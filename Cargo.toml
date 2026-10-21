@@ -1,0 +1,41 @@
+[workspace]
+members = ["crates/vetinari-core", "crates/vetinari-adapters", "crates/vetinari-tui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/gameldar/vetinari"
+description = "An orchestrator for coding agents, attention, and technical leadership"
+
+[workspace.dependencies]
+vetinari-core = { path = "crates/vetinari-core" }
+vetinari-adapters = { path = "crates/vetinari-adapters" }
+
+async-trait = "0.1.92"
+thiserror = "2.0.21"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml = "0.9.34"
+toml = "1.1.8"
+time = { version = "0.3.55", features = ["serde", "parsing", "formatting", "macros", "local-offset"] }
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "sync", "time", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+keyring = { version = "4.2.0", features = ["apple-native-keyring-store", "windows-native-keyring-store", "zbus-secret-service-keyring-store"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "charset", "http2", "query"] }
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+futures = "0.3.34"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,18 @@
+[package]
+name = "vetinari-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Domain and application layer for Vetinari: ports, keymap engine, attention and agent orchestration"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
