@@ -128,6 +128,12 @@ Stated plainly, since the configuration mentions some of it:
   speaks something else, that module is the only thing that needs to change.
 - **`agy`'s command line** is assumed to take the prompt as its last argument.
   Adjust `args` in `[agents.agy-gemini]` if it does not.
+- **No pseudo-terminal.** The PRD lists `portable-pty`; Vetinari runs managed
+  agents with piped stdio in print mode instead, and hands the *interactive*
+  command line to tmux or Herdr (`<Space> w r`) when you want to sit beside
+  the agent. A pty already exists in those targets, so emulating a second one
+  would add a terminal to debug rather than a feature. The cost is that an
+  agent's own full-screen interface is not drawn inside Vetinari.
 - **Sources fetch one page** (50 items, 25 events). There is no pagination.
 - **A machine with no keychain service** - a headless container, say - reports
   `Keychain: unavailable on this machine` and no credential can be stored.
