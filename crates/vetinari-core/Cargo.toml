@@ -22,3 +22,4 @@ time.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+toml.workspace = true
