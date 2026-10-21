@@ -3529,6 +3529,7 @@ dependencies = [
  "directories",
  "futures",
  "keyring",
+ "keyring-core",
  "reqwest",
  "serde",
  "serde_json",

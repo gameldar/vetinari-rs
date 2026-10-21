@@ -14,6 +14,9 @@ pub mod skills;
 pub mod sources;
 pub mod workspace;
 
+#[cfg(test)]
+mod testing;
+
 mod http;
 
 pub use http::HttpClient;

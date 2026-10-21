@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::action::Action;
 use crate::domain::agent::TaskClass;
+use crate::domain::credentials::{AuthMethod, Provider};
 use crate::domain::ids::{AgentId, ProfileId, Slug, SourceId};
 use crate::domain::keymap::{Keymap, Mode};
 use crate::domain::keys::KeySequence;
@@ -204,6 +205,21 @@ pub struct SourceConfig {
     pub settings: SourceSettings,
 }
 
+/// An OAuth client registered with a provider, for the device-code flow.
+///
+/// The client id and secret identify the *application*, not the developer, so
+/// they live in configuration rather than the keychain; the tokens they obtain
+/// are what go in the keychain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthClientConfig {
+    /// The provider it authenticates against.
+    pub provider: Provider,
+    /// The client id.
+    pub client_id: String,
+    /// The client secret, when the provider demands one.
+    pub client_secret: Option<String>,
+}
+
 /// Behaviour that is not specific to a profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct General {
@@ -255,6 +271,8 @@ pub struct Config {
     pub targets: Vec<TargetConfig>,
     /// The attention sources.
     pub sources: Vec<SourceConfig>,
+    /// The OAuth clients for device-code flows.
+    pub oauth_clients: Vec<OAuthClientConfig>,
 }
 
 impl Config {
@@ -268,6 +286,7 @@ impl Config {
         let agents = parse_agents(&raw.agents, &mut problems);
         let targets = parse_targets(&raw.targets, context, &mut problems);
         let sources = parse_sources(&raw.sources, &mut problems);
+        let oauth_clients = parse_oauth(&raw.oauth, &mut problems);
 
         let profiles = match profiles {
             Some(mut set) => {
@@ -300,7 +319,16 @@ impl Config {
             agents,
             targets,
             sources,
+            oauth_clients,
         })
+    }
+
+    /// The OAuth client registered for a provider, if any.
+    #[must_use]
+    pub fn oauth_client(&self, provider: Provider) -> Option<&OAuthClientConfig> {
+        self.oauth_clients
+            .iter()
+            .find(|client| client.provider == provider)
     }
 
     /// The agent ids every routing table may refer to.
@@ -759,6 +787,57 @@ fn parse_sources(
     sources
 }
 
+fn parse_oauth(
+    raw: &BTreeMap<String, RawOAuthClient>,
+    problems: &mut Vec<ConfigProblem>,
+) -> Vec<OAuthClientConfig> {
+    let mut clients = Vec::with_capacity(raw.len());
+    for (name, entry) in raw {
+        let Ok(provider) = name.parse::<Provider>() else {
+            problems.push(ConfigProblem {
+                path: format!("oauth.{name}"),
+                message: format!("unknown provider {name:?}"),
+            });
+            continue;
+        };
+        if !matches!(
+            provider.auth_spec().method,
+            AuthMethod::OAuthDeviceCode { .. }
+        ) {
+            problems.push(ConfigProblem {
+                path: format!("oauth.{name}"),
+                message: format!(
+                    "{} does not use the device-code flow; paste an API token instead",
+                    provider.name()
+                ),
+            });
+            continue;
+        }
+        let Some(client_id) = entry
+            .client_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+        else {
+            problems.push(ConfigProblem {
+                path: format!("oauth.{name}.client_id"),
+                message: "an OAuth client needs its client id".to_owned(),
+            });
+            continue;
+        };
+        clients.push(OAuthClientConfig {
+            provider,
+            client_id,
+            client_secret: entry
+                .client_secret
+                .as_ref()
+                .filter(|secret| !secret.trim().is_empty())
+                .cloned(),
+        });
+    }
+    clients
+}
+
 fn expand(path: &str, context: &ParseContext) -> PathBuf {
     let trimmed = path.trim();
     if let Some(rest) = trimmed.strip_prefix("~/")
@@ -790,6 +869,18 @@ pub struct RawConfig {
     pub targets: BTreeMap<String, RawTarget>,
     /// Attention sources, keyed by id.
     pub sources: BTreeMap<String, RawSource>,
+    /// OAuth clients, keyed by provider.
+    pub oauth: BTreeMap<String, RawOAuthClient>,
+}
+
+/// One `[oauth.<provider>]` table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawOAuthClient {
+    /// The OAuth client id.
+    pub client_id: Option<String>,
+    /// The OAuth client secret, when the provider needs one.
+    pub client_secret: Option<String>,
 }
 
 /// The `[general]` table.
@@ -1359,6 +1450,68 @@ mod tests {
         )
         .expect_err("several problems");
         assert_eq!(error.problems().len(), 3);
+    }
+
+    #[test]
+    fn oauth_clients_are_configured_per_provider() {
+        let config = parse(
+            r#"
+            [oauth.google-calendar]
+            client_id = "123.apps.googleusercontent.com"
+            client_secret = "GOCSPX-secret"
+            "#,
+        )
+        .expect("config");
+
+        assert_eq!(config.oauth_clients.len(), 1);
+        let client = &config.oauth_clients[0];
+        assert_eq!(client.provider, Provider::GoogleCalendar);
+        assert_eq!(client.client_id, "123.apps.googleusercontent.com");
+        assert_eq!(client.client_secret.as_deref(), Some("GOCSPX-secret"));
+        assert_eq!(
+            config
+                .oauth_client(Provider::GoogleCalendar)
+                .map(|c| c.client_id.as_str()),
+            Some("123.apps.googleusercontent.com")
+        );
+        assert!(config.oauth_client(Provider::Outlook).is_none());
+    }
+
+    #[test]
+    fn an_oauth_client_for_a_provider_that_uses_tokens_is_reported() {
+        let error = parse(
+            r#"
+            [oauth.github]
+            client_id = "abc"
+            "#,
+        )
+        .expect_err("wrong method");
+        assert_eq!(error.problems()[0].path, "oauth.github");
+        assert!(error.problems()[0].message.contains("device"));
+    }
+
+    #[test]
+    fn an_oauth_client_without_an_id_is_reported() {
+        let error = parse(
+            r#"
+            [oauth.google-calendar]
+            client_secret = "only-a-secret"
+            "#,
+        )
+        .expect_err("incomplete");
+        assert_eq!(error.problems()[0].path, "oauth.google-calendar.client_id");
+    }
+
+    #[test]
+    fn an_unknown_provider_in_the_oauth_table_is_reported() {
+        let error = parse(
+            r#"
+            [oauth.telepathy]
+            client_id = "abc"
+            "#,
+        )
+        .expect_err("unknown provider");
+        assert_eq!(error.problems()[0].path, "oauth.telepathy");
     }
 
     #[test]

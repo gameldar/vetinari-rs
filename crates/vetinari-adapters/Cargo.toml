@@ -17,6 +17,7 @@ async-trait.workspace = true
 directories.workspace = true
 futures.workspace = true
 keyring.workspace = true
+keyring-core = "1.0.1"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
