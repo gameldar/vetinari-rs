@@ -6,6 +6,7 @@
 //! Only the event loop in the binary touches the real terminal.
 
 pub mod app;
+pub mod controller;
 pub mod event;
 pub mod overlay;
 pub mod text_input;

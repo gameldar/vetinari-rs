@@ -449,13 +449,26 @@ impl WorkspaceTarget for FakeWorkspaceTarget {
 pub struct FakeWorktreeManager {
     created: Mutex<Vec<WorktreeSpec>>,
     removed: Mutex<Vec<PathBuf>>,
+    fetched: Mutex<Vec<(PathBuf, String, String)>>,
     failure: Mutex<Option<PortError>>,
+    fetch_failure: Mutex<Option<PortError>>,
 }
 
 impl FakeWorktreeManager {
     /// Make the next creation fail.
     pub fn fail_create(&self, error: PortError) {
         *self.failure.lock().expect("failure lock") = Some(error);
+    }
+
+    /// Make every fetch fail, as it would with no remote configured.
+    pub fn fail_fetch(&self, error: PortError) {
+        *self.fetch_failure.lock().expect("fetch failure lock") = Some(error);
+    }
+
+    /// The refspecs it was asked to fetch.
+    #[must_use]
+    pub fn fetched(&self) -> Vec<(PathBuf, String, String)> {
+        self.fetched.lock().expect("fetched lock").clone()
     }
 
     /// The specs it was asked to create.
@@ -473,6 +486,23 @@ impl FakeWorktreeManager {
 
 #[async_trait]
 impl WorktreeManager for FakeWorktreeManager {
+    async fn fetch(&self, repo: &Path, remote: &str, refspec: &str) -> PortResult<()> {
+        self.fetched.lock().expect("fetched lock").push((
+            repo.to_path_buf(),
+            remote.to_owned(),
+            refspec.to_owned(),
+        ));
+        match self
+            .fetch_failure
+            .lock()
+            .expect("fetch failure lock")
+            .clone()
+        {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree> {
         if let Some(error) = self.failure.lock().expect("failure lock").take() {
             return Err(error);

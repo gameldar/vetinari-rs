@@ -99,6 +99,16 @@ impl GitWorktreeManager {
 
 #[async_trait]
 impl WorktreeManager for GitWorktreeManager {
+    async fn fetch(&self, repo: &Path, remote: &str, refspec: &str) -> PortResult<()> {
+        self.run_ok(
+            repo,
+            "git fetch",
+            &["fetch", "--quiet", "--force", remote, refspec],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree> {
         if self.is_worktree(spec.path()).await {
             return Ok(Worktree::new(
@@ -418,6 +428,79 @@ mod tests {
         manager.remove(&worktree).await.expect("remove");
 
         assert!(!worktree.path().exists());
+    }
+
+    #[tokio::test]
+    async fn a_branch_can_be_fetched_from_a_remote_and_worked_on() {
+        let origin = repo_with_a_commit().await;
+        git(origin.path(), &["checkout", "-q", "-b", "fix/leak"]).await;
+        tokio::fs::write(origin.path().join("fix.txt"), "fixed")
+            .await
+            .expect("write");
+        git(origin.path(), &["add", "."]).await;
+        git(origin.path(), &["commit", "-m", "the fix"]).await;
+        git(origin.path(), &["checkout", "-q", "main"]).await;
+
+        let clone = repo_with_a_commit().await;
+        git(
+            clone.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.path().to_str().expect("utf-8"),
+            ],
+        )
+        .await;
+
+        let manager = GitWorktreeManager::default();
+        manager
+            .fetch(
+                clone.path(),
+                "origin",
+                "fix/leak:refs/remotes/vetinari/fix/leak",
+            )
+            .await
+            .expect("fetch");
+
+        let trees = tempfile::tempdir().expect("tempdir");
+        let worktree = manager
+            .create(&spec(
+                clone.path(),
+                trees.path(),
+                "vetinari/review/pr-1",
+                Some("refs/remotes/vetinari/fix/leak"),
+            ))
+            .await
+            .expect("create");
+
+        assert!(
+            worktree.path().join("fix.txt").is_file(),
+            "the worktree holds the fetched branch's work"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetching_from_a_remote_that_does_not_exist_is_reported() {
+        let repo = repo_with_a_commit().await;
+        let manager = GitWorktreeManager::default();
+
+        let error = manager
+            .fetch(
+                repo.path(),
+                "origin",
+                "fix/leak:refs/remotes/vetinari/fix/leak",
+            )
+            .await
+            .expect_err("no remote");
+
+        match error {
+            PortError::Refused { what, detail } => {
+                assert_eq!(what, "git fetch");
+                assert!(!detail.is_empty());
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

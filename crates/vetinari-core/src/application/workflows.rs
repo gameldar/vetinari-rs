@@ -59,6 +59,13 @@ impl WorkflowEngine {
     /// The directory worktrees go in when a profile does not say.
     pub const DEFAULT_WORKTREE_DIR: &'static str = ".vetinari-worktrees";
 
+    /// The remote a pull request's branch is fetched from.
+    pub const DEFAULT_REMOTE: &'static str = "origin";
+
+    /// Where fetched review branches are kept, so they cannot clash with the
+    /// developer's own remote-tracking branches.
+    pub const FETCH_NAMESPACE: &'static str = "refs/remotes/vetinari";
+
     /// Build a workflow engine.
     #[must_use]
     pub fn new(worktrees: Arc<dyn WorktreeManager>, workspaces: WorkspaceDirectory) -> Self {
@@ -114,17 +121,57 @@ impl WorkflowEngine {
             .with("base_ref", pr.base_ref.clone());
         let spec = render(skill, &bindings, &repo)?;
         let worktree_root = self.worktree_root(profile, &repo);
-        let worktree_spec =
-            WorktreeSpec::for_pull_request(repo, worktree_root, pr.number, &pr.head_ref);
-        self.run_isolated(
-            spec,
-            worktree_spec,
-            SpaceName::for_pull_request(pr.number, &pr.head_ref),
-            skill,
-            profile,
-            registry,
-        )
-        .await
+        let mut worktree_spec =
+            WorktreeSpec::for_pull_request(repo.clone(), worktree_root, pr.number, &pr.head_ref);
+
+        // The branch under review usually exists only on the remote, so fetch
+        // it under a namespace of Vetinari's own: a developer's own remotes
+        // and branches are theirs, and must not be moved by a review.
+        let local_ref = format!("{}/{}", Self::FETCH_NAMESPACE, pr.head_ref);
+        let mut warnings = Vec::new();
+        match self
+            .worktrees
+            .fetch(
+                &repo,
+                Self::DEFAULT_REMOTE,
+                &format!("{}:{local_ref}", pr.head_ref),
+            )
+            .await
+        {
+            Ok(()) => {
+                worktree_spec = WorktreeSpec::new(
+                    worktree_spec.repo().to_path_buf(),
+                    worktree_spec.branch().clone(),
+                    worktree_spec.path().to_path_buf(),
+                    Some(local_ref),
+                );
+            }
+            Err(error) => {
+                // Without the branch, base the worktree on the repository
+                // head: a review that starts at the wrong commit with a
+                // warning is worth more than one that refuses to start.
+                worktree_spec = WorktreeSpec::new(
+                    worktree_spec.repo().to_path_buf(),
+                    worktree_spec.branch().clone(),
+                    worktree_spec.path().to_path_buf(),
+                    None,
+                );
+                warnings.push(error);
+            }
+        }
+
+        let mut outcome = self
+            .run_isolated(
+                spec,
+                worktree_spec,
+                SpaceName::for_pull_request(pr.number, &pr.head_ref),
+                skill,
+                profile,
+                registry,
+            )
+            .await?;
+        outcome.warnings.splice(0..0, warnings);
+        Ok(outcome)
     }
 
     /// Prepare for a meeting: no worktree, no space, just a briefing.
@@ -505,7 +552,11 @@ mod tests {
 
         let created = h.worktrees.created();
         assert_eq!(created[0].branch().as_str(), "vetinari/review/pr-142");
-        assert_eq!(created[0].base(), Some("fix/memory-leak"));
+        assert_eq!(
+            created[0].base(),
+            Some("refs/remotes/vetinari/fix/memory-leak"),
+            "the worktree is based on the branch as fetched"
+        );
         assert_eq!(
             created[0].path(),
             Path::new("/work/trees/web-pr-142-fix-memory-leak")
@@ -517,6 +568,50 @@ mod tests {
         assert!(prompt.contains("fix/memory-leak"));
         assert!(prompt.contains("main"));
         assert_eq!(outcome.agent.as_str(), "claude-code");
+    }
+
+    #[tokio::test]
+    async fn a_pr_review_fetches_the_branch_before_cutting_a_worktree_for_it() {
+        let mut h = harness();
+
+        h.workflows
+            .start_pr_review(&pull_request(), &h.library, &h.profile, &mut h.registry)
+            .await
+            .expect("workflow");
+
+        let fetched = h.worktrees.fetched();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].1, "origin");
+        assert_eq!(
+            fetched[0].2, "fix/memory-leak:refs/remotes/vetinari/fix/memory-leak",
+            "the branch is fetched under a namespace of our own so it cannot              clash with the developer's own remotes"
+        );
+        assert_eq!(
+            h.worktrees.created()[0].base(),
+            Some("refs/remotes/vetinari/fix/memory-leak")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_cannot_be_fetched_still_gets_a_worktree_and_a_warning() {
+        let mut h = harness();
+        h.worktrees
+            .fail_fetch(PortError::unavailable("git", "no remote named origin"));
+
+        let outcome = h
+            .workflows
+            .start_pr_review(&pull_request(), &h.library, &h.profile, &mut h.registry)
+            .await
+            .expect("the review still starts");
+
+        assert_eq!(h.worktrees.created().len(), 1);
+        assert_eq!(
+            h.worktrees.created()[0].base(),
+            None,
+            "it falls back to the repository head"
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(h.claude.spawned().len() == 1, "the agent still starts");
     }
 
     #[tokio::test]

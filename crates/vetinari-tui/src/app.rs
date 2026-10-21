@@ -20,7 +20,7 @@ use vetinari_core::domain::attention::{
 };
 use vetinari_core::domain::credentials::{AuthMethod, Provider, Secret};
 use vetinari_core::domain::feedback::{CapturedContext, FeedbackRequest, FeedbackTarget};
-use vetinari_core::domain::ids::{SessionId, SkillId, SpaceId};
+use vetinari_core::domain::ids::{SessionId, SkillId, SourceId, SpaceId};
 use vetinari_core::domain::keymap::{Keymap, Mode};
 use vetinari_core::domain::keys::{KeyChord, KeyCode};
 use vetinari_core::domain::profile::{Profile, ProfileSet};
@@ -262,15 +262,48 @@ pub enum Task {
         bindings: Bindings,
     },
     /// Approve a pull request.
-    ApprovePr(PullRequestRef),
+    ApprovePr {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The pull request.
+        pr: PullRequestRef,
+    },
     /// Comment on a pull request.
-    CommentPr(PullRequestRef, String),
+    CommentPr {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The pull request.
+        pr: PullRequestRef,
+        /// What to say.
+        body: String,
+    },
     /// Reply to a message.
-    ReplyChat(MessageRef, String),
+    ReplyChat {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The message to reply to.
+        message: MessageRef,
+        /// What to say.
+        body: String,
+    },
     /// Move an issue to another status.
-    TransitionIssue(IssueRef, String),
+    TransitionIssue {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The issue.
+        issue: IssueRef,
+        /// The status to move it to.
+        status: String,
+    },
     /// Assign an issue.
-    AssignIssue(IssueRef, String),
+    AssignIssue {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The issue.
+        issue: IssueRef,
+        /// Who to assign it to.
+        assignee: String,
+    },
     /// Bring a space to the foreground.
     FocusSpace(SpaceId),
     /// Close a space.
@@ -742,17 +775,17 @@ impl App {
             },
 
             Action::PrReviewSpawn => match self.selected_pull_request() {
-                Some(pr) => Outcome::Task(Task::StartPrReview(pr)),
+                Some((_, pr)) => Outcome::Task(Task::StartPrReview(pr)),
                 None => self.warn("select a pull request row first"),
             },
             Action::PrApprove => match self.selected_pull_request() {
-                Some(pr) => Outcome::Task(Task::ApprovePr(pr)),
+                Some((source, pr)) => Outcome::Task(Task::ApprovePr { source, pr }),
                 None => self.warn("select a pull request row first"),
             },
             Action::PrComment => match self.selected_pull_request() {
-                Some(pr) => {
+                Some((source, pr)) => {
                     self.open_prompt(
-                        PromptKind::PrComment(pr),
+                        PromptKind::PrComment { source, pr },
                         "Comment on pull request",
                         "RET posts the comment",
                     );
@@ -762,21 +795,25 @@ impl App {
             },
 
             Action::IssueUpdateStatus => match self.selected_issue() {
-                Some(issue) => {
+                Some((source, issue)) => {
                     let hint = if issue.transitions.is_empty() {
                         "RET moves the issue".to_owned()
                     } else {
                         format!("one of: {}", issue.transitions.join(", "))
                     };
-                    self.open_prompt(PromptKind::IssueStatus(issue), "New status", hint);
+                    self.open_prompt(
+                        PromptKind::IssueStatus { source, issue },
+                        "New status",
+                        hint,
+                    );
                     Outcome::Nothing
                 }
                 None => self.warn("select an issue row first"),
             },
             Action::IssueAssign => match self.selected_issue() {
-                Some(issue) => {
+                Some((source, issue)) => {
                     self.open_prompt(
-                        PromptKind::IssueAssignee(issue),
+                        PromptKind::IssueAssignee { source, issue },
                         "Assign issue",
                         "account id or username",
                     );
@@ -790,9 +827,9 @@ impl App {
             }),
 
             Action::ChatReply => match self.selected_message() {
-                Some(message) => {
+                Some((source, message)) => {
                     self.open_prompt(
-                        PromptKind::ChatReply(message),
+                        PromptKind::ChatReply { source, message },
                         "Reply",
                         "RET sends the reply",
                     );
@@ -1010,11 +1047,27 @@ impl App {
                 self.last_feedback = Some(captured.clone());
                 Outcome::Task(Task::StartFeedback(Box::new(captured)))
             }
-            PromptKind::PrComment(pr) => Outcome::Task(Task::CommentPr(pr, text)),
-            PromptKind::ChatReply(message) => Outcome::Task(Task::ReplyChat(message, text)),
+            PromptKind::PrComment { source, pr } => Outcome::Task(Task::CommentPr {
+                source,
+                pr,
+                body: text,
+            }),
+            PromptKind::ChatReply { source, message } => Outcome::Task(Task::ReplyChat {
+                source,
+                message,
+                body: text,
+            }),
             PromptKind::AgentAnswer(session) => Outcome::Task(Task::AnswerAgent(session, text)),
-            PromptKind::IssueStatus(issue) => Outcome::Task(Task::TransitionIssue(issue, text)),
-            PromptKind::IssueAssignee(issue) => Outcome::Task(Task::AssignIssue(issue, text)),
+            PromptKind::IssueStatus { source, issue } => Outcome::Task(Task::TransitionIssue {
+                source,
+                issue,
+                status: text,
+            }),
+            PromptKind::IssueAssignee { source, issue } => Outcome::Task(Task::AssignIssue {
+                source,
+                issue,
+                assignee: text,
+            }),
             PromptKind::ApiToken(provider) => {
                 Outcome::Task(Task::SaveToken(provider, Secret::new(text.trim())))
             }
@@ -1429,23 +1482,26 @@ impl App {
         described
     }
 
-    fn selected_pull_request(&self) -> Option<PullRequestRef> {
-        match self.feed.selected()?.context() {
-            ItemContext::PullRequest(pr) => Some(pr.clone()),
+    fn selected_pull_request(&self) -> Option<(SourceId, PullRequestRef)> {
+        let item = self.feed.selected()?;
+        match item.context() {
+            ItemContext::PullRequest(pr) => Some((item.source().clone(), pr.clone())),
             _ => None,
         }
     }
 
-    fn selected_issue(&self) -> Option<IssueRef> {
-        match self.feed.selected()?.context() {
-            ItemContext::Issue(issue) => Some(issue.clone()),
+    fn selected_issue(&self) -> Option<(SourceId, IssueRef)> {
+        let item = self.feed.selected()?;
+        match item.context() {
+            ItemContext::Issue(issue) => Some((item.source().clone(), issue.clone())),
             _ => None,
         }
     }
 
-    fn selected_message(&self) -> Option<MessageRef> {
-        match self.feed.selected()?.context() {
-            ItemContext::Message(message) => Some(message.clone()),
+    fn selected_message(&self) -> Option<(SourceId, MessageRef)> {
+        let item = self.feed.selected()?;
+        match item.context() {
+            ItemContext::Message(message) => Some((item.source().clone(), message.clone())),
             _ => None,
         }
     }
@@ -1852,7 +1908,11 @@ mod tests {
         let mut app = app();
         select_row(&mut app, "Fix memory leak in auth parser");
         let outcome = press(&mut app, "SPC p a");
-        assert!(matches!(outcome, Outcome::Task(Task::ApprovePr(_))));
+        let Outcome::Task(Task::ApprovePr { source, pr }) = outcome else {
+            panic!("expected an approval task, got {outcome:?}");
+        };
+        assert_eq!(source.as_str(), "github");
+        assert_eq!(pr.number, 142);
     }
 
     #[test]
@@ -1864,9 +1924,10 @@ mod tests {
 
         let outcome = press(&mut app, "RET");
 
-        let Outcome::Task(Task::CommentPr(pr, body)) = outcome else {
+        let Outcome::Task(Task::CommentPr { source, pr, body }) = outcome else {
             panic!("expected a comment task, got {outcome:?}");
         };
+        assert_eq!(source.as_str(), "github");
         assert_eq!(pr.number, 142);
         assert_eq!(body, "one question");
     }
@@ -1880,9 +1941,15 @@ mod tests {
 
         let outcome = press(&mut app, "RET");
 
-        let Outcome::Task(Task::TransitionIssue(issue, status)) = outcome else {
+        let Outcome::Task(Task::TransitionIssue {
+            source,
+            issue,
+            status,
+        }) = outcome
+        else {
             panic!("expected a transition task, got {outcome:?}");
         };
+        assert_eq!(source.as_str(), "jira");
         assert_eq!(issue.key, "DEV-891");
         assert_eq!(status, "In Progress");
     }
@@ -1896,9 +1963,15 @@ mod tests {
 
         let outcome = press(&mut app, "RET");
 
-        let Outcome::Task(Task::ReplyChat(message, body)) = outcome else {
+        let Outcome::Task(Task::ReplyChat {
+            source,
+            message,
+            body,
+        }) = outcome
+        else {
             panic!("expected a reply task, got {outcome:?}");
         };
+        assert_eq!(source.as_str(), "slack");
         assert_eq!(message.channel, "D123");
         assert_eq!(body, "on it");
     }
@@ -2144,6 +2217,10 @@ mod tests {
             panic!("expected a token prompt");
         };
         assert_eq!(prompt.kind, PromptKind::ApiToken(Provider::GitHub));
+        assert!(
+            prompt.hint.contains("token"),
+            "the wizard explains what to paste"
+        );
 
         type_text(&mut app, "ghp_pasted");
         let outcome = press(&mut app, "RET");

@@ -4,6 +4,7 @@
 //! which types implement each port, which is what keeps that knowledge out of
 //! the core and out of the TUI.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,8 +15,8 @@ use vetinari_core::application::config::{
     AgentConfig, Config, SourceConfig, SourceSettings, TargetConfig, TargetSettings,
 };
 use vetinari_core::application::ports::{
-    AttentionSource, Clock, CredentialStore, DeviceCodeFlow, PortResult, SkillStore,
-    WorkspaceTarget, WorktreeManager,
+    ChatSource, Clock, CodeHostSource, CredentialStore, DeviceCodeFlow, IssueTrackerSource,
+    PortResult, ScheduleSource, SkillStore, WorkspaceTarget, WorktreeManager,
 };
 use vetinari_core::application::skills::SkillService;
 use vetinari_core::application::workflows::WorkflowEngine;
@@ -61,6 +62,14 @@ pub struct Runtime {
     pub workflows: WorkflowEngine,
     /// The skill library's store.
     pub skills: SkillService,
+    /// The code hosts, by source id, for approving and commenting.
+    pub code_hosts: BTreeMap<SourceId, Arc<dyn CodeHostSource>>,
+    /// The issue trackers, by source id, for transitions and assignment.
+    pub issue_trackers: BTreeMap<SourceId, Arc<dyn IssueTrackerSource>>,
+    /// The chat systems, by source id, for replies.
+    pub chats: BTreeMap<SourceId, Arc<dyn ChatSource>>,
+    /// The calendars, by source id, for agendas.
+    pub schedules: BTreeMap<SourceId, Arc<dyn ScheduleSource>>,
     /// Where files were looked for.
     pub paths: Paths,
     /// Things the configuration asked for that could not be provided.
@@ -121,9 +130,33 @@ impl Runtime {
         }
 
         let mut attention = AttentionEngine::new(clock.clone());
+        let mut code_hosts: BTreeMap<SourceId, Arc<dyn CodeHostSource>> = BTreeMap::new();
+        let mut issue_trackers: BTreeMap<SourceId, Arc<dyn IssueTrackerSource>> = BTreeMap::new();
+        let mut chats: BTreeMap<SourceId, Arc<dyn ChatSource>> = BTreeMap::new();
+        let mut schedules: BTreeMap<SourceId, Arc<dyn ScheduleSource>> = BTreeMap::new();
         for source in &config.sources {
             match build_source(source, &http, &auth, &clock) {
-                Ok(built) => attention.register(built),
+                Ok(built) => {
+                    let id = source.id.clone();
+                    match built {
+                        BuiltSource::CodeHost(host) => {
+                            attention.register(host.clone());
+                            code_hosts.insert(id, host);
+                        }
+                        BuiltSource::IssueTracker(tracker) => {
+                            attention.register(tracker.clone());
+                            issue_trackers.insert(id, tracker);
+                        }
+                        BuiltSource::Chat(chat) => {
+                            attention.register(chat.clone());
+                            chats.insert(id, chat);
+                        }
+                        BuiltSource::Schedule(schedule) => {
+                            attention.register(schedule.clone());
+                            schedules.insert(id, schedule);
+                        }
+                    }
+                }
                 Err(problem) => problems.push(problem),
             }
         }
@@ -136,6 +169,10 @@ impl Runtime {
             agents,
             workflows: WorkflowEngine::new(worktrees, workspaces),
             skills: SkillService::new(skills),
+            code_hosts,
+            issue_trackers,
+            chats,
+            schedules,
             paths,
             problems,
         })
@@ -191,29 +228,43 @@ fn build_target(target: &TargetConfig, state_dir: &Path) -> Arc<dyn WorkspaceTar
     }
 }
 
+/// A source, in the richest role it can play.
+///
+/// The concrete adapters implement both [`AttentionSource`] and the trait for
+/// their category, and a trait object cannot be widened after the fact, so the
+/// role is decided here, where the concrete type is still known.
+enum BuiltSource {
+    CodeHost(Arc<dyn CodeHostSource>),
+    IssueTracker(Arc<dyn IssueTrackerSource>),
+    Chat(Arc<dyn ChatSource>),
+    Schedule(Arc<dyn ScheduleSource>),
+}
+
 fn build_source(
     source: &SourceConfig,
     http: &HttpClient,
     auth: &Arc<AuthService>,
     clock: &Arc<dyn Clock>,
-) -> Result<Arc<dyn AttentionSource>, String> {
+) -> Result<BuiltSource, String> {
     let id: SourceId = source.id.clone();
     match &source.settings {
-        SourceSettings::GitHub { query, base_url } => Ok(Arc::new(GitHubSource::new(
-            id,
-            GitHubSettings {
-                query: query.clone(),
-                base_url: base_url.clone(),
-                account: None,
-            },
-            http.clone(),
-            auth.clone(),
-        ))),
+        SourceSettings::GitHub { query, base_url } => {
+            Ok(BuiltSource::CodeHost(Arc::new(GitHubSource::new(
+                id,
+                GitHubSettings {
+                    query: query.clone(),
+                    base_url: base_url.clone(),
+                    account: None,
+                },
+                http.clone(),
+                auth.clone(),
+            ))))
+        }
         SourceSettings::Jira {
             base_url,
             email,
             jql,
-        } => Ok(Arc::new(JiraSource::new(
+        } => Ok(BuiltSource::IssueTracker(Arc::new(JiraSource::new(
             id,
             JiraSettings {
                 base_url: base_url.clone(),
@@ -223,8 +274,8 @@ fn build_source(
             },
             http.clone(),
             auth.clone(),
-        ))),
-        SourceSettings::Slack { channels } => Ok(Arc::new(SlackSource::new(
+        )))),
+        SourceSettings::Slack { channels } => Ok(BuiltSource::Chat(Arc::new(SlackSource::new(
             id,
             SlackSettings {
                 channels: channels.clone(),
@@ -233,11 +284,11 @@ fn build_source(
             },
             http.clone(),
             auth.clone(),
-        ))),
+        )))),
         SourceSettings::GoogleCalendar {
             calendar_id,
             lookahead_hours,
-        } => Ok(Arc::new(GoogleCalendarSource::new(
+        } => Ok(BuiltSource::Schedule(Arc::new(GoogleCalendarSource::new(
             id,
             GoogleCalendarSettings {
                 calendar_id: calendar_id.clone(),
@@ -248,7 +299,7 @@ fn build_source(
             http.clone(),
             auth.clone(),
             clock.clone(),
-        ))),
+        )))),
         SourceSettings::GitLab { .. }
         | SourceSettings::Discord { .. }
         | SourceSettings::Outlook { .. } => Err(format!(
@@ -340,6 +391,49 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["calendar", "github", "jira", "slack"]);
         assert!(runtime.problems.is_empty());
+    }
+
+    #[test]
+    fn sources_are_kept_in_the_registry_their_actions_need() {
+        let runtime = runtime(
+            r#"
+            [sources.github]
+            kind = "github"
+
+            [sources.jira]
+            kind = "jira"
+            base_url = "https://acme.atlassian.net"
+            email = "dev@acme.test"
+
+            [sources.slack]
+            kind = "slack"
+
+            [sources.calendar]
+            kind = "google-calendar"
+            "#,
+        );
+
+        assert!(
+            runtime
+                .code_hosts
+                .contains_key(&SourceId::parse("github").expect("id"))
+        );
+        assert!(
+            runtime
+                .issue_trackers
+                .contains_key(&SourceId::parse("jira").expect("id"))
+        );
+        assert!(
+            runtime
+                .chats
+                .contains_key(&SourceId::parse("slack").expect("id"))
+        );
+        assert!(
+            runtime
+                .schedules
+                .contains_key(&SourceId::parse("calendar").expect("id"))
+        );
+        assert_eq!(runtime.code_hosts.len(), 1);
     }
 
     #[test]

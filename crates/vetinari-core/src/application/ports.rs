@@ -260,6 +260,10 @@ pub trait CredentialStore: Send + Sync {
 /// Git worktree management.
 #[async_trait]
 pub trait WorktreeManager: Send + Sync {
+    /// Fetch a refspec, so a worktree can be based on a branch that only
+    /// exists on the remote - a pull request's branch, typically.
+    async fn fetch(&self, repo: &Path, remote: &str, refspec: &str) -> PortResult<()>;
+
     /// Create a worktree, or adopt the existing one if it is already there.
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree>;
 

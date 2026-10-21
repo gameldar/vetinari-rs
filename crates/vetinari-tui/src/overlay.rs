@@ -7,7 +7,7 @@ use vetinari_core::application::ports::DeviceCodeChallenge;
 use vetinari_core::application::skills::SkillDraft;
 use vetinari_core::domain::attention::{IssueRef, MessageRef, PullRequestRef};
 use vetinari_core::domain::credentials::Provider;
-use vetinari_core::domain::ids::{ItemId, ProfileId, SessionId, SkillId, SpaceId};
+use vetinari_core::domain::ids::{ItemId, ProfileId, SessionId, SkillId, SourceId, SpaceId};
 use vetinari_core::domain::skill::Skill;
 
 use crate::text_input::TextInput;
@@ -20,15 +20,35 @@ pub enum PromptKind {
     /// A feedback or enhancement request.
     Feedback,
     /// A comment on a pull request.
-    PrComment(PullRequestRef),
+    PrComment {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The pull request.
+        pr: PullRequestRef,
+    },
     /// A reply to a chat message.
-    ChatReply(MessageRef),
+    ChatReply {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The message to reply to.
+        message: MessageRef,
+    },
     /// An answer to a question an agent is blocked on.
     AgentAnswer(SessionId),
     /// A new status for an issue.
-    IssueStatus(IssueRef),
+    IssueStatus {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The issue.
+        issue: IssueRef,
+    },
     /// A new assignee for an issue.
-    IssueAssignee(IssueRef),
+    IssueAssignee {
+        /// The source that produced the item.
+        source: SourceId,
+        /// The issue.
+        issue: IssueRef,
+    },
     /// An API token for a provider.
     ApiToken(Provider),
 }
