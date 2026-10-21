@@ -10,9 +10,15 @@ description = "Domain and application layer for Vetinari: ports, keymap engine, 
 [lints]
 workspace = true
 
+[features]
+testing = []
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
