@@ -10,6 +10,7 @@ pub mod config;
 pub mod credentials;
 pub mod git;
 pub mod oauth;
+pub mod runtime;
 pub mod skills;
 pub mod sources;
 pub mod workspace;
@@ -20,3 +21,4 @@ mod testing;
 mod http;
 
 pub use http::HttpClient;
+pub use runtime::{Paths, Runtime};

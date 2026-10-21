@@ -29,6 +29,7 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+toml.workspace = true
 tempfile.workspace = true
 vetinari-core = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
