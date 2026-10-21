@@ -22,6 +22,7 @@ vetinari-adapters.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+directories.workspace = true
 futures.workspace = true
 ratatui.workspace = true
 thiserror.workspace = true

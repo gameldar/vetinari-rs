@@ -3563,6 +3563,7 @@ dependencies = [
  "async-trait",
  "clap",
  "crossterm",
+ "directories",
  "futures",
  "ratatui",
  "tempfile",

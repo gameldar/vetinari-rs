@@ -190,13 +190,6 @@ impl TaskSpec {
         self
     }
 
-    /// Add several context paths.
-    #[must_use]
-    pub fn with_context_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        self.context_paths.extend(paths);
-        self
-    }
-
     /// Record the skill that produced the prompt.
     #[must_use]
     pub fn with_skill(mut self, skill: SkillId) -> Self {

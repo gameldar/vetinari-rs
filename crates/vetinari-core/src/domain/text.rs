@@ -60,12 +60,6 @@ impl NonEmptyText {
     pub fn single_line(&self) -> String {
         self.0.split_whitespace().collect::<Vec<_>>().join(" ")
     }
-
-    /// Consume the wrapper, yielding the inner [`String`].
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
 }
 
 impl fmt::Display for NonEmptyText {

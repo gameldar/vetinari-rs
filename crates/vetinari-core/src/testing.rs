@@ -599,6 +599,35 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
+/// A credential store that cannot be reached, as on a machine with no
+/// keychain service running.
+#[derive(Debug)]
+pub struct UnavailableCredentialStore;
+
+#[async_trait]
+impl CredentialStore for UnavailableCredentialStore {
+    async fn get(&self, _key: &CredentialKey) -> PortResult<Option<StoredCredential>> {
+        Err(PortError::unavailable(
+            "keychain",
+            "no usable credential store",
+        ))
+    }
+
+    async fn set(&self, _key: &CredentialKey, _credential: &StoredCredential) -> PortResult<()> {
+        Err(PortError::unavailable(
+            "keychain",
+            "no usable credential store",
+        ))
+    }
+
+    async fn delete(&self, _key: &CredentialKey) -> PortResult<bool> {
+        Err(PortError::unavailable(
+            "keychain",
+            "no usable credential store",
+        ))
+    }
+}
+
 /// A skill store backed by memory.
 #[derive(Debug)]
 pub struct MemorySkillStore(Mutex<SkillLibrary>);

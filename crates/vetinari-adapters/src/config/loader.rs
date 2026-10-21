@@ -266,3 +266,63 @@ mod tests {
         assert_eq!(loaded.path, Some(path));
     }
 }
+
+#[cfg(test)]
+mod example_tests {
+    use std::path::Path;
+
+    use vetinari_core::application::config::ParseContext;
+    use vetinari_core::domain::agent::TaskClass;
+    use vetinari_core::domain::credentials::Provider;
+
+    use super::load_file;
+
+    /// The example file ships as documentation, so it has to be correct: if it
+    /// stops loading, the documentation is wrong.
+    #[test]
+    fn the_example_configuration_loads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/config.example.toml")
+            .canonicalize()
+            .expect("the example configuration is in the repository");
+
+        let config = load_file(
+            &path,
+            &ParseContext {
+                home: Some(Path::new("/home/dev").to_path_buf()),
+            },
+        )
+        .expect("the example configuration loads");
+
+        assert_eq!(config.profiles.active().id().as_str(), "work");
+        assert_eq!(config.profiles.len(), 2);
+        assert_eq!(
+            config.profiles.active().repo_roots(),
+            &[Path::new("/home/dev/work").to_path_buf()]
+        );
+        assert_eq!(
+            config
+                .profiles
+                .active()
+                .routing()
+                .agent_for(TaskClass::PrSummary)
+                .as_str(),
+            "agy-gemini"
+        );
+        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.targets.len(), 3);
+        assert_eq!(config.sources.len(), 4);
+        assert!(config.oauth_client(Provider::GoogleCalendar).is_some());
+        assert_eq!(
+            config.keymap.lookup(
+                vetinari_core::domain::keymap::Mode::Normal,
+                vetinari_core::domain::keys::KeySequence::parse("SPC o o")
+                    .expect("sequence")
+                    .chords()
+            ),
+            vetinari_core::domain::keymap::Lookup::Action(
+                vetinari_core::domain::action::Action::AgentLogs
+            )
+        );
+    }
+}

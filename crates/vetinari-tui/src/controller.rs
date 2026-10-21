@@ -24,6 +24,9 @@ impl Controller {
     /// How many lines of agent output to fetch for the output overlay.
     pub const OUTPUT_LINES: usize = 200;
 
+    /// How many finished sessions stay in the monitor.
+    pub const FINISHED_SESSIONS_KEPT: usize = 20;
+
     /// Take ownership of a runtime.
     #[must_use]
     pub fn new(runtime: Runtime, library: SkillLibrary) -> Self {
@@ -55,6 +58,9 @@ impl Controller {
         for (session, error) in self.runtime.agents.poll().await {
             updates.push(Update::Log(format!("WARN session {session}: {error}")));
         }
+        self.runtime
+            .agents
+            .prune_finished(Self::FINISHED_SESSIONS_KEPT);
 
         let mut feed = self.runtime.attention.refresh(profile).await;
         let agent_items = self.runtime.agents.attention_items();
@@ -313,6 +319,39 @@ impl Controller {
                     ],
                     Err(error) => vec![Update::Status(describe_failure(
                         &format!("storing the {} credential", provider.display_name()),
+                        &error,
+                    ))],
+                }
+            }
+
+            Task::DelegateToSpace(session) => {
+                let placed = match (
+                    self.runtime.agents.session(&session),
+                    self.runtime.agents.spec_for(&session),
+                ) {
+                    (Some(tracked), Some(spec)) => tracked
+                        .space()
+                        .cloned()
+                        .map(|space| (space, tracked.agent().clone(), spec.clone())),
+                    _ => None,
+                };
+                let Some((space, agent, spec)) = placed else {
+                    return vec![Update::Status(StatusMessage::warn(format!(
+                        "{session} has no space to run in"
+                    )))];
+                };
+                match self
+                    .runtime
+                    .workflows
+                    .delegate_to_space(&space, &agent, &self.runtime.agents, &spec)
+                    .await
+                {
+                    Ok(command) => vec![Update::Status(StatusMessage::info(format!(
+                        "running {} in {space}",
+                        command.join(" ")
+                    )))],
+                    Err(error) => vec![Update::Status(describe_failure(
+                        &format!("running {agent} in {space}"),
                         &error,
                     ))],
                 }
@@ -968,6 +1007,57 @@ mod tests {
             .await;
         assert!(status_of(&updates).text.contains("re-running"));
         assert_eq!(h.controller.runtime().agents.sessions().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_session_can_be_run_in_its_space_beside_the_developer() {
+        let mut h = harness("");
+        h.controller
+            .run(
+                Task::StartFeedback(Box::new(feedback_request(&h.repo))),
+                &h.profile,
+            )
+            .await;
+        let session = h
+            .controller
+            .runtime()
+            .agents
+            .sessions()
+            .first()
+            .expect("a session")
+            .id()
+            .clone();
+
+        let updates = h
+            .controller
+            .run(Task::DelegateToSpace(session), &h.profile)
+            .await;
+
+        let status = status_of(&updates);
+        assert_eq!(
+            status.level,
+            crate::app::Level::Error,
+            "got {}",
+            status.text
+        );
+        assert!(
+            status.text.contains("editor target") || status.text.contains("does not support"),
+            "an editor cannot host a command, and says so: {}",
+            status.text
+        );
+    }
+
+    #[tokio::test]
+    async fn delegating_a_session_with_no_space_says_so() {
+        let mut h = harness("");
+        let updates = h
+            .controller
+            .run(
+                Task::DelegateToSpace(SessionId::parse("ghost").expect("id")),
+                &h.profile,
+            )
+            .await;
+        assert!(status_of(&updates).text.contains("no space"));
     }
 
     #[tokio::test]

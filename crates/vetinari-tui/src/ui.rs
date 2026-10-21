@@ -98,7 +98,17 @@ fn pane_block(app: &App, pane: Pane, extra: &str) -> Block<'static> {
 fn render_feed(frame: &mut Frame, app: &App, area: Rect) {
     let visible = app.feed().visible();
     let extra = if app.feed().filter().is_empty() {
-        format!("({})", visible.len())
+        let counts = app.feed().feed().counts_by_category();
+        if counts.is_empty() {
+            "(0)".to_owned()
+        } else {
+            let summary = counts
+                .iter()
+                .map(|(category, count)| format!("{} {count}", category.label()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("({summary})")
+        }
     } else {
         format!("(/{} - {})", app.feed().filter(), visible.len())
     };
@@ -604,6 +614,13 @@ mod tests {
         assert!(rendered.contains("[CAL] Sprint planning (scheduled)"));
         assert!(rendered.contains("[PR] Fix memory leak (CI failed)"));
         assert!(rendered.contains("in 15m"), "a meeting says how soon it is");
+    }
+
+    #[test]
+    fn the_feed_title_counts_what_is_waiting_by_category() {
+        let rendered = drawn(&app(), 100, 24);
+        assert!(rendered.contains("PR 1"), "got {rendered}");
+        assert!(rendered.contains("CAL 1"));
     }
 
     #[test]

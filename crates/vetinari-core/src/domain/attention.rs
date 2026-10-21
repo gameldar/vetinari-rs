@@ -180,20 +180,6 @@ impl ItemState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Priority(u32);
 
-impl Priority {
-    /// The raw score, for display and debugging.
-    #[must_use]
-    pub const fn score(&self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for Priority {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// A pull request or merge request, with everything a review workflow needs
 /// to create a worktree for it.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -55,12 +55,6 @@ impl KeymapEngine {
         &self.keymap
     }
 
-    /// Replace the keymap, e.g. after a config reload, discarding any prefix.
-    pub fn set_keymap(&mut self, keymap: Keymap) {
-        self.keymap = keymap;
-        self.pending.clear();
-    }
-
     /// The current mode.
     #[must_use]
     pub const fn mode(&self) -> Mode {
@@ -248,22 +242,6 @@ mod tests {
             press(&mut engine, "j"),
             Keystroke::Dispatch(Action::NavDown)
         );
-    }
-
-    #[test]
-    fn a_replaced_keymap_takes_effect_immediately() {
-        let mut engine = engine();
-        let mut custom = Keymap::empty();
-        custom
-            .bind(
-                Mode::Normal,
-                KeySequence::parse("x").expect("sequence"),
-                Action::Quit,
-            )
-            .expect("bind");
-        engine.set_keymap(custom);
-        assert_eq!(press(&mut engine, "x"), Keystroke::Dispatch(Action::Quit));
-        assert!(matches!(press(&mut engine, "j"), Keystroke::Unbound(_)));
     }
 
     #[test]

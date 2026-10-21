@@ -154,6 +154,17 @@ impl AuthService {
         let statuses = self.statuses(account).await;
         let authenticated = statuses.iter().filter(|s| s.is_usable()).count();
         let attention = statuses.iter().filter(|s| s.needs_attention()).count();
+        let unreadable = statuses
+            .iter()
+            .filter(|s| s.state == AuthState::Corrupt)
+            .count();
+
+        // If nothing at all can be read, the store is the problem rather than
+        // the credentials, and saying so is more use than counting failures.
+        if unreadable == statuses.len() && !statuses.is_empty() {
+            return "Keychain: unavailable on this machine".to_owned();
+        }
+
         match (authenticated, attention) {
             (0, 0) => "Keychain: none configured".to_owned(),
             (count, 0) => format!("Keychain: {count} authenticated"),
@@ -498,6 +509,27 @@ mod tests {
         assert_eq!(
             service.summary(None).await,
             "Keychain: 0 authenticated, 1 needs attention"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_credential_store_says_that_rather_than_counting_failures() {
+        let service = AuthService::new(
+            Arc::new(crate::testing::UnavailableCredentialStore),
+            Arc::new(FakeDeviceCodeFlow::new(0, LATER)),
+            Arc::new(FixedClock::new(NOW)),
+        );
+
+        assert_eq!(
+            service.summary(None).await,
+            "Keychain: unavailable on this machine"
+        );
+        assert!(
+            service
+                .statuses(None)
+                .await
+                .iter()
+                .all(|status| status.state == AuthState::Corrupt)
         );
     }
 

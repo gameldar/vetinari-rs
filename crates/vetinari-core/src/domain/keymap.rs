@@ -23,9 +23,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Every mode, for config validation and help output.
-    pub const ALL: &'static [Mode] = &[Mode::Normal, Mode::Insert];
-
     /// The name used in configuration files.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -296,6 +293,7 @@ impl Keymap {
             ("SPC w w", Action::WorkspaceNavigate),
             ("SPC w s", Action::WorkspaceFocusSpace),
             ("SPC w d", Action::WorkspaceCloseSpace),
+            ("SPC w r", Action::WorkspaceRunAgent),
             ("SPC s e", Action::SkillEditor),
             ("SPC s r", Action::SkillRun),
             ("SPC h k", Action::Help),

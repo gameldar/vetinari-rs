@@ -109,6 +109,7 @@ actions! {
     WorkspaceNavigate => "workspace-navigate", "Workspace targets";
     WorkspaceFocusSpace => "workspace-focus-space", "Focus space";
     WorkspaceCloseSpace => "workspace-close-space", "Close space";
+    WorkspaceRunAgent => "workspace-run-agent", "Run the agent in its space";
 
     ProfileCycle => "profile-cycle", "Switch context profile";
     ProfileMenu => "profile-menu", "Choose context profile";

@@ -9,5 +9,6 @@ pub mod app;
 pub mod controller;
 pub mod event;
 pub mod overlay;
+pub mod startup;
 pub mod text_input;
 pub mod ui;

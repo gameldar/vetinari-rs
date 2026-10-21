@@ -253,20 +253,6 @@ impl WorkflowEngine {
         Ok(command)
     }
 
-    /// Close a space and remove the worktree behind it.
-    pub async fn tear_down(&self, space: &SpaceId, worktree: Option<&Worktree>) -> Vec<PortError> {
-        let mut problems = Vec::new();
-        if let Err(error) = self.workspaces.close_space(space).await {
-            problems.push(error);
-        }
-        if let Some(worktree) = worktree
-            && let Err(error) = self.worktrees.remove(worktree).await
-        {
-            problems.push(error);
-        }
-        problems
-    }
-
     async fn run_isolated(
         &self,
         spec: TaskSpec,

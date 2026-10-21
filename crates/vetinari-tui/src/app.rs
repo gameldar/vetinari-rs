@@ -316,6 +316,9 @@ pub enum Task {
     AnswerAgent(SessionId, String),
     /// Fetch an agent's output.
     ShowAgentOutput(SessionId),
+    /// Run a session's task again inside its own space, beside the
+    /// developer's shell, instead of under Vetinari's supervision.
+    DelegateToSpace(SessionId),
     /// Save a skill.
     SaveSkill(Skill),
     /// Store a pasted API token.
@@ -898,6 +901,13 @@ impl App {
             Action::WorkspaceCloseSpace => match self.focusable_space() {
                 Some(space) => Outcome::Task(Task::CloseSpace(space)),
                 None => self.warn("nothing selected has a workspace space"),
+            },
+            Action::WorkspaceRunAgent => match self.selected_session() {
+                Some(session) if session.space.is_some() => {
+                    Outcome::Task(Task::DelegateToSpace(session.id.clone()))
+                }
+                Some(_) => self.warn("that session has no space to run in"),
+                None => self.warn("no agent session is selected"),
             },
 
             Action::ProfileCycle => {
@@ -2073,6 +2083,37 @@ mod tests {
         };
         assert_eq!(session.as_str(), "s1");
         assert_eq!(answer, "main");
+    }
+
+    #[test]
+    fn a_session_can_be_run_beside_the_developer_in_its_own_space() {
+        let mut app = app();
+        let mut row = SessionRow::sample("s1", "claude-code", "writing tests", "running");
+        row.space = Some(SpaceId::parse("space-7").expect("id"));
+        app.apply(Update::Sessions(vec![row]));
+
+        let outcome = press(&mut app, "SPC w r");
+
+        let Outcome::Task(Task::DelegateToSpace(session)) = outcome else {
+            panic!("expected a delegation task, got {outcome:?}");
+        };
+        assert_eq!(session.as_str(), "s1");
+    }
+
+    #[test]
+    fn a_session_with_no_space_cannot_be_run_beside_the_developer() {
+        let mut app = app();
+        app.apply(Update::Sessions(vec![SessionRow::sample(
+            "s1",
+            "claude-code",
+            "writing tests",
+            "running",
+        )]));
+
+        let outcome = press(&mut app, "SPC w r");
+
+        assert!(matches!(outcome, Outcome::Nothing));
+        assert!(app.status().expect("status").text.contains("no space"));
     }
 
     #[test]

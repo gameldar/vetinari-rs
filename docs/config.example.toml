@@ -1,0 +1,147 @@
+# Vetinari configuration.
+#
+# Copy to ~/.config/vetinari/config.toml and edit. Every section is optional:
+# with no configuration at all Vetinari starts with the Doom keymap, a work
+# and a home profile, a tmux target, and no attention sources.
+#
+# YAML is also accepted (~/.config/vetinari/config.yaml) with the same shape.
+
+[general]
+# Which profile to start in. Must match one of the [[profiles]] ids below.
+profile = "work"
+# How often the interface redraws, in milliseconds.
+tick_rate_ms = 250
+# How often sources are polled, in seconds.
+refresh_secs = 60
+# How many log lines to keep for feedback capture (<Space> f f sends these
+# to the implementing agent).
+log_lines = 200
+
+
+# --- Context profiles -------------------------------------------------------
+# Declaring any profile replaces the built-in work/home pair. <Space> p p
+# cycles between them; <Space> p l chooses one.
+
+[[profiles]]
+id = "work"
+name = "Work"
+# Where spaces are opened: "herdr", "tmux", or "editor".
+target = "herdr"
+# Which sources to poll. Omit to poll them all.
+sources = ["github", "jira", "slack", "calendar"]
+# Where repositories live; the first is used to resolve a pull request's
+# repository by name.
+repo_roots = ["~/work"]
+# Where worktrees are created. Without this, a .vetinari-worktrees directory
+# beside the repository is used.
+worktree_root = "~/work/.worktrees"
+# Scopes credentials, so work and home can hold separate tokens for one
+# provider.
+account = "work"
+
+# Which engine handles which class of work. Unlisted classes go to `default`.
+# Classes: deep-code-change, pr-review, pr-summary, issue-summary,
+# standup-summary, meeting-prep, enhancement, long-context-query.
+[profiles.routing]
+default = "claude-code"
+pr-summary = "agy-gemini"
+long-context-query = "agy-gemini"
+standup-summary = "summariser"
+
+[[profiles]]
+id = "home"
+name = "Home"
+target = "tmux"
+sources = ["github"]
+repo_roots = ["~/src"]
+account = "home"
+
+
+# --- Agent engines ----------------------------------------------------------
+# Declaring any engine replaces the built-in set. `kind` decides how the
+# prompt reaches the tool: claude-code uses --print, agy takes the prompt as
+# its last argument, and script receives it on stdin and in $VETINARI_PROMPT.
+
+[agents.claude-code]
+kind = "claude-code"
+command = "claude"
+args = ["--permission-mode", "acceptEdits"]
+
+[agents.agy-gemini]
+kind = "agy"
+command = "agy"
+
+[agents.summariser]
+kind = "script"
+command = "sh"
+args = ["-c", "printf '%s\\n' \"$VETINARI_PROMPT\""]
+env = { TZ = "UTC" }
+
+
+# --- Workspace targets ------------------------------------------------------
+
+[targets.herdr]
+# Herdr's Unix socket. Without this, $XDG_STATE_HOME/herdr/herdr.sock is used.
+socket = "~/.local/state/herdr/herdr.sock"
+
+[targets.tmux]
+# Vetinari keeps its own session so its windows never mix with yours.
+session = "vetinari"
+
+[targets.editor]
+command = "zed"
+args = []
+
+
+# --- Attention sources ------------------------------------------------------
+# Each needs a credential: run `vetinari auth <provider>` or press
+# <Space> h a in the interface.
+
+[sources.github]
+kind = "github"
+query = "is:open is:pr review-requested:@me archived:false"
+# base_url = "https://github.acme.test/api/v3"   # GitHub Enterprise
+
+[sources.jira]
+kind = "jira"
+base_url = "https://acme.atlassian.net"
+email = "dev@acme.test"
+jql = "assignee = currentUser() AND statusCategory != Done ORDER BY duedate"
+
+[sources.slack]
+kind = "slack"
+# Conversations to watch. Omit to use the direct messages Slack lists.
+channels = []
+
+[sources.calendar]
+kind = "google-calendar"
+calendar_id = "primary"
+lookahead_hours = 12
+
+
+# --- OAuth clients ----------------------------------------------------------
+# Only needed for providers that use the device-code flow (the calendars).
+# These identify the application rather than you; the tokens they obtain are
+# what goes in the keychain.
+
+[oauth.google-calendar]
+client_id = "000000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com"
+client_secret = "GOCSPX-xxxxxxxxxxxxxxxxxxxx"
+
+
+# --- Keybindings ------------------------------------------------------------
+# Bindings layer over the Doom Emacs defaults. Set defaults = false to start
+# from nothing instead. A binding that would shadow another is reported at
+# start-up rather than silently dropped.
+
+[keymap]
+defaults = true
+# Remove a default binding, e.g. to free its prefix for a longer sequence.
+unbind = { normal = [] }
+
+[keymap.normal]
+"SPC o o" = "agent-logs"
+"SPC o s" = "meeting-schedule"
+
+[keymap.insert]
+"C-c" = "cancel-pending"

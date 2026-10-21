@@ -149,21 +149,6 @@ impl AgentRegistry {
             .map(|tracked| &tracked.session)
     }
 
-    /// The sessions that are waiting on the developer.
-    #[must_use]
-    pub fn blocked_sessions(&self) -> Vec<&AgentSession> {
-        self.tracked
-            .iter()
-            .filter(|tracked| {
-                matches!(
-                    tracked.session.status(),
-                    AgentStatus::WaitingForInput { .. }
-                )
-            })
-            .map(|tracked| &tracked.session)
-            .collect()
-    }
-
     /// Stop a task.
     pub async fn cancel(&mut self, id: &SessionId) -> PortResult<()> {
         let engine = self.engine_for(id)?;
@@ -700,6 +685,69 @@ mod tests {
             .expect_err("unavailable");
 
         assert!(matches!(error, PortError::NotConfigured { .. }));
+    }
+
+    #[tokio::test]
+    async fn finished_sessions_are_pruned_so_the_monitor_does_not_grow_without_bound() {
+        let (mut registry, claude, _) = registry();
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let id = registry
+                .spawn(
+                    spec(TaskClass::PrSummary),
+                    &RoutingTable::new(agent_id("claude-code")),
+                    None,
+                )
+                .await
+                .expect("spawn");
+            claude.set_status(&id, AgentStatus::Succeeded);
+            ids.push(id);
+        }
+        let running = registry
+            .spawn(
+                spec(TaskClass::PrSummary),
+                &RoutingTable::new(agent_id("claude-code")),
+                None,
+            )
+            .await
+            .expect("spawn");
+        registry.poll().await;
+
+        registry.prune_finished(2);
+
+        assert_eq!(
+            registry.sessions().len(),
+            3,
+            "two finished plus the running one"
+        );
+        assert!(
+            registry.session(&running).is_some(),
+            "work in flight is never pruned"
+        );
+        assert!(
+            registry.session(&ids[0]).is_none(),
+            "the oldest finished session goes first"
+        );
+        assert!(registry.session(&ids[4]).is_some());
+    }
+
+    #[tokio::test]
+    async fn pruning_with_fewer_finished_sessions_than_the_limit_keeps_them_all() {
+        let (mut registry, claude, _) = registry();
+        let id = registry
+            .spawn(
+                spec(TaskClass::PrSummary),
+                &RoutingTable::new(agent_id("claude-code")),
+                None,
+            )
+            .await
+            .expect("spawn");
+        claude.set_status(&id, AgentStatus::Succeeded);
+        registry.poll().await;
+
+        registry.prune_finished(5);
+
+        assert_eq!(registry.sessions().len(), 1);
     }
 
     #[tokio::test]
