@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use vetinari_adapters::config::{APP_DIR, candidate_paths};
 use vetinari_core::application::auth::ProviderStatus;
 use vetinari_core::application::config::{AgentConfig, Config};
+use vetinari_core::domain::ids::Slug;
+use vetinari_core::domain::profile::ProfileSet;
 
 /// Where to look for configuration, in order.
 ///
@@ -25,6 +27,31 @@ pub fn config_candidates(explicit: Option<PathBuf>, config_dir: Option<&Path>) -
 #[must_use]
 pub fn skills_path(config_dir: &Path) -> PathBuf {
     config_dir.join(APP_DIR).join("skills.toml")
+}
+
+/// Which credential account a command-line invocation should read and write.
+///
+/// The interface scopes credentials by the active profile's account, so
+/// `auth` and `doctor` have to agree with it: storing a token the interface
+/// then reports as missing is worse than not storing one at all. An explicit
+/// `--account` wins, for setting up a profile that is not the active one.
+///
+/// # Errors
+///
+/// Returns the name unchanged when it is not a usable account name.
+pub fn account_for(explicit: Option<&str>, profiles: &ProfileSet) -> Result<Option<Slug>, String> {
+    match explicit {
+        Some(name) => Slug::parse(name)
+            .map(Some)
+            .map_err(|error| format!("{name:?} is not a usable account name: {error}")),
+        None => Ok(profiles.active().account().cloned()),
+    }
+}
+
+/// How to describe the account a credential is filed under.
+#[must_use]
+pub fn account_label(account: Option<&Slug>) -> &str {
+    account.map_or("default", Slug::as_str)
 }
 
 /// What `vetinari doctor` prints.
@@ -75,6 +102,10 @@ pub fn doctor_report(
     if let Some(keychain) = keychain {
         lines.push(format!("keychain: {keychain}"));
     }
+    lines.push(format!(
+        "credential account: {}",
+        account_label(config.profiles.active().account())
+    ));
 
     for engine in &config.agents {
         let state = if missing_engines
@@ -276,5 +307,101 @@ mod tests {
         let report = doctor_report(&config(""), None, &[], &[], &[], &[], None);
         assert!(report[0].contains("built-in defaults"));
         assert!(report.iter().any(|line| line.contains("none configured")));
+    }
+    #[test]
+    fn the_command_line_defaults_to_the_active_profiles_account() {
+        // The symptom this fixes: `vetinari auth github` stored a credential
+        // under "default" while the interface looked under "work" and
+        // reported "Keychain: none configured".
+        let config = config(
+            r#"
+            [[profiles]]
+            id = "work"
+            name = "Work"
+            target = "tmux"
+            account = "work"
+            "#,
+        );
+
+        let account = account_for(None, &config.profiles).expect("an account");
+
+        assert_eq!(account.as_ref().map(Slug::as_str), Some("work"));
+    }
+
+    #[test]
+    fn a_profile_with_no_account_uses_the_default_one() {
+        let config = config(
+            r#"
+            [[profiles]]
+            id = "work"
+            name = "Work"
+            target = "tmux"
+            "#,
+        );
+
+        assert_eq!(account_for(None, &config.profiles).expect("ok"), None);
+        assert_eq!(account_label(None), "default");
+    }
+
+    #[test]
+    fn an_explicit_account_wins_so_another_profile_can_be_set_up() {
+        let config = config(
+            r#"
+            [[profiles]]
+            id = "work"
+            name = "Work"
+            target = "tmux"
+            account = "work"
+            "#,
+        );
+
+        let account = account_for(Some("home"), &config.profiles).expect("an account");
+
+        assert_eq!(account.as_ref().map(Slug::as_str), Some("home"));
+        assert_eq!(account_label(account.as_ref()), "home");
+    }
+
+    #[test]
+    fn an_account_name_that_cannot_be_a_key_is_refused_rather_than_mangled() {
+        let config = config(
+            r#"
+            [[profiles]]
+            id = "work"
+            name = "Work"
+            target = "tmux"
+            "#,
+        );
+
+        let error = account_for(Some("not a slug!"), &config.profiles).expect_err("refused");
+
+        assert!(error.contains("not a slug!"), "{error}");
+    }
+
+    #[test]
+    fn doctor_says_which_account_it_read() {
+        let config = config(
+            r#"
+            [[profiles]]
+            id = "work"
+            name = "Work"
+            target = "tmux"
+            account = "work"
+            "#,
+        );
+
+        let report = doctor_report(
+            &config,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            Some("Keychain: none configured"),
+        );
+
+        assert!(
+            report.iter().any(|line| line == "credential account: work"),
+            "a keychain line without the account it read is what made this confusing: {report:?}"
+        );
     }
 }

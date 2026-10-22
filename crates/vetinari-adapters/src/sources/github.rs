@@ -27,8 +27,6 @@ pub struct GitHubSettings {
     pub query: String,
     /// An enterprise API base URL, when not github.com.
     pub base_url: Option<String>,
-    /// The credential account to use.
-    pub account: Option<Slug>,
 }
 
 /// Pull requests, checks, and issues from GitHub.
@@ -91,9 +89,9 @@ impl GitHubSource {
         format!("{base}{path}")
     }
 
-    async fn token(&self) -> PortResult<String> {
+    async fn token(&self, account: Option<&Slug>) -> PortResult<String> {
         self.auth
-            .token(Provider::GitHub, self.settings.account.clone())
+            .token(Provider::GitHub, account.cloned())
             .await
             .map(|secret| secret.expose().to_owned())
     }
@@ -156,8 +154,8 @@ impl AttentionSource for GitHubSource {
         SourceCategory::CodeReview
     }
 
-    async fn fetch(&self) -> PortResult<Vec<AttentionItem>> {
-        let token = self.token().await?;
+    async fn fetch(&self, account: Option<&Slug>) -> PortResult<Vec<AttentionItem>> {
+        let token = self.token(account).await?;
         let body = json!({
             "query": SEARCH_QUERY,
             "variables": { "q": self.settings.query, "n": Self::PAGE_SIZE },
@@ -198,8 +196,13 @@ impl AttentionSource for GitHubSource {
 
 #[async_trait]
 impl CodeHostSource for GitHubSource {
-    async fn approve(&self, pr: &PullRequestRef, comment: Option<&str>) -> PortResult<()> {
-        let token = self.token().await?;
+    async fn approve(
+        &self,
+        account: Option<&Slug>,
+        pr: &PullRequestRef,
+        comment: Option<&str>,
+    ) -> PortResult<()> {
+        let token = self.token(account).await?;
         let body = json!({ "event": "APPROVE", "body": comment.unwrap_or("") });
         self.send(
             self.http
@@ -212,8 +215,13 @@ impl CodeHostSource for GitHubSource {
         Ok(())
     }
 
-    async fn comment(&self, pr: &PullRequestRef, body: &str) -> PortResult<()> {
-        let token = self.token().await?;
+    async fn comment(
+        &self,
+        account: Option<&Slug>,
+        pr: &PullRequestRef,
+        body: &str,
+    ) -> PortResult<()> {
+        let token = self.token(account).await?;
         self.send(
             self.http
                 .inner()
@@ -380,13 +388,32 @@ mod tests {
         ))
     }
 
+    /// An auth service holding a token filed under a named account only.
+    fn auth_for_account(account: &str) -> Arc<AuthService> {
+        let store = Arc::new(MemoryCredentialStore::default());
+        store.seed(
+            &vetinari_core::domain::credentials::CredentialKey::new(
+                Provider::GitHub,
+                Some(Slug::parse(account).expect("account")),
+            ),
+            vetinari_core::domain::credentials::StoredCredential::api_token(Secret::new(
+                "ghp_work_only",
+            )),
+        );
+        let flow: Arc<dyn DeviceCodeFlow> = Arc::new(FakeDeviceCodeFlow::new(0, NOW));
+        Arc::new(AuthService::new(
+            store,
+            flow,
+            Arc::new(FixedClock::new(NOW)),
+        ))
+    }
+
     fn source(base_url: &str, with_token: bool) -> GitHubSource {
         GitHubSource::new(
             SourceId::parse("github").expect("id"),
             GitHubSettings {
                 query: "is:open is:pr review-requested:@me".to_owned(),
                 base_url: Some(base_url.to_owned()),
-                account: None,
             },
             HttpClient::new().expect("client"),
             auth(with_token),
@@ -418,7 +445,7 @@ mod tests {
             MockServer::with_json(&pull_request_payload("SUCCESS", "REVIEW_REQUIRED", false)).await;
         let source = source(&server.base_url, true);
 
-        source.fetch().await.expect("fetch");
+        source.fetch(None).await.expect("fetch");
 
         let request = server.request();
         assert_eq!(request.method, "POST");
@@ -439,7 +466,10 @@ mod tests {
     async fn a_pull_request_becomes_an_item_with_everything_a_review_needs() {
         let server =
             MockServer::with_json(&pull_request_payload("SUCCESS", "REVIEW_REQUIRED", false)).await;
-        let items = source(&server.base_url, true).fetch().await.expect("fetch");
+        let items = source(&server.base_url, true)
+            .fetch(None)
+            .await
+            .expect("fetch");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -467,7 +497,10 @@ mod tests {
     async fn a_failing_build_outranks_a_review_request_in_the_state_it_reports() {
         let server =
             MockServer::with_json(&pull_request_payload("FAILURE", "REVIEW_REQUIRED", false)).await;
-        let items = source(&server.base_url, true).fetch().await.expect("fetch");
+        let items = source(&server.base_url, true)
+            .fetch(None)
+            .await
+            .expect("fetch");
         assert_eq!(items[0].state(), ItemState::CiFailed);
     }
 
@@ -475,7 +508,10 @@ mod tests {
     async fn a_build_still_running_says_so() {
         let server =
             MockServer::with_json(&pull_request_payload("PENDING", "REVIEW_REQUIRED", false)).await;
-        let items = source(&server.base_url, true).fetch().await.expect("fetch");
+        let items = source(&server.base_url, true)
+            .fetch(None)
+            .await
+            .expect("fetch");
         assert_eq!(items[0].state(), ItemState::CiRunning);
     }
 
@@ -484,7 +520,10 @@ mod tests {
         let server =
             MockServer::with_json(&pull_request_payload("SUCCESS", "CHANGES_REQUESTED", false))
                 .await;
-        let items = source(&server.base_url, true).fetch().await.expect("fetch");
+        let items = source(&server.base_url, true)
+            .fetch(None)
+            .await
+            .expect("fetch");
         assert_eq!(items[0].state(), ItemState::ChangesRequested);
     }
 
@@ -492,7 +531,10 @@ mod tests {
     async fn a_draft_pull_request_is_work_in_progress_rather_than_a_review() {
         let server =
             MockServer::with_json(&pull_request_payload("SUCCESS", "REVIEW_REQUIRED", true)).await;
-        let items = source(&server.base_url, true).fetch().await.expect("fetch");
+        let items = source(&server.base_url, true)
+            .fetch(None)
+            .await
+            .expect("fetch");
         assert_eq!(items[0].state(), ItemState::InProgress);
     }
 
@@ -511,7 +553,10 @@ mod tests {
         )
         .await;
 
-        let items = source(&server.base_url, true).fetch().await.expect("fetch");
+        let items = source(&server.base_url, true)
+            .fetch(None)
+            .await
+            .expect("fetch");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].category(), SourceCategory::IssueTracking);
@@ -534,7 +579,10 @@ mod tests {
         )
         .await;
 
-        let items = source(&server.base_url, true).fetch().await.expect("fetch");
+        let items = source(&server.base_url, true)
+            .fetch(None)
+            .await
+            .expect("fetch");
 
         assert_eq!(items.len(), 1, "only the describable node survives");
         assert_eq!(items[0].title().as_str(), "Fine");
@@ -548,7 +596,7 @@ mod tests {
         .await;
 
         let error = source(&server.base_url, true)
-            .fetch()
+            .fetch(None)
             .await
             .expect_err("graphql error");
 
@@ -562,7 +610,7 @@ mod tests {
             MockServer::start(vec![(401, r#"{"message":"Bad credentials"}"#.to_owned())]).await;
 
         let error = source(&server.base_url, true)
-            .fetch()
+            .fetch(None)
             .await
             .expect_err("unauthorized");
 
@@ -578,7 +626,7 @@ mod tests {
     async fn a_server_error_is_transient_so_the_next_refresh_tries_again() {
         let server = MockServer::start(vec![(500, "boom".to_owned())]).await;
         let error = source(&server.base_url, true)
-            .fetch()
+            .fetch(None)
             .await
             .expect_err("server error");
         assert!(error.is_transient());
@@ -588,7 +636,7 @@ mod tests {
     async fn rate_limiting_is_transient_too() {
         let server = MockServer::start(vec![(429, "slow down".to_owned())]).await;
         let error = source(&server.base_url, true)
-            .fetch()
+            .fetch(None)
             .await
             .expect_err("rate limited");
         assert!(error.is_transient());
@@ -598,7 +646,7 @@ mod tests {
     async fn a_reply_that_is_not_json_is_a_protocol_error() {
         let server = MockServer::with_json("<html>nope</html>").await;
         let error = source(&server.base_url, true)
-            .fetch()
+            .fetch(None)
             .await
             .expect_err("not json");
         assert!(matches!(error, PortError::Protocol { .. }));
@@ -608,7 +656,7 @@ mod tests {
     async fn without_a_token_nothing_is_sent_at_all() {
         let server = MockServer::with_json("{}").await;
         let error = source(&server.base_url, false)
-            .fetch()
+            .fetch(None)
             .await
             .expect_err("no token");
         assert!(matches!(error, PortError::Unauthenticated { .. }));
@@ -628,7 +676,7 @@ mod tests {
         };
 
         source
-            .approve(&pr, Some("looks good"))
+            .approve(None, &pr, Some("looks good"))
             .await
             .expect("approve");
 
@@ -651,7 +699,10 @@ mod tests {
             clone_url: "https://github.test/acme/web.git".to_owned(),
         };
 
-        source.comment(&pr, "one question").await.expect("comment");
+        source
+            .comment(None, &pr, "one question")
+            .await
+            .expect("comment");
 
         let request = server.request();
         assert_eq!(request.target, "/repos/acme/web/issues/142/comments");
@@ -674,7 +725,7 @@ mod tests {
             clone_url: "u".to_owned(),
         };
 
-        let error = source.approve(&pr, None).await.expect_err("refused");
+        let error = source.approve(None, &pr, None).await.expect_err("refused");
 
         match error {
             PortError::Refused { detail, .. } => {
@@ -691,7 +742,6 @@ mod tests {
             GitHubSettings {
                 query: "is:open".to_owned(),
                 base_url: None,
-                account: None,
             },
             HttpClient::new().expect("client"),
             auth(true),
@@ -716,5 +766,93 @@ mod tests {
         let source = source("http://example.test", true);
         assert_eq!(source.category(), SourceCategory::CodeReview);
         assert_eq!(source.id().as_str(), "github");
+    }
+    #[tokio::test]
+    async fn fetching_as_an_account_uses_that_accounts_credential() {
+        // The profile scopes credentials, so a source must read the key the
+        // header reports and `vetinari auth` wrote - not a fixed one.
+        let server =
+            MockServer::start(vec![(200, pull_request_payload("SUCCESS", "", false))]).await;
+        let source = GitHubSource::new(
+            SourceId::parse("github").expect("id"),
+            GitHubSettings {
+                query: "is:open".to_owned(),
+                base_url: Some(server.base_url.clone()),
+            },
+            HttpClient::new().expect("client"),
+            auth_for_account("work"),
+        );
+
+        let items = source
+            .fetch(Some(&Slug::parse("work").expect("account")))
+            .await
+            .expect("fetch");
+
+        assert_eq!(items.len(), 1);
+        let request = server.request();
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer ghp_work_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetching_without_an_account_does_not_reach_an_accounts_credential() {
+        let server =
+            MockServer::start(vec![(200, pull_request_payload("SUCCESS", "", false))]).await;
+        let source = GitHubSource::new(
+            SourceId::parse("github").expect("id"),
+            GitHubSettings {
+                query: "is:open".to_owned(),
+                base_url: Some(server.base_url.clone()),
+            },
+            HttpClient::new().expect("client"),
+            auth_for_account("work"),
+        );
+
+        let error = source.fetch(None).await.expect_err("no default credential");
+
+        assert!(
+            matches!(
+                error,
+                vetinari_core::application::ports::PortError::Unauthenticated { .. }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_as_an_account_uses_that_accounts_credential() {
+        let server = MockServer::start(vec![(200, "{}".to_owned())]).await;
+        let source = GitHubSource::new(
+            SourceId::parse("github").expect("id"),
+            GitHubSettings {
+                query: "is:open".to_owned(),
+                base_url: Some(server.base_url.clone()),
+            },
+            HttpClient::new().expect("client"),
+            auth_for_account("work"),
+        );
+
+        source
+            .approve(
+                Some(&Slug::parse("work").expect("account")),
+                &PullRequestRef {
+                    repo: "acme/web".to_owned(),
+                    number: 142,
+                    head_ref: "fix".to_owned(),
+                    base_ref: "main".to_owned(),
+                    clone_url: String::new(),
+                },
+                None,
+            )
+            .await
+            .expect("approve");
+
+        let request = server.request();
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer ghp_work_only")
+        );
     }
 }

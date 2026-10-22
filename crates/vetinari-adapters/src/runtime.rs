@@ -5,7 +5,7 @@
 //! the core and out of the TUI.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use vetinari_core::application::agents::AgentRegistry;
@@ -14,9 +14,10 @@ use vetinari_core::application::auth::AuthService;
 use vetinari_core::application::config::{
     AgentConfig, Config, SourceConfig, SourceSettings, TargetConfig, TargetSettings,
 };
+use vetinari_core::application::observed::ObservedAgents;
 use vetinari_core::application::ports::{
-    ChatSource, Clock, CodeHostSource, CredentialStore, DeviceCodeFlow, IssueTrackerSource,
-    PortResult, ScheduleSource, SkillStore, WorkspaceTarget, WorktreeManager,
+    ChatSource, Clock, CodeHostSource, CredentialStore, DeviceCodeFlow, ExternalAgentSource,
+    IssueTrackerSource, PortResult, ScheduleSource, SkillStore, WorkspaceTarget, WorktreeManager,
 };
 use vetinari_core::application::skills::SkillService;
 use vetinari_core::application::workflows::WorkflowEngine;
@@ -35,6 +36,7 @@ use crate::sources::{
     GitHubSettings, GitHubSource, GoogleCalendarSettings, GoogleCalendarSource, JiraSettings,
     JiraSource, SlackSettings, SlackSource,
 };
+use crate::workspace::herdr::SocketLocation;
 use crate::workspace::{EditorTarget, HerdrSocketTarget, TmuxTarget};
 
 /// Where Vetinari keeps its files.
@@ -58,6 +60,8 @@ pub struct Runtime {
     pub attention: AttentionEngine,
     /// The agent engines and their sessions.
     pub agents: AgentRegistry,
+    /// The agents running in workspace targets that Vetinari did not start.
+    pub observed: ObservedAgents,
     /// Worktrees, spaces, and the workflows that compose them.
     pub workflows: WorkflowEngine,
     /// The skill library's store.
@@ -125,8 +129,28 @@ impl Runtime {
         }
 
         let mut workspaces = WorkspaceDirectory::default();
+        let mut observed = ObservedAgents::default();
         for target in &config.targets {
-            workspaces.register(build_target(target, &paths.state_dir));
+            let built = build_target(target, &paths);
+            // A trait object cannot be widened after the fact, so whether a
+            // target can report its own agents is decided here, where the
+            // concrete type is still known.
+            if let Some(watcher) = built.observer {
+                observed.register(watcher);
+            }
+            workspaces.register(built.target);
+        }
+
+        // A profile that opens spaces on a target nobody configured fails only
+        // when a workflow reaches for it, which is too late to be useful.
+        for profile in config.profiles.iter() {
+            if !workspaces.has(profile.target()) {
+                problems.push(format!(
+                    "profile {} opens spaces on {}, which is not configured",
+                    profile.id(),
+                    profile.target().name()
+                ));
+            }
         }
 
         let mut attention = AttentionEngine::new(clock.clone());
@@ -167,6 +191,7 @@ impl Runtime {
             auth,
             attention,
             agents,
+            observed,
             workflows: WorkflowEngine::new(worktrees, workspaces),
             skills: SkillService::new(skills),
             code_hosts,
@@ -214,17 +239,31 @@ impl Runtime {
     }
 }
 
-fn build_target(target: &TargetConfig, state_dir: &Path) -> Arc<dyn WorkspaceTarget> {
+/// A target, and whether it can also report the agents running inside it.
+struct BuiltTarget {
+    target: Arc<dyn WorkspaceTarget>,
+    observer: Option<Arc<dyn ExternalAgentSource>>,
+}
+
+fn build_target(target: &TargetConfig, paths: &Paths) -> BuiltTarget {
     match &target.settings {
         TargetSettings::Herdr { socket } => {
-            Arc::new(HerdrSocketTarget::new(socket.clone().unwrap_or_else(
-                || HerdrSocketTarget::default_socket(Some(state_dir)),
-            )))
+            let herdr = Arc::new(HerdrSocketTarget::at(
+                &SocketLocation::from_env(Some(&paths.config_dir)).configured(socket.clone()),
+            ));
+            BuiltTarget {
+                target: herdr.clone(),
+                observer: Some(herdr),
+            }
         }
-        TargetSettings::Tmux { session } => Arc::new(TmuxTarget::new(session.clone())),
-        TargetSettings::Editor { command, args } => {
-            Arc::new(EditorTarget::new(command.clone(), args.clone()))
-        }
+        TargetSettings::Tmux { session } => BuiltTarget {
+            target: Arc::new(TmuxTarget::new(session.clone())),
+            observer: None,
+        },
+        TargetSettings::Editor { command, args } => BuiltTarget {
+            target: Arc::new(EditorTarget::new(command.clone(), args.clone())),
+            observer: None,
+        },
     }
 }
 
@@ -254,7 +293,6 @@ fn build_source(
                 GitHubSettings {
                     query: query.clone(),
                     base_url: base_url.clone(),
-                    account: None,
                 },
                 http.clone(),
                 auth.clone(),
@@ -270,7 +308,6 @@ fn build_source(
                 base_url: base_url.clone(),
                 email: email.clone(),
                 jql: jql.clone(),
-                account: None,
             },
             http.clone(),
             auth.clone(),
@@ -279,7 +316,6 @@ fn build_source(
             id,
             SlackSettings {
                 channels: channels.clone(),
-                account: None,
                 base_url: None,
             },
             http.clone(),
@@ -293,7 +329,6 @@ fn build_source(
             GoogleCalendarSettings {
                 calendar_id: calendar_id.clone(),
                 lookahead_hours: *lookahead_hours,
-                account: None,
                 base_url: None,
             },
             http.clone(),
@@ -343,6 +378,32 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_whose_target_is_not_configured_is_reported_at_start_up() {
+        // Otherwise it fails only when a workflow reaches for the target, and
+        // the monitor just stays empty.
+        let runtime = runtime(
+            r#"
+            [[profiles]]
+            id = "work"
+            name = "Work"
+            target = "herdr"
+
+            [targets.tmux]
+            session = "vetinari"
+            "#,
+        );
+
+        assert!(
+            runtime
+                .problems
+                .iter()
+                .any(|problem| problem.contains("work") && problem.contains("herdr")),
+            "got {:?}",
+            runtime.problems
+        );
+    }
+
+    #[test]
     fn an_empty_configuration_still_produces_a_working_runtime() {
         let runtime = runtime("");
 
@@ -356,7 +417,18 @@ mod tests {
         assert_eq!(engines, vec!["agy-gemini", "claude-code", "script"]);
         assert_eq!(
             runtime.workflows.workspaces().kinds(),
-            vec![TargetKind::Tmux]
+            vec![TargetKind::Herdr, TargetKind::Tmux],
+            "the built-in profiles target both, so both have to be there"
+        );
+        assert_eq!(
+            runtime.observed.targets(),
+            vec![TargetKind::Herdr],
+            "herdr is the only default target that reports its own agents"
+        );
+        assert!(
+            runtime.problems.is_empty(),
+            "no profile should be left without its target: {:?}",
+            runtime.problems
         );
         assert!(runtime.attention.source_ids().is_empty());
         assert!(runtime.problems.is_empty());

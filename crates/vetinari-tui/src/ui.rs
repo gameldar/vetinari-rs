@@ -182,6 +182,21 @@ fn render_monitor(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    if !app.observed_agents().is_empty() {
+        rows.push(ListItem::new(Line::styled(
+            "  -- agents Vetinari did not start --",
+            Style::default().fg(Color::DarkGray),
+        )));
+        rows.extend(app.observed_agents().iter().map(|agent| {
+            let style = if agent.blocked {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            ListItem::new(Line::styled(format!("  {}", agent.label), style))
+        }));
+    }
+
     if !app.spaces().is_empty() {
         rows.push(ListItem::new(Line::styled(
             "  -- spaces --",
@@ -498,7 +513,7 @@ mod tests {
     use vetinari_core::domain::skill::SkillLibrary;
     use vetinari_core::domain::text::NonEmptyText;
 
-    use crate::app::{SessionRow, SpaceRow, StatusMessage, Update};
+    use crate::app::{ObservedAgentRow, SessionRow, SpaceRow, StatusMessage, Update};
 
     const NOW: OffsetDateTime = datetime!(2026-10-21 09:00 UTC);
 
@@ -650,6 +665,32 @@ mod tests {
         press(&mut app, "RET");
         let rendered = drawn(&app, 100, 24);
         assert!(rendered.contains("/memory"));
+    }
+
+    #[test]
+    fn the_monitor_lists_the_agents_vetinari_did_not_start_and_marks_a_blocked_one() {
+        let mut app = app();
+        app.apply(Update::ObservedAgents(vec![
+            ObservedAgentRow::from_observed(&vetinari_core::domain::agent::ObservedAgent::new(
+                vetinari_core::domain::ids::SpaceId::parse("w1:p1").expect("pane"),
+                Some(vetinari_core::domain::ids::SpaceId::parse("w1").expect("workspace")),
+                "claude",
+                vetinari_core::domain::agent::ObservedAgentState::Blocked,
+                vetinari_core::domain::workspace::TargetKind::Herdr,
+                None,
+            )),
+        ]));
+
+        let rendered = drawn(&app, 120, 30);
+
+        assert!(
+            rendered.contains("agents Vetinari did not start"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("herdr claude [w1] (blocked)"),
+            "{rendered}"
+        );
     }
 
     #[test]

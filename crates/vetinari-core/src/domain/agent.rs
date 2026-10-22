@@ -13,6 +13,7 @@ use time::{Duration, OffsetDateTime};
 use super::attention::ItemState;
 use super::ids::{AgentId, SessionId, SkillId, SpaceId};
 use super::text::NonEmptyText;
+use super::workspace::TargetKind;
 
 /// The kind of work a task represents. Routing rules are written against
 /// these rather than against free text, so a rule cannot name work that does
@@ -398,6 +399,158 @@ impl AgentSession {
     }
 }
 
+/// Where an agent Vetinari did not start has got to.
+///
+/// A workspace target such as Herdr runs agents of its own, started by the
+/// developer rather than by a Vetinari workflow. Their states are the
+/// target's vocabulary, not Vetinari's, so they are modelled separately from
+/// [`AgentStatus`]: nothing here can be cancelled, answered, or re-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedAgentState {
+    /// Working.
+    Working,
+    /// Stopped, needing input or approval before it can continue.
+    Blocked,
+    /// Finished, and the developer has not looked yet.
+    Done,
+    /// Finished, and the developer has looked.
+    Idle,
+    /// The target could not say.
+    Unknown,
+}
+
+impl ObservedAgentState {
+    /// Read a target's own state name.
+    ///
+    /// An unrecognised name is [`ObservedAgentState::Unknown`] rather than an
+    /// error: a target that grows a new state should not stop the monitor
+    /// listing the agents it already understands.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "working" => ObservedAgentState::Working,
+            "blocked" => ObservedAgentState::Blocked,
+            "done" => ObservedAgentState::Done,
+            "idle" => ObservedAgentState::Idle,
+            _ => ObservedAgentState::Unknown,
+        }
+    }
+
+    /// The short label for the monitor pane.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            ObservedAgentState::Working => "working",
+            ObservedAgentState::Blocked => "blocked",
+            ObservedAgentState::Done => "done",
+            ObservedAgentState::Idle => "idle",
+            ObservedAgentState::Unknown => "unknown",
+        }
+    }
+
+    /// How the feed should rank it.
+    ///
+    /// A blocked agent is the most expensive thing in the inbox whether or
+    /// not Vetinari started it - it is burning time right now - so it maps to
+    /// the same state as one of Vetinari's own.
+    #[must_use]
+    pub const fn as_item_state(&self) -> ItemState {
+        match self {
+            ObservedAgentState::Working => ItemState::AgentRunning,
+            ObservedAgentState::Blocked => ItemState::AgentWaiting,
+            ObservedAgentState::Done => ItemState::AgentDone,
+            // Seen and finished, or unknowable: nothing outstanding either
+            // way, and both belong below everything actionable.
+            ObservedAgentState::Idle | ObservedAgentState::Unknown => ItemState::Resolved,
+        }
+    }
+}
+
+/// An agent running in a workspace target that Vetinari did not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedAgent {
+    pane: SpaceId,
+    workspace: Option<SpaceId>,
+    name: String,
+    state: ObservedAgentState,
+    target: TargetKind,
+    source: Option<String>,
+}
+
+impl ObservedAgent {
+    /// Record what a target reported.
+    #[must_use]
+    pub fn new(
+        pane: SpaceId,
+        workspace: Option<SpaceId>,
+        name: impl Into<String>,
+        state: ObservedAgentState,
+        target: TargetKind,
+        source: Option<String>,
+    ) -> Self {
+        Self {
+            pane,
+            workspace,
+            name: name.into(),
+            state,
+            target,
+            source,
+        }
+    }
+
+    /// The terminal it occupies, which is how the target addresses it.
+    #[must_use]
+    pub const fn pane(&self) -> &SpaceId {
+        &self.pane
+    }
+
+    /// The space it is running in, when the target says.
+    #[must_use]
+    pub const fn workspace(&self) -> Option<&SpaceId> {
+        self.workspace.as_ref()
+    }
+
+    /// What the target calls it, e.g. `claude`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Where it has got to.
+    #[must_use]
+    pub const fn state(&self) -> ObservedAgentState {
+        self.state
+    }
+
+    /// Which target is running it.
+    #[must_use]
+    pub const fn target(&self) -> TargetKind {
+        self.target
+    }
+
+    /// How the target knows about it, e.g. a screen manifest.
+    #[must_use]
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// One line for the monitor pane.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let where_it_is = self.workspace.as_ref().map_or_else(
+            || self.pane.as_str().to_owned(),
+            |id| id.as_str().to_owned(),
+        );
+        format!(
+            "{} {} [{}] ({})",
+            self.target.name(),
+            self.name,
+            where_it_is,
+            self.state.label()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +709,84 @@ mod tests {
         );
         session.attach_space(SpaceId::parse("space-3").expect("id"));
         assert_eq!(session.space().map(SpaceId::as_str), Some("space-3"));
+    }
+    #[test]
+    fn an_observed_agents_state_is_ranked_as_vetinaris_own_would_be() {
+        assert_eq!(
+            ObservedAgentState::Blocked.as_item_state(),
+            ItemState::AgentWaiting
+        );
+        assert_eq!(
+            ObservedAgentState::Working.as_item_state(),
+            ItemState::AgentRunning
+        );
+        assert_eq!(
+            ObservedAgentState::Done.as_item_state(),
+            ItemState::AgentDone
+        );
+        assert_eq!(
+            ObservedAgentState::Idle.as_item_state(),
+            ItemState::Resolved
+        );
+        assert_eq!(
+            ObservedAgentState::Unknown.as_item_state(),
+            ItemState::Resolved
+        );
+    }
+
+    #[test]
+    fn a_targets_state_names_are_read_and_an_unknown_one_does_not_lose_the_agent() {
+        assert_eq!(
+            ObservedAgentState::parse("working"),
+            ObservedAgentState::Working
+        );
+        assert_eq!(
+            ObservedAgentState::parse(" Blocked "),
+            ObservedAgentState::Blocked
+        );
+        assert_eq!(ObservedAgentState::parse("done"), ObservedAgentState::Done);
+        assert_eq!(ObservedAgentState::parse("idle"), ObservedAgentState::Idle);
+        assert_eq!(
+            ObservedAgentState::parse("reticulating-splines"),
+            ObservedAgentState::Unknown
+        );
+    }
+
+    #[test]
+    fn a_finished_observed_agent_is_not_actionable() {
+        assert!(ObservedAgentState::Blocked.as_item_state().is_actionable());
+        assert!(ObservedAgentState::Working.as_item_state().is_actionable());
+        assert!(!ObservedAgentState::Done.as_item_state().is_actionable());
+        assert!(!ObservedAgentState::Idle.as_item_state().is_actionable());
+    }
+
+    #[test]
+    fn an_observed_agent_describes_itself_by_the_space_it_occupies() {
+        let agent = ObservedAgent::new(
+            SpaceId::parse("w1:p2").expect("pane"),
+            Some(SpaceId::parse("w1").expect("workspace")),
+            "claude",
+            ObservedAgentState::Blocked,
+            TargetKind::Herdr,
+            Some("screen-manifest".to_owned()),
+        );
+
+        assert_eq!(agent.describe(), "herdr claude [w1] (blocked)");
+        assert_eq!(agent.pane().as_str(), "w1:p2");
+        assert_eq!(agent.source(), Some("screen-manifest"));
+    }
+
+    #[test]
+    fn an_observed_agent_without_a_workspace_falls_back_to_its_pane() {
+        let agent = ObservedAgent::new(
+            SpaceId::parse("w1:p2").expect("pane"),
+            None,
+            "codex",
+            ObservedAgentState::Working,
+            TargetKind::Herdr,
+            None,
+        );
+
+        assert_eq!(agent.describe(), "herdr codex [w1:p2] (working)");
     }
 }

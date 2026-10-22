@@ -29,8 +29,6 @@ pub struct GoogleCalendarSettings {
     pub calendar_id: String,
     /// How far ahead to look.
     pub lookahead_hours: u16,
-    /// The credential account to use.
-    pub account: Option<Slug>,
     /// An API base URL, for testing.
     pub base_url: Option<String>,
 }
@@ -83,12 +81,13 @@ impl GoogleCalendarSource {
 
     async fn events(
         &self,
+        account: Option<&Slug>,
         from: OffsetDateTime,
         to: OffsetDateTime,
     ) -> PortResult<Vec<AttentionItem>> {
         let token = self
             .auth
-            .token(Provider::GoogleCalendar, self.settings.account.clone())
+            .token(Provider::GoogleCalendar, account.cloned())
             .await?;
         let rfc3339 = &time::format_description::well_known::Rfc3339;
         let time_min = from
@@ -174,12 +173,12 @@ impl AttentionSource for GoogleCalendarSource {
         SourceCategory::Calendar
     }
 
-    async fn fetch(&self) -> PortResult<Vec<AttentionItem>> {
+    async fn fetch(&self, account: Option<&Slug>) -> PortResult<Vec<AttentionItem>> {
         let now = self.clock.now();
         let lookahead = Duration::hours(i64::from(self.settings.lookahead_hours.max(1)));
         // A meeting that has already started still matters, so the window
         // opens slightly in the past.
-        self.events(now - Duration::minutes(30), now + lookahead)
+        self.events(account, now - Duration::minutes(30), now + lookahead)
             .await
     }
 }
@@ -188,10 +187,11 @@ impl AttentionSource for GoogleCalendarSource {
 impl ScheduleSource for GoogleCalendarSource {
     async fn agenda(
         &self,
+        account: Option<&Slug>,
         from: OffsetDateTime,
         to: OffsetDateTime,
     ) -> PortResult<Vec<AttentionItem>> {
-        self.events(from, to).await
+        self.events(account, from, to).await
     }
 }
 
@@ -318,7 +318,6 @@ mod tests {
             GoogleCalendarSettings {
                 calendar_id: "primary".to_owned(),
                 lookahead_hours: 12,
-                account: None,
                 base_url: Some(base_url.to_owned()),
             },
             HttpClient::new().expect("client"),
@@ -341,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn the_window_asked_for_opens_slightly_in_the_past() {
         let server = MockServer::with_json(EVENTS).await;
-        source(&server.base_url).fetch().await.expect("fetch");
+        source(&server.base_url).fetch(None).await.expect("fetch");
 
         let target = server.request().target;
         assert!(target.starts_with("/calendar/v3/calendars/primary/events"));
@@ -360,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn the_access_token_is_sent_as_a_bearer_token() {
         let server = MockServer::with_json(EVENTS).await;
-        source(&server.base_url).fetch().await.expect("fetch");
+        source(&server.base_url).fetch(None).await.expect("fetch");
         assert_eq!(
             server.request().header("authorization"),
             Some("Bearer ya29.token")
@@ -370,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn an_event_becomes_a_scheduled_item_with_its_attendees_and_link() {
         let server = MockServer::with_json(EVENTS).await;
-        let items = source(&server.base_url).fetch().await.expect("fetch");
+        let items = source(&server.base_url).fetch(None).await.expect("fetch");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -403,7 +402,7 @@ mod tests {
         )
         .await;
 
-        let items = source(&server.base_url).fetch().await.expect("fetch");
+        let items = source(&server.base_url).fetch(None).await.expect("fetch");
 
         assert_eq!(
             items[0].state(),
@@ -420,7 +419,7 @@ mod tests {
         )
         .await;
 
-        let items = source(&server.base_url).fetch().await.expect("fetch");
+        let items = source(&server.base_url).fetch(None).await.expect("fetch");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title().as_str(), "Fine");
@@ -430,7 +429,7 @@ mod tests {
     async fn an_event_with_no_title_still_appears() {
         let server =
             MockServer::with_json(r#"{"items":[{"id":"e","start":{"date":"2026-10-22"}}]}"#).await;
-        let items = source(&server.base_url).fetch().await.expect("fetch");
+        let items = source(&server.base_url).fetch(None).await.expect("fetch");
         assert_eq!(items[0].title().as_str(), "(no title)");
     }
 
@@ -439,6 +438,7 @@ mod tests {
         let server = MockServer::with_json(EVENTS).await;
         source(&server.base_url)
             .agenda(
+                None,
                 datetime!(2026-10-22 00:00:00 UTC),
                 datetime!(2026-10-23 00:00:00 UTC),
             )
@@ -460,7 +460,7 @@ mod tests {
     async fn an_expired_credential_asks_for_authentication() {
         let server = MockServer::start(vec![(401, String::new())]).await;
         assert_eq!(
-            source(&server.base_url).fetch().await.expect_err("401"),
+            source(&server.base_url).fetch(None).await.expect_err("401"),
             PortError::Unauthenticated {
                 provider: Provider::GoogleCalendar
             }
@@ -475,7 +475,10 @@ mod tests {
         )])
         .await;
 
-        let error = source(&server.base_url).fetch().await.expect_err("refused");
+        let error = source(&server.base_url)
+            .fetch(None)
+            .await
+            .expect_err("refused");
 
         assert!(error.to_string().contains("usage limits"), "got {error}");
     }
@@ -490,7 +493,6 @@ mod tests {
                 ..GoogleCalendarSettings {
                     calendar_id: String::new(),
                     lookahead_hours: 12,
-                    account: None,
                     base_url: Some("http://example.test".to_owned()),
                 }
             },

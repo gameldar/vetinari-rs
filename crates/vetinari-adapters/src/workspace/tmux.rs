@@ -13,6 +13,8 @@ use vetinari_core::application::ports::{PortError, PortResult, WorkspaceTarget};
 use vetinari_core::domain::ids::SpaceId;
 use vetinari_core::domain::workspace::{Space, SpaceName, TargetKind};
 
+use super::shell_join;
+
 /// Drives a dedicated tmux session.
 #[derive(Debug, Clone)]
 pub struct TmuxTarget {
@@ -183,26 +185,6 @@ fn send_keys_args(id: &SpaceId, command: &[String]) -> Vec<String> {
     ]
 }
 
-/// Quote a command for a shell, since `send-keys` types text rather than
-/// execing an argument vector.
-fn shell_join(command: &[String]) -> String {
-    command
-        .iter()
-        .map(|argument| {
-            if !argument.is_empty()
-                && argument
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || "-_./=:@,+".contains(ch))
-            {
-                argument.clone()
-            } else {
-                format!("'{}'", argument.replace('\'', r"'\''"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn parse_windows(output: &str) -> Vec<Space> {
     output
         .lines()
@@ -342,19 +324,6 @@ mod tests {
                 "Enter".to_owned(),
             ]
         );
-    }
-
-    #[test]
-    fn an_argument_that_needs_no_quoting_is_left_alone() {
-        assert_eq!(
-            shell_join(&["echo".to_owned(), "hello-world".to_owned()]),
-            "echo hello-world"
-        );
-    }
-
-    #[test]
-    fn an_empty_argument_is_still_passed_through() {
-        assert_eq!(shell_join(&["echo".to_owned(), String::new()]), "echo ''");
     }
 
     #[test]

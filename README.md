@@ -15,7 +15,8 @@ knowing what deserved his attention and what did not.
 - **One prioritised feed.** GitHub, Jira, Slack, Google Calendar, and running
   agents in a single list, ranked by interruption cost: an agent waiting on an
   answer is wasting time right now; a meeting in fifteen minutes cannot be
-  deferred; finished work sinks.
+  deferred; finished work sinks. That includes agents Vetinari did not start -
+  Herdr reports its own, and a blocked one ranks as highly as Vetinari's.
 - **Doom Emacs keybindings.** Modal navigation (`hjkl`, `gg`, `G`, `/`) with a
   `<Space>` leader and a which-key popup, all rebindable in TOML or YAML.
 - **Workflows, not links.** `<Space> p r` on a pull request fetches its branch,
@@ -45,6 +46,7 @@ vetinari doctor               # check config, engines, and credentials
 vetinari auth                 # list every provider's credential state
 vetinari auth github          # paste a token (read from stdin)
 vetinari auth google-calendar --device
+vetinari auth --account home github   # a profile other than the active one
 vetinari config               # print where configuration is looked for
 ```
 
@@ -80,7 +82,12 @@ paragraph, `TAB` moves between fields.
 Copy [`docs/config.example.toml`](docs/config.example.toml) to
 `~/.config/vetinari/config.toml`. Every section is optional - with no
 configuration Vetinari starts with the Doom keymap, work and home profiles, a
-tmux target, and no sources. YAML is accepted too.
+Herdr and a tmux target, and no sources. YAML is accepted too.
+
+Credentials are scoped by the active profile's `account`, and everything
+agrees on which one that is: `vetinari auth`, `vetinari doctor`, the header,
+and the sources themselves. `--account` overrides it to set up a profile that
+is not the active one.
 
 Problems are reported all at once, with the path of each: a typo in a key
 name is an error rather than a setting that silently does nothing.
@@ -103,7 +110,7 @@ returns a `Task`; the controller performs it and answers with `Update`s.
 Run the checks the way CI does:
 
 ```sh
-cargo test --workspace     # 560 tests
+cargo test --workspace     # 603 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -122,10 +129,13 @@ Stated plainly, since the configuration mentions some of it:
 - **Converting a message into a ticket** (`<Space> c t`) is refused with a
   message rather than half-done - creating an issue needs a write API Vetinari
   does not have yet.
-- **Herdr's IPC protocol** is Vetinari's assumption, documented at the top of
-  `workspace/herdr.rs`: newline-delimited JSON with `create_space`,
-  `focus_space`, `close_space`, `list_spaces`, and `run_in_space`. If Herdr
-  speaks something else, that module is the only thing that needs to change.
+- **Herdr's events.** Vetinari speaks Herdr's documented socket API
+  (`workspace.*`, `pane.*`, `agent.list`) but polls it on the refresh
+  interval rather than subscribing with `events.subscribe`, so a workspace
+  that opens between refreshes appears late.
+- **Herdr's agents can be seen but not driven.** They are listed and ranked;
+  `agent.prompt` and `agent.wait` are not wired up, so `<Space> a u` and
+  `<Space> a c` still only act on agents Vetinari started.
 - **`agy`'s command line** is assumed to take the prompt as its last argument.
   Adjust `args` in `[agents.agy-gemini]` if it does not.
 - **No pseudo-terminal.** The PRD lists `portable-pty`; Vetinari runs managed
@@ -137,6 +147,8 @@ Stated plainly, since the configuration mentions some of it:
 - **Sources fetch one page** (50 items, 25 events). There is no pagination.
 - **A machine with no keychain service** - a headless container, say - reports
   `Keychain: unavailable on this machine` and no credential can be stored.
+  `Keychain: none configured` is different: the store works and holds nothing
+  for this profile's account, which `vetinari doctor` names.
 
 ## Licence
 

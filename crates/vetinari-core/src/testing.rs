@@ -13,16 +13,16 @@ use time::OffsetDateTime;
 
 use crate::application::ports::{
     AgentEngine, AttentionSource, ChatSource, Clock, CodeHostSource, CredentialStore,
-    DeviceCodeChallenge, DeviceCodeFlow, DeviceCodePoll, IssueTrackerSource, PortError, PortResult,
-    ScheduleSource, SkillStore, WorkspaceTarget, WorktreeManager,
+    DeviceCodeChallenge, DeviceCodeFlow, DeviceCodePoll, ExternalAgentSource, IssueTrackerSource,
+    PortError, PortResult, ScheduleSource, SkillStore, WorkspaceTarget, WorktreeManager,
 };
-use crate::domain::agent::{AgentSession, AgentStatus, TaskSpec};
+use crate::domain::agent::{AgentSession, AgentStatus, ObservedAgent, TaskSpec};
 use crate::domain::attention::{
     AttentionItem, IssueRef, MessageRef, PullRequestRef, SourceCategory,
 };
 use crate::domain::credentials::{CredentialKey, Provider, StoredCredential};
 use crate::domain::git::{Worktree, WorktreeSpec};
-use crate::domain::ids::{AgentId, SessionId, SourceId, SpaceId};
+use crate::domain::ids::{AgentId, SessionId, Slug, SourceId, SpaceId};
 use crate::domain::skill::SkillLibrary;
 use crate::domain::workspace::{Space, SpaceName, TargetKind};
 
@@ -58,6 +58,7 @@ pub struct FakeSource {
     items: Mutex<Vec<AttentionItem>>,
     failure: Mutex<Option<PortError>>,
     fetches: Mutex<usize>,
+    accounts: Mutex<Vec<Option<Slug>>>,
     pub(crate) calls: Mutex<Vec<String>>,
 }
 
@@ -71,6 +72,7 @@ impl FakeSource {
             items: Mutex::new(items),
             failure: Mutex::new(None),
             fetches: Mutex::new(0),
+            accounts: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -94,10 +96,25 @@ impl FakeSource {
         *self.fetches.lock().expect("fetches lock")
     }
 
-    /// The side-effecting calls it has received.
+    /// The side-effecting calls it has received, each prefixed with the
+    /// credential account it was made as, so a test can tell whether the
+    /// active profile's account actually reached the adapter.
     #[must_use]
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("calls lock").clone()
+    }
+
+    /// The account each fetch was made as.
+    #[must_use]
+    pub fn accounts(&self) -> Vec<Option<Slug>> {
+        self.accounts.lock().expect("accounts lock").clone()
+    }
+
+    fn record(&self, account: Option<&Slug>, call: String) {
+        self.calls.lock().expect("calls lock").push(format!(
+            "[{}] {call}",
+            account.map_or("default", Slug::as_str)
+        ));
     }
 }
 
@@ -111,8 +128,12 @@ impl AttentionSource for FakeSource {
         self.category
     }
 
-    async fn fetch(&self) -> PortResult<Vec<AttentionItem>> {
+    async fn fetch(&self, account: Option<&Slug>) -> PortResult<Vec<AttentionItem>> {
         *self.fetches.lock().expect("fetches lock") += 1;
+        self.accounts
+            .lock()
+            .expect("accounts lock")
+            .push(account.cloned());
         if let Some(error) = self.failure.lock().expect("failure lock").clone() {
             return Err(error);
         }
@@ -122,49 +143,59 @@ impl AttentionSource for FakeSource {
 
 #[async_trait]
 impl CodeHostSource for FakeSource {
-    async fn approve(&self, pr: &PullRequestRef, comment: Option<&str>) -> PortResult<()> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(format!("approve {} {:?}", pr.number, comment));
+    async fn approve(
+        &self,
+        account: Option<&Slug>,
+        pr: &PullRequestRef,
+        comment: Option<&str>,
+    ) -> PortResult<()> {
+        self.record(account, format!("approve {} {:?}", pr.number, comment));
         Ok(())
     }
 
-    async fn comment(&self, pr: &PullRequestRef, body: &str) -> PortResult<()> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(format!("comment {} {body}", pr.number));
+    async fn comment(
+        &self,
+        account: Option<&Slug>,
+        pr: &PullRequestRef,
+        body: &str,
+    ) -> PortResult<()> {
+        self.record(account, format!("comment {} {body}", pr.number));
         Ok(())
     }
 }
 
 #[async_trait]
 impl IssueTrackerSource for FakeSource {
-    async fn transition(&self, issue: &IssueRef, status: &str) -> PortResult<()> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(format!("transition {} {status}", issue.key));
+    async fn transition(
+        &self,
+        account: Option<&Slug>,
+        issue: &IssueRef,
+        status: &str,
+    ) -> PortResult<()> {
+        self.record(account, format!("transition {} {status}", issue.key));
         Ok(())
     }
 
-    async fn assign(&self, issue: &IssueRef, assignee: &str) -> PortResult<()> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(format!("assign {} {assignee}", issue.key));
+    async fn assign(
+        &self,
+        account: Option<&Slug>,
+        issue: &IssueRef,
+        assignee: &str,
+    ) -> PortResult<()> {
+        self.record(account, format!("assign {} {assignee}", issue.key));
         Ok(())
     }
 }
 
 #[async_trait]
 impl ChatSource for FakeSource {
-    async fn reply(&self, message: &MessageRef, body: &str) -> PortResult<()> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(format!("reply {} {body}", message.channel));
+    async fn reply(
+        &self,
+        account: Option<&Slug>,
+        message: &MessageRef,
+        body: &str,
+    ) -> PortResult<()> {
+        self.record(account, format!("reply {} {body}", message.channel));
         Ok(())
     }
 }
@@ -173,10 +204,11 @@ impl ChatSource for FakeSource {
 impl ScheduleSource for FakeSource {
     async fn agenda(
         &self,
+        account: Option<&Slug>,
         _from: OffsetDateTime,
         _to: OffsetDateTime,
     ) -> PortResult<Vec<AttentionItem>> {
-        self.fetch().await
+        self.fetch(account).await
     }
 }
 
@@ -333,6 +365,55 @@ impl AgentEngine for FakeAgentEngine {
             self.id.as_str().to_owned(),
             spec.prompt().as_str().to_owned(),
         ])
+    }
+}
+
+/// A workspace target that reports agents it did not start.
+#[derive(Debug)]
+pub struct FakeExternalAgentSource {
+    target: TargetKind,
+    agents: Mutex<Vec<ObservedAgent>>,
+    failure: Mutex<Option<PortError>>,
+}
+
+impl FakeExternalAgentSource {
+    /// A target that can see these agents.
+    #[must_use]
+    pub fn new(target: TargetKind, agents: Vec<ObservedAgent>) -> Self {
+        Self {
+            target,
+            agents: Mutex::new(agents),
+            failure: Mutex::new(None),
+        }
+    }
+
+    /// A target that cannot be reached.
+    #[must_use]
+    pub fn failing(target: TargetKind, error: PortError) -> Self {
+        Self {
+            target,
+            agents: Mutex::new(Vec::new()),
+            failure: Mutex::new(Some(error)),
+        }
+    }
+
+    /// Change what it can see.
+    pub fn set_agents(&self, agents: Vec<ObservedAgent>) {
+        *self.agents.lock().expect("agents lock") = agents;
+    }
+}
+
+#[async_trait]
+impl ExternalAgentSource for FakeExternalAgentSource {
+    fn target(&self) -> TargetKind {
+        self.target
+    }
+
+    async fn observed_agents(&self) -> PortResult<Vec<ObservedAgent>> {
+        if let Some(error) = self.failure.lock().expect("failure lock").clone() {
+            return Err(error);
+        }
+        Ok(self.agents.lock().expect("agents lock").clone())
     }
 }
 

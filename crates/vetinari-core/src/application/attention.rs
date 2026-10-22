@@ -154,8 +154,9 @@ impl AttentionEngine {
             .filter(|source| profile.wants_source(source.id()))
             .collect();
 
+        let account = profile.account();
         let results = join_all(wanted.iter().map(|source| async {
-            let outcome = source.fetch().await;
+            let outcome = source.fetch(account).await;
             (source.id().clone(), outcome)
         }))
         .await;
@@ -311,7 +312,7 @@ impl FeedView {
 mod tests {
     use super::*;
     use crate::domain::attention::{ItemState, SourceCategory};
-    use crate::domain::ids::ProfileId;
+    use crate::domain::ids::{ProfileId, Slug};
     use crate::domain::profile::Profile;
     use crate::domain::text::NonEmptyText;
     use crate::domain::workspace::TargetKind;
@@ -359,6 +360,48 @@ mod tests {
             engine.register(source);
         }
         engine
+    }
+
+    #[tokio::test]
+    async fn every_source_is_polled_as_the_active_profiles_account() {
+        // The profile is what scopes credentials, and it changes while
+        // Vetinari is running, so the account has to travel with the call.
+        let github = Arc::new(FakeSource::new(
+            source_id("github"),
+            SourceCategory::CodeReview,
+            Vec::new(),
+        ));
+        let engine = engine(vec![github.clone()]);
+        let work = profile(&["github"]).with_account(Slug::parse("work").expect("account"));
+        let home = profile(&["github"]).with_account(Slug::parse("home").expect("account"));
+
+        engine.refresh(&work).await;
+        engine.refresh(&home).await;
+
+        let seen: Vec<Option<String>> = github
+            .accounts()
+            .into_iter()
+            .map(|account| account.map(|slug| slug.as_str().to_owned()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![Some("work".to_owned()), Some("home".to_owned())],
+            "switching profile must switch which credential is used"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_with_no_account_polls_without_one() {
+        let github = Arc::new(FakeSource::new(
+            source_id("github"),
+            SourceCategory::CodeReview,
+            Vec::new(),
+        ));
+        let engine = engine(vec![github.clone()]);
+
+        engine.refresh(&profile(&["github"])).await;
+
+        assert_eq!(github.accounts(), vec![None]);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 #
 # Copy to ~/.config/vetinari/config.toml and edit. Every section is optional:
 # with no configuration at all Vetinari starts with the Doom keymap, a work
-# and a home profile, a tmux target, and no attention sources.
+# and a home profile, a Herdr and a tmux target, and no attention sources.
 #
 # YAML is also accepted (~/.config/vetinari/config.yaml) with the same shape.
 
@@ -36,7 +36,8 @@ repo_roots = ["~/work"]
 # beside the repository is used.
 worktree_root = "~/work/.worktrees"
 # Scopes credentials, so work and home can hold separate tokens for one
-# provider.
+# provider. `vetinari auth <provider>` writes to the active profile's account,
+# and `vetinari auth --account home <provider>` to another one.
 account = "work"
 
 # Which engine handles which class of work. Unlisted classes go to `default`.
@@ -81,8 +82,11 @@ env = { TZ = "UTC" }
 # --- Workspace targets ------------------------------------------------------
 
 [targets.herdr]
-# Herdr's Unix socket. Without this, $XDG_STATE_HOME/herdr/herdr.sock is used.
-socket = "~/.local/state/herdr/herdr.sock"
+# Herdr's Unix socket. Without this, Vetinari resolves it the way Herdr does:
+# $HERDR_SOCKET_PATH, then ~/.config/herdr/sessions/$HERDR_SESSION/herdr.sock
+# for a named session, then ~/.config/herdr/herdr.sock. Set this only to
+# address a socket none of those find.
+# socket = "/run/user/1000/herdr.sock"
 
 [targets.tmux]
 # Vetinari keeps its own session so its windows never mix with yours.

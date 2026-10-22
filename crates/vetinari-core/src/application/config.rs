@@ -365,16 +365,27 @@ impl Config {
         ]
     }
 
-    /// The workspace target Vetinari assumes when a file names none: a tmux
-    /// session of its own, which needs nothing installed beyond tmux.
+    /// The workspace targets Vetinari assumes when a file names none.
+    ///
+    /// One of each target the built-in profiles open spaces on: a tmux
+    /// session of its own, which needs nothing installed beyond tmux, and
+    /// Herdr at whichever socket Herdr itself would use. A target whose
+    /// backend is not running reports that on the first refresh, which is
+    /// more use than a profile quietly having nowhere to put a space.
     #[must_use]
     pub fn default_targets() -> Vec<TargetConfig> {
-        vec![TargetConfig {
-            kind: TargetKind::Tmux,
-            settings: TargetSettings::Tmux {
-                session: "vetinari".to_owned(),
+        vec![
+            TargetConfig {
+                kind: TargetKind::Herdr,
+                settings: TargetSettings::Herdr { socket: None },
             },
-        }]
+            TargetConfig {
+                kind: TargetKind::Tmux,
+                settings: TargetSettings::Tmux {
+                    session: "vetinari".to_owned(),
+                },
+            },
+        ]
     }
 }
 
@@ -1576,5 +1587,38 @@ mod tests {
         .expect("config");
         assert_eq!(config.general.tick_rate_ms, General::MIN_TICK_RATE_MS);
         assert_eq!(config.general.log_lines, General::MIN_LOG_LINES);
+    }
+    #[test]
+    fn the_default_targets_cover_every_default_profiles_target() {
+        // The built-in work profile opens spaces in Herdr, so a machine with
+        // no configuration file at all has to have a Herdr target to open
+        // them on. Without one, nothing was contacted and nothing was said.
+        let targets = Config::default_targets();
+        let kinds: Vec<TargetKind> = targets.iter().map(|target| target.kind).collect();
+
+        for profile in ProfileSet::defaults().iter() {
+            assert!(
+                kinds.contains(&profile.target()),
+                "the {} profile targets {}, which is not in the defaults: {kinds:?}",
+                profile.id(),
+                profile.target().name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_herdr_target_lets_herdr_say_where_its_socket_is() {
+        let herdr = Config::default_targets()
+            .into_iter()
+            .find(|target| target.kind == TargetKind::Herdr)
+            .expect("a herdr target");
+
+        match herdr.settings {
+            TargetSettings::Herdr { socket } => assert_eq!(
+                socket, None,
+                "with no path configured the adapter resolves Herdr's own"
+            ),
+            other => panic!("expected herdr settings, got {other:?}"),
+        }
     }
 }

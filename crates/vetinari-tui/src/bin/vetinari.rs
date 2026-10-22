@@ -26,7 +26,7 @@ use vetinari_core::domain::text::NonEmptyText;
 use vetinari_tui::app::{App, Outcome, StatusMessage, Update};
 use vetinari_tui::controller::Controller;
 use vetinari_tui::overlay::Overlay;
-use vetinari_tui::startup::{config_candidates, doctor_report};
+use vetinari_tui::startup::{account_for, account_label, config_candidates, doctor_report};
 use vetinari_tui::{event, ui};
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
@@ -46,6 +46,11 @@ struct Cli {
     /// The project feedback improves; defaults to the working directory.
     #[arg(long, global = true, value_name = "DIR")]
     project: Option<PathBuf>,
+
+    /// Which credential account to read and write; defaults to the active
+    /// profile's.
+    #[arg(long, global = true, value_name = "NAME")]
+    account: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -145,11 +150,12 @@ fn feedback_target(cli: &Cli) -> Fallible<FeedbackTarget> {
 
 async fn doctor(cli: Cli) -> Fallible<()> {
     let (loaded, paths) = load(&cli)?;
+    let account = account_for(cli.account.as_deref(), &loaded.config.profiles)?;
     let runtime = Runtime::build(loaded.config, paths)?;
     let missing = runtime.missing_engines().await;
     let required = runtime.required_providers();
-    let statuses = runtime.auth.statuses(None).await;
-    let keychain = runtime.auth.summary(None).await;
+    let statuses = runtime.auth.statuses(account.clone()).await;
+    let keychain = runtime.auth.summary(account).await;
 
     for line in doctor_report(
         &runtime.config,
@@ -167,10 +173,12 @@ async fn doctor(cli: Cli) -> Fallible<()> {
 
 async fn auth(cli: Cli, provider: Option<String>, device: bool, forget: bool) -> Fallible<()> {
     let (loaded, paths) = load(&cli)?;
+    let account = account_for(cli.account.as_deref(), &loaded.config.profiles)?;
     let runtime = Runtime::build(loaded.config, paths)?;
 
     let Some(name) = provider else {
-        for status in runtime.auth.statuses(None).await {
+        println!("account: {}", account_label(account.as_ref()));
+        for status in runtime.auth.statuses(account).await {
             println!("{:<18} {}", status.provider.name(), status.state.label());
         }
         return Ok(());
@@ -178,7 +186,7 @@ async fn auth(cli: Cli, provider: Option<String>, device: bool, forget: bool) ->
     let provider: Provider = name.parse()?;
 
     if forget {
-        let removed = runtime.auth.forget(provider, None).await?;
+        let removed = runtime.auth.forget(provider, account).await?;
         println!(
             "{}: {}",
             provider.name(),
@@ -201,7 +209,7 @@ async fn auth(cli: Cli, provider: Option<String>, device: bool, forget: bool) ->
             tokio::time::sleep(Duration::from_secs(challenge.interval_secs.max(1))).await;
             match runtime
                 .auth
-                .poll_device_flow(provider, None, &challenge)
+                .poll_device_flow(provider, account.clone(), &challenge)
                 .await?
             {
                 DeviceCodePoll::Pending => continue,
@@ -227,11 +235,15 @@ async fn auth(cli: Cli, provider: Option<String>, device: bool, forget: bool) ->
     if token.is_empty() {
         return Err("no token was given".into());
     }
+    let label = account_label(account.as_ref()).to_owned();
     runtime
         .auth
-        .save_api_token(provider, None, Secret::new(token))
+        .save_api_token(provider, account, Secret::new(token))
         .await?;
-    println!("stored the {} credential", provider.display_name());
+    println!(
+        "stored the {} credential for the {label} account",
+        provider.display_name()
+    );
     Ok(())
 }
 

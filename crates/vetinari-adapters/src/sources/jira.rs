@@ -31,8 +31,6 @@ pub struct JiraSettings {
     pub email: String,
     /// The JQL that defines the inbox.
     pub jql: String,
-    /// The credential account to use.
-    pub account: Option<Slug>,
 }
 
 /// Issues from Jira.
@@ -80,15 +78,19 @@ impl JiraSource {
         format!("{}{path}", self.settings.base_url.trim_end_matches('/'))
     }
 
-    async fn token(&self) -> PortResult<String> {
+    async fn token(&self, account: Option<&Slug>) -> PortResult<String> {
         self.auth
-            .token(Provider::Jira, self.settings.account.clone())
+            .token(Provider::Jira, account.cloned())
             .await
             .map(|secret| secret.expose().to_owned())
     }
 
-    async fn send(&self, request: reqwest::RequestBuilder) -> PortResult<Value> {
-        let token = self.token().await?;
+    async fn send(
+        &self,
+        account: Option<&Slug>,
+        request: reqwest::RequestBuilder,
+    ) -> PortResult<Value> {
+        let token = self.token(account).await?;
         let response = request
             .basic_auth(&self.settings.email, Some(token))
             .send()
@@ -147,7 +149,7 @@ impl AttentionSource for JiraSource {
         SourceCategory::IssueTracking
     }
 
-    async fn fetch(&self) -> PortResult<Vec<AttentionItem>> {
+    async fn fetch(&self, account: Option<&Slug>) -> PortResult<Vec<AttentionItem>> {
         let body = json!({
             "jql": self.settings.jql,
             "maxResults": Self::PAGE_SIZE,
@@ -155,6 +157,7 @@ impl AttentionSource for JiraSource {
         });
         let reply = self
             .send(
+                account,
                 self.http
                     .inner()
                     .post(self.endpoint("/rest/api/3/search/jql"))
@@ -176,9 +179,15 @@ impl AttentionSource for JiraSource {
 
 #[async_trait]
 impl IssueTrackerSource for JiraSource {
-    async fn transition(&self, issue: &IssueRef, status: &str) -> PortResult<()> {
+    async fn transition(
+        &self,
+        account: Option<&Slug>,
+        issue: &IssueRef,
+        status: &str,
+    ) -> PortResult<()> {
         let available = self
             .send(
+                account,
                 self.http
                     .inner()
                     .get(self.endpoint(&format!("/rest/api/3/issue/{}/transitions", issue.key))),
@@ -204,6 +213,7 @@ impl IssueTrackerSource for JiraSource {
             .to_owned();
 
         self.send(
+            account,
             self.http
                 .inner()
                 .post(self.endpoint(&format!("/rest/api/3/issue/{}/transitions", issue.key)))
@@ -213,8 +223,14 @@ impl IssueTrackerSource for JiraSource {
         Ok(())
     }
 
-    async fn assign(&self, issue: &IssueRef, assignee: &str) -> PortResult<()> {
+    async fn assign(
+        &self,
+        account: Option<&Slug>,
+        issue: &IssueRef,
+        assignee: &str,
+    ) -> PortResult<()> {
         self.send(
+            account,
             self.http
                 .inner()
                 .put(self.endpoint(&format!("/rest/api/3/issue/{}/assignee", issue.key)))
@@ -333,7 +349,6 @@ mod tests {
                 base_url: base_url.to_owned(),
                 email: "dev@acme.test".to_owned(),
                 jql: "assignee = currentUser()".to_owned(),
-                account: None,
             },
             HttpClient::new().expect("client"),
             Arc::new(AuthService::new(
@@ -363,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn the_jql_is_posted_with_basic_auth_and_the_fields_the_feed_needs() {
         let server = MockServer::with_json(&issue_payload("To Do", "new", "null")).await;
-        source(&server.base_url).fetch().await.expect("fetch");
+        source(&server.base_url).fetch(None).await.expect("fetch");
 
         let request = server.request();
         assert_eq!(request.method, "POST");
@@ -387,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn an_issue_becomes_an_item_with_its_key_status_and_due_date() {
         let server = MockServer::with_json(&issue_payload("To Do", "new", "\"2026-10-24\"")).await;
-        let items = source(&server.base_url).fetch().await.expect("fetch");
+        let items = source(&server.base_url).fetch(None).await.expect("fetch");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -415,13 +430,13 @@ mod tests {
         let server =
             MockServer::with_json(&issue_payload("In Progress", "indeterminate", "null")).await;
         assert_eq!(
-            source(&server.base_url).fetch().await.expect("fetch")[0].state(),
+            source(&server.base_url).fetch(None).await.expect("fetch")[0].state(),
             ItemState::InProgress
         );
 
         let server = MockServer::with_json(&issue_payload("Done", "done", "null")).await;
         assert_eq!(
-            source(&server.base_url).fetch().await.expect("fetch")[0].state(),
+            source(&server.base_url).fetch(None).await.expect("fetch")[0].state(),
             ItemState::Resolved
         );
     }
@@ -434,7 +449,7 @@ mod tests {
         )
         .await;
 
-        let items = source(&server.base_url).fetch().await.expect("fetch");
+        let items = source(&server.base_url).fetch(None).await.expect("fetch");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title().as_str(), "fine");
@@ -448,7 +463,10 @@ mod tests {
         )])
         .await;
 
-        let error = source(&server.base_url).fetch().await.expect_err("bad jql");
+        let error = source(&server.base_url)
+            .fetch(None)
+            .await
+            .expect_err("bad jql");
 
         match error {
             PortError::Refused { detail, .. } => assert!(detail.contains("JQL query is invalid")),
@@ -460,7 +478,7 @@ mod tests {
     async fn a_rejected_token_asks_for_authentication() {
         let server = MockServer::start(vec![(401, String::new())]).await;
         assert_eq!(
-            source(&server.base_url).fetch().await.expect_err("401"),
+            source(&server.base_url).fetch(None).await.expect_err("401"),
             PortError::Unauthenticated {
                 provider: Provider::Jira
             }
@@ -487,7 +505,7 @@ mod tests {
         };
 
         source
-            .transition(&issue, "In Progress")
+            .transition(None, &issue, "In Progress")
             .await
             .expect("transition");
 
@@ -512,7 +530,7 @@ mod tests {
         };
 
         let error = source(&server.base_url)
-            .transition(&issue, "In Progress")
+            .transition(None, &issue, "In Progress")
             .await
             .expect_err("no such transition");
 
@@ -530,7 +548,7 @@ mod tests {
         };
 
         source(&server.base_url)
-            .assign(&issue, "5b10a2844c20165700ede21g")
+            .assign(None, &issue, "5b10a2844c20165700ede21g")
             .await
             .expect("assign");
 

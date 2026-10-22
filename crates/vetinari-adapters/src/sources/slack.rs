@@ -25,8 +25,6 @@ use crate::HttpClient;
 pub struct SlackSettings {
     /// Conversations to watch; empty means the direct messages Slack lists.
     pub channels: Vec<String>,
-    /// The credential account to use.
-    pub account: Option<Slug>,
     /// An API base URL, for testing.
     pub base_url: Option<String>,
 }
@@ -71,15 +69,19 @@ impl SlackSource {
         format!("{base}/api/{method}")
     }
 
-    async fn token(&self) -> PortResult<String> {
+    async fn token(&self, account: Option<&Slug>) -> PortResult<String> {
         self.auth
-            .token(Provider::Slack, self.settings.account.clone())
+            .token(Provider::Slack, account.cloned())
             .await
             .map(|secret| secret.expose().to_owned())
     }
 
-    async fn call(&self, request: reqwest::RequestBuilder) -> PortResult<Value> {
-        let token = self.token().await?;
+    async fn call(
+        &self,
+        account: Option<&Slug>,
+        request: reqwest::RequestBuilder,
+    ) -> PortResult<Value> {
+        let token = self.token(account).await?;
         let response = request
             .bearer_auth(token)
             .send()
@@ -123,12 +125,13 @@ impl SlackSource {
         Ok(value)
     }
 
-    async fn conversations(&self) -> PortResult<Vec<String>> {
+    async fn conversations(&self, account: Option<&Slug>) -> PortResult<Vec<String>> {
         if !self.settings.channels.is_empty() {
             return Ok(self.settings.channels.clone());
         }
         let listed = self
             .call(
+                account,
                 self.http
                     .inner()
                     .get(self.endpoint("conversations.list"))
@@ -161,11 +164,12 @@ impl AttentionSource for SlackSource {
         SourceCategory::Messaging
     }
 
-    async fn fetch(&self) -> PortResult<Vec<AttentionItem>> {
+    async fn fetch(&self, account: Option<&Slug>) -> PortResult<Vec<AttentionItem>> {
         let mut items = Vec::new();
-        for channel in self.conversations().await? {
+        for channel in self.conversations(account).await? {
             let history = self
                 .call(
+                    account,
                     self.http
                         .inner()
                         .get(self.endpoint("conversations.history"))
@@ -182,12 +186,18 @@ impl AttentionSource for SlackSource {
 
 #[async_trait]
 impl ChatSource for SlackSource {
-    async fn reply(&self, message: &MessageRef, body: &str) -> PortResult<()> {
+    async fn reply(
+        &self,
+        account: Option<&Slug>,
+        message: &MessageRef,
+        body: &str,
+    ) -> PortResult<()> {
         let mut payload = json!({ "channel": message.channel, "text": body });
         if let Some(thread) = &message.thread {
             payload["thread_ts"] = Value::from(thread.clone());
         }
         self.call(
+            account,
             self.http
                 .inner()
                 .post(self.endpoint("chat.postMessage"))
@@ -268,7 +278,6 @@ mod tests {
             SourceId::parse("slack").expect("id"),
             SlackSettings {
                 channels: channels.iter().map(|c| (*c).to_owned()).collect(),
-                account: None,
                 base_url: Some(base_url.to_owned()),
             },
             HttpClient::new().expect("client"),
@@ -289,7 +298,7 @@ mod tests {
         let server = MockServer::start(vec![(200, HISTORY.to_owned())]).await;
 
         let items = source(&server.base_url, &["D123"])
-            .fetch()
+            .fetch(None)
             .await
             .expect("fetch");
 
@@ -304,7 +313,7 @@ mod tests {
     async fn a_message_becomes_one_row_for_its_conversation() {
         let server = MockServer::start(vec![(200, HISTORY.to_owned())]).await;
         let items = source(&server.base_url, &["D123"])
-            .fetch()
+            .fetch(None)
             .await
             .expect("fetch");
 
@@ -340,7 +349,10 @@ mod tests {
         ])
         .await;
 
-        let items = source(&server.base_url, &[]).fetch().await.expect("fetch");
+        let items = source(&server.base_url, &[])
+            .fetch(None)
+            .await
+            .expect("fetch");
 
         assert_eq!(items.len(), 2);
         let requests = server.requests();
@@ -354,7 +366,7 @@ mod tests {
             MockServer::start(vec![(200, r#"{"ok":true,"messages":[]}"#.to_owned())]).await;
         assert!(
             source(&server.base_url, &["D123"])
-                .fetch()
+                .fetch(None)
                 .await
                 .expect("fetch")
                 .is_empty()
@@ -370,7 +382,7 @@ mod tests {
         .await;
 
         let items = source(&server.base_url, &["C1"])
-            .fetch()
+            .fetch(None)
             .await
             .expect("fetch");
 
@@ -391,7 +403,7 @@ mod tests {
         .await;
         assert_eq!(
             source(&server.base_url, &["D1"])
-                .fetch()
+                .fetch(None)
                 .await
                 .expect_err("auth"),
             PortError::Unauthenticated {
@@ -406,7 +418,7 @@ mod tests {
         .await;
         assert!(
             source(&server.base_url, &["D1"])
-                .fetch()
+                .fetch(None)
                 .await
                 .expect_err("rate limited")
                 .is_transient()
@@ -418,7 +430,7 @@ mod tests {
         )])
         .await;
         let error = source(&server.base_url, &["D1"])
-            .fetch()
+            .fetch(None)
             .await
             .expect_err("refused");
         assert!(error.to_string().contains("channel_not_found"));
@@ -433,7 +445,7 @@ mod tests {
         };
 
         source(&server.base_url, &[])
-            .reply(&message, "on it")
+            .reply(None, &message, "on it")
             .await
             .expect("reply");
 
@@ -453,7 +465,7 @@ mod tests {
         };
 
         source(&server.base_url, &[])
-            .reply(&message, "answered")
+            .reply(None, &message, "answered")
             .await
             .expect("reply");
 
@@ -483,7 +495,6 @@ mod tests {
             SourceId::parse("slack").expect("id"),
             SlackSettings {
                 channels: Vec::new(),
-                account: None,
                 base_url: None,
             },
             HttpClient::new().expect("client"),

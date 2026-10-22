@@ -26,7 +26,8 @@ pub enum SourceCategory {
     Messaging,
     /// Calendar events.
     Calendar,
-    /// Work being done by agents Vetinari started.
+    /// Work being done by agents - the ones Vetinari started, and the ones
+    /// it can see running in a workspace target.
     AgentState,
 }
 

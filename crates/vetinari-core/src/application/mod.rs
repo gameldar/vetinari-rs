@@ -5,6 +5,7 @@ pub mod attention;
 pub mod auth;
 pub mod config;
 pub mod keymap_engine;
+pub mod observed;
 pub mod ports;
 pub mod skills;
 pub mod workflows;

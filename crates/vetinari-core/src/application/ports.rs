@@ -10,13 +10,13 @@ use std::path::Path;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use crate::domain::agent::{AgentSession, AgentStatus, TaskSpec};
+use crate::domain::agent::{AgentSession, AgentStatus, ObservedAgent, TaskSpec};
 use crate::domain::attention::{
     AttentionItem, IssueRef, MessageRef, PullRequestRef, SourceCategory,
 };
 use crate::domain::credentials::{CredentialKey, Provider, StoredCredential};
 use crate::domain::git::{Worktree, WorktreeSpec};
-use crate::domain::ids::{AgentId, SessionId, SourceId, SpaceId};
+use crate::domain::ids::{AgentId, SessionId, Slug, SourceId, SpaceId};
 use crate::domain::skill::SkillLibrary;
 use crate::domain::workspace::{Space, SpaceName, TargetKind};
 
@@ -164,6 +164,21 @@ pub trait WorkspaceTarget: Send + Sync {
     async fn run_in_space(&self, id: &SpaceId, command: &[String]) -> PortResult<()>;
 }
 
+/// A target that also reports the agents already running inside it.
+///
+/// Herdr and tmux hold agents the developer started themselves, which
+/// Vetinari can see but did not spawn and therefore cannot cancel, answer, or
+/// re-run. Kept separate from [`AgentEngine`] for exactly that reason: the
+/// type says what can be done with what it returns.
+#[async_trait]
+pub trait ExternalAgentSource: Send + Sync {
+    /// Which target is being observed.
+    fn target(&self) -> TargetKind;
+
+    /// Every agent the target can currently see.
+    async fn observed_agents(&self) -> PortResult<Vec<ObservedAgent>>;
+}
+
 /// An execution agent: a CLI, an API caller, or a script.
 #[async_trait]
 pub trait AgentEngine: Send + Sync {
@@ -194,6 +209,11 @@ pub trait AgentEngine: Send + Sync {
 }
 
 /// Something that produces attention items.
+///
+/// Every call names the credential account it should use rather than holding
+/// one, because the account comes from the active profile and the profile
+/// changes while Vetinari is running: a source built for `work` would keep
+/// reading work's token after `<Space> p p` switched to home.
 #[async_trait]
 pub trait AttentionSource: Send + Sync {
     /// The source's configuration id.
@@ -202,35 +222,60 @@ pub trait AttentionSource: Send + Sync {
     /// Which category its items belong to.
     fn category(&self) -> SourceCategory;
 
-    /// Fetch the current items.
-    async fn fetch(&self) -> PortResult<Vec<AttentionItem>>;
+    /// Fetch the current items as an account.
+    async fn fetch(&self, account: Option<&Slug>) -> PortResult<Vec<AttentionItem>>;
 }
 
 /// A code host: pull requests, reviews, and CI.
 #[async_trait]
 pub trait CodeHostSource: AttentionSource {
     /// Approve a pull request, optionally with a comment.
-    async fn approve(&self, pr: &PullRequestRef, comment: Option<&str>) -> PortResult<()>;
+    async fn approve(
+        &self,
+        account: Option<&Slug>,
+        pr: &PullRequestRef,
+        comment: Option<&str>,
+    ) -> PortResult<()>;
 
     /// Comment on a pull request.
-    async fn comment(&self, pr: &PullRequestRef, body: &str) -> PortResult<()>;
+    async fn comment(
+        &self,
+        account: Option<&Slug>,
+        pr: &PullRequestRef,
+        body: &str,
+    ) -> PortResult<()>;
 }
 
 /// An issue tracker.
 #[async_trait]
 pub trait IssueTrackerSource: AttentionSource {
     /// Move an issue to a different status.
-    async fn transition(&self, issue: &IssueRef, status: &str) -> PortResult<()>;
+    async fn transition(
+        &self,
+        account: Option<&Slug>,
+        issue: &IssueRef,
+        status: &str,
+    ) -> PortResult<()>;
 
     /// Assign an issue.
-    async fn assign(&self, issue: &IssueRef, assignee: &str) -> PortResult<()>;
+    async fn assign(
+        &self,
+        account: Option<&Slug>,
+        issue: &IssueRef,
+        assignee: &str,
+    ) -> PortResult<()>;
 }
 
 /// A chat system.
 #[async_trait]
 pub trait ChatSource: AttentionSource {
     /// Reply to a message, in its thread when it has one.
-    async fn reply(&self, message: &MessageRef, body: &str) -> PortResult<()>;
+    async fn reply(
+        &self,
+        account: Option<&Slug>,
+        message: &MessageRef,
+        body: &str,
+    ) -> PortResult<()>;
 }
 
 /// A calendar.
@@ -239,6 +284,7 @@ pub trait ScheduleSource: AttentionSource {
     /// Events between two instants, for the schedule view.
     async fn agenda(
         &self,
+        account: Option<&Slug>,
         from: OffsetDateTime,
         to: OffsetDateTime,
     ) -> PortResult<Vec<AttentionItem>>;

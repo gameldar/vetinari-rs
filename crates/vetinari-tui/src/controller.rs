@@ -5,6 +5,7 @@
 //! the controller performs, and nothing in between holds a terminal.
 
 use vetinari_adapters::Runtime;
+use vetinari_core::application::observed::ObservedAgents;
 use vetinari_core::application::ports::{DeviceCodeChallenge, DeviceCodePoll, PortResult};
 use vetinari_core::application::workflows::WorkflowOutcome;
 use vetinari_core::domain::credentials::Provider;
@@ -12,7 +13,9 @@ use vetinari_core::domain::ids::SourceId;
 use vetinari_core::domain::profile::Profile;
 use vetinari_core::domain::skill::SkillLibrary;
 
-use crate::app::{SessionRow, SpaceRow, StatusMessage, Task, Update, describe_failure};
+use crate::app::{
+    ObservedAgentRow, SessionRow, SpaceRow, StatusMessage, Task, Update, describe_failure,
+};
 
 /// Performs work against the adapters.
 pub struct Controller {
@@ -62,8 +65,19 @@ impl Controller {
             .agents
             .prune_finished(Self::FINISHED_SESSIONS_KEPT);
 
+        // The agents a target is running on its own: Vetinari cannot control
+        // them, but a blocked one is still the most expensive thing in the
+        // inbox, so it is ranked alongside the rest.
+        let observation = self.runtime.observed.poll().await;
+        for (kind, error) in &observation.problems {
+            updates.push(Update::Log(format!(
+                "WARN target {kind} could not list its agents: {error}"
+            )));
+        }
+
         let mut feed = self.runtime.attention.refresh(profile).await;
-        let agent_items = self.runtime.agents.attention_items();
+        let mut agent_items = self.runtime.agents.attention_items();
+        agent_items.extend(ObservedAgents::attention_items(&observation.agents));
         if !agent_items.is_empty() {
             let mut items = feed.items().to_vec();
             items.extend(agent_items);
@@ -74,6 +88,14 @@ impl Controller {
             );
         }
         updates.push(Update::Feed(feed));
+
+        updates.push(Update::ObservedAgents(
+            observation
+                .agents
+                .iter()
+                .map(ObservedAgentRow::from_observed)
+                .collect(),
+        ));
 
         updates.push(Update::Sessions(
             self.runtime
@@ -162,7 +184,7 @@ impl Controller {
 
             Task::ApprovePr { source, pr } => {
                 let result = match self.runtime.code_hosts.get(&source) {
-                    Some(host) => host.approve(&pr, None).await,
+                    Some(host) => host.approve(profile.account(), &pr, None).await,
                     None => Err(missing(&source, "code host")),
                 };
                 self.report(&format!("approving #{}", pr.number), result, profile)
@@ -171,7 +193,7 @@ impl Controller {
 
             Task::CommentPr { source, pr, body } => {
                 let result = match self.runtime.code_hosts.get(&source) {
-                    Some(host) => host.comment(&pr, &body).await,
+                    Some(host) => host.comment(profile.account(), &pr, &body).await,
                     None => Err(missing(&source, "code host")),
                 };
                 self.report(&format!("commenting on #{}", pr.number), result, profile)
@@ -184,7 +206,7 @@ impl Controller {
                 body,
             } => {
                 let result = match self.runtime.chats.get(&source) {
-                    Some(chat) => chat.reply(&message, &body).await,
+                    Some(chat) => chat.reply(profile.account(), &message, &body).await,
                     None => Err(missing(&source, "chat source")),
                 };
                 self.report(&format!("replying in {}", message.channel), result, profile)
@@ -197,7 +219,7 @@ impl Controller {
                 status,
             } => {
                 let result = match self.runtime.issue_trackers.get(&source) {
-                    Some(tracker) => tracker.transition(&issue, &status).await,
+                    Some(tracker) => tracker.transition(profile.account(), &issue, &status).await,
                     None => Err(missing(&source, "issue tracker")),
                 };
                 self.report(
@@ -214,7 +236,7 @@ impl Controller {
                 assignee,
             } => {
                 let result = match self.runtime.issue_trackers.get(&source) {
-                    Some(tracker) => tracker.assign(&issue, &assignee).await,
+                    Some(tracker) => tracker.assign(profile.account(), &issue, &assignee).await,
                     None => Err(missing(&source, "issue tracker")),
                 };
                 self.report(&format!("assigning {}", issue.key), result, profile)
@@ -651,6 +673,106 @@ mod tests {
                 _ => None,
             })
             .expect("a status update")
+    }
+
+    /// A minimal stand-in for Herdr, so the wiring from the socket to the
+    /// monitor is exercised rather than assumed.
+    fn fake_herdr(socket: std::path::PathBuf) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut lines = BufReader::new(read_half).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let id = field(&line, "id");
+                        let result = match field(&line, "method").as_str() {
+                            "workspace.list" => concat!(
+                                r#"{"workspaces":[{"workspace_id":"w1","#,
+                                r#""label":"api","cwd":"/src/api"}]}"#
+                            )
+                            .to_owned(),
+                            "agent.list" => concat!(
+                                r#"{"agents":[{"pane_id":"w1:p1","workspace_id":"w1","#,
+                                r#""agent":"claude","status":"blocked"}]}"#
+                            )
+                            .to_owned(),
+                            _ => "{}".to_owned(),
+                        };
+                        let reply = format!(r#"{{"id":"{id}","result":{result}}}"#);
+                        let _ = write_half.write_all(format!("{reply}\n").as_bytes()).await;
+                        let _ = write_half.flush().await;
+                    }
+                });
+            }
+        });
+    }
+
+    /// Pull a string field out of a request, so the test needs no JSON parser.
+    fn field(line: &str, name: &str) -> String {
+        let key = format!("\"{name}\":\"");
+        let start = line.find(&key).map(|at| at + key.len()).unwrap_or_default();
+        line[start..]
+            .find('"')
+            .map(|end| line[start..start + end].to_owned())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_refresh_lists_the_agents_herdr_is_running_and_ranks_a_blocked_one_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("herdr.sock");
+        fake_herdr(socket.clone());
+        let mut h = harness(&format!(
+            "\n[targets.herdr]\nsocket = \"{}\"\n",
+            socket.display()
+        ));
+
+        let updates = h.controller.refresh(&h.profile).await;
+
+        let observed = updates
+            .iter()
+            .find_map(|update| match update {
+                Update::ObservedAgents(agents) => Some(agents.clone()),
+                _ => None,
+            })
+            .expect("the agents herdr is running");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].label, "herdr claude [w1] (blocked)");
+        assert!(observed[0].blocked);
+
+        let feed = updates
+            .iter()
+            .find_map(|update| match update {
+                Update::Feed(feed) => Some(feed.clone()),
+                _ => None,
+            })
+            .expect("a feed");
+        // A feed is built in priority order, so the head of it is the ranking.
+        let first = feed.items().first().expect("at least one item");
+        assert_eq!(
+            first.state(),
+            vetinari_core::domain::attention::ItemState::AgentWaiting,
+            "a blocked agent is the most expensive thing in the inbox"
+        );
+        assert!(first.title().as_str().contains("claude in w1"));
+
+        let spaces = updates
+            .iter()
+            .find_map(|update| match update {
+                Update::Spaces(spaces) => Some(spaces.clone()),
+                _ => None,
+            })
+            .expect("spaces");
+        assert!(
+            spaces.iter().any(|space| space.id.as_str() == "w1"),
+            "herdr's workspaces are its spaces: {spaces:?}"
+        );
     }
 
     #[tokio::test]

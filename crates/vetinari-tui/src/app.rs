@@ -14,7 +14,7 @@ use vetinari_core::application::keymap_engine::{KeymapEngine, Keystroke};
 use vetinari_core::application::ports::{DeviceCodeChallenge, PortError};
 use vetinari_core::application::skills::SkillDraft;
 use vetinari_core::domain::action::Action;
-use vetinari_core::domain::agent::AgentSession;
+use vetinari_core::domain::agent::{AgentSession, ObservedAgent, ObservedAgentState};
 use vetinari_core::domain::attention::{
     AttentionItem, EventRef, IssueRef, ItemContext, ItemState, MessageRef, PullRequestRef,
 };
@@ -233,6 +233,32 @@ impl SpaceRow {
     }
 }
 
+/// One agent in the monitor that Vetinari did not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedAgentRow {
+    /// The terminal it occupies.
+    pub pane: SpaceId,
+    /// The space it is running in, when the target says.
+    pub space: Option<SpaceId>,
+    /// How to describe it.
+    pub label: String,
+    /// Whether it is waiting on somebody.
+    pub blocked: bool,
+}
+
+impl ObservedAgentRow {
+    /// Summarise an observed agent for the monitor.
+    #[must_use]
+    pub fn from_observed(agent: &ObservedAgent) -> Self {
+        Self {
+            pane: agent.pane().clone(),
+            space: agent.workspace().cloned(),
+            label: agent.describe(),
+            blocked: agent.state() == ObservedAgentState::Blocked,
+        }
+    }
+}
+
 /// Work for the event loop to do against the adapters.
 #[derive(Debug, Clone)]
 pub enum Task {
@@ -347,6 +373,8 @@ pub enum Update {
     Sessions(Vec<SessionRow>),
     /// The workspace spaces as they now stand.
     Spaces(Vec<SpaceRow>),
+    /// The agents a workspace target is running that Vetinari did not start.
+    ObservedAgents(Vec<ObservedAgentRow>),
     /// The keychain summary for the header.
     Keychain(String),
     /// A reloaded skill library.
@@ -382,6 +410,7 @@ pub struct App {
     log_limit: usize,
     sessions: Vec<SessionRow>,
     spaces: Vec<SpaceRow>,
+    observed: Vec<ObservedAgentRow>,
     monitor_cursor: usize,
     keychain: String,
     config_path: Option<PathBuf>,
@@ -419,6 +448,7 @@ impl App {
             log_limit: log_limit.max(1),
             sessions: Vec::new(),
             spaces: Vec::new(),
+            observed: Vec::new(),
             monitor_cursor: 0,
             keychain: "Keychain: unknown".to_owned(),
             config_path: None,
@@ -504,6 +534,12 @@ impl App {
     #[must_use]
     pub fn spaces(&self) -> &[SpaceRow] {
         &self.spaces
+    }
+
+    /// The agents a workspace target is running on its own.
+    #[must_use]
+    pub fn observed_agents(&self) -> &[ObservedAgentRow] {
+        &self.observed
     }
 
     /// Which monitor row is highlighted.
@@ -624,6 +660,7 @@ impl App {
                     .min(self.sessions.len().saturating_sub(1));
             }
             Update::Spaces(spaces) => self.spaces = spaces,
+            Update::ObservedAgents(agents) => self.observed = agents,
             Update::Keychain(summary) => self.keychain = summary,
             Update::Library(library) => self.library = library,
             Update::Status(message) => self.set_status(message),
