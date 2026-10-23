@@ -18,6 +18,28 @@ refresh_secs = 60
 log_lines = 200
 
 
+# --- Attention queue ---------------------------------------------------------
+# When items you have set aside come back. Every return is recorded with the
+# rule that caused it and what you did next, so these can be tuned from use.
+[queue]
+# Taking something else while working on an item parks it this long. 0 puts
+# it straight back in the inbox.
+switched_away_park_minutes = 10
+# Close items that go away at their source, unless you are working on them.
+close_when_gone = true
+# Reopen finished items that need you again.
+reopen_finished = true
+# Let an urgent change (failed CI, a blocked agent) cut a timed park short.
+urgent_breaks_snooze = true
+# How long to wait on a reply before following up.
+follow_up_after_minutes = 120
+# What focus time holds back: code-review, issue-tracking, messaging,
+# calendar, agent-state.
+focus_mutes = ["messaging"]
+# Show an agent inside the item it is working on, rather than as its own row.
+fold_agents = true
+
+
 # --- Context profiles -------------------------------------------------------
 # Declaring any profile replaces the built-in work/home pair. <Space> p p
 # cycles between them; <Space> p l chooses one.

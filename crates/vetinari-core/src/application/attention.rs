@@ -11,7 +11,7 @@ use std::sync::Arc;
 use futures::future::join_all;
 use time::OffsetDateTime;
 
-use super::ports::{AttentionSource, Clock, PortError};
+use super::ports::{AttentionSource, Clock, PortError, PortResult};
 use crate::domain::attention::{AttentionItem, SourceCategory};
 use crate::domain::ids::{ItemId, SourceId};
 use crate::domain::profile::Profile;
@@ -23,6 +23,15 @@ pub struct SourceProblem {
     pub source: SourceId,
     /// Why.
     pub error: PortError,
+}
+
+/// One source's answer to a poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Polled {
+    /// Which source.
+    pub source: SourceId,
+    /// Everything it reports, or why it could not be asked.
+    pub outcome: PortResult<Vec<AttentionItem>>,
 }
 
 /// Everything asking for attention, most urgent first.
@@ -146,24 +155,29 @@ impl AttentionEngine {
             .collect()
     }
 
-    /// Poll the sources the profile wants, concurrently.
-    pub async fn refresh(&self, profile: &Profile) -> Feed {
-        let wanted: Vec<_> = self
-            .sources
-            .iter()
-            .filter(|source| profile.wants_source(source.id()))
-            .collect();
-
+    /// Poll the sources the profile wants, concurrently, keeping each
+    /// source's answer apart.
+    pub async fn poll(&self, profile: &Profile) -> Vec<Polled> {
         let account = profile.account();
-        let results = join_all(wanted.iter().map(|source| async {
-            let outcome = source.fetch(account).await;
-            (source.id().clone(), outcome)
-        }))
-        .await;
+        join_all(
+            self.sources
+                .iter()
+                .filter(|source| profile.wants_source(source.id()))
+                .map(|source| async {
+                    Polled {
+                        source: source.id().clone(),
+                        outcome: source.fetch(account).await,
+                    }
+                }),
+        )
+        .await
+    }
 
+    /// Poll the sources the profile wants and merge them into one feed.
+    pub async fn refresh(&self, profile: &Profile) -> Feed {
         let mut items = Vec::new();
         let mut problems = Vec::new();
-        for (source, outcome) in results {
+        for Polled { source, outcome } in self.poll(profile).await {
             match outcome {
                 Ok(fetched) => items.extend(fetched),
                 Err(error) => problems.push(SourceProblem { source, error }),
@@ -475,6 +489,41 @@ mod tests {
         assert_eq!(feed.problems().len(), 1);
         assert_eq!(feed.problems()[0].source.as_str(), "jira");
         assert!(feed.problems()[0].error.is_transient());
+    }
+
+    #[tokio::test]
+    async fn a_poll_keeps_each_sources_answer_apart() {
+        let github = Arc::new(FakeSource::new(
+            source_id("github"),
+            SourceCategory::CodeReview,
+            vec![item(
+                "github",
+                "142",
+                SourceCategory::CodeReview,
+                ItemState::CiFailed,
+            )],
+        ));
+        let jira = Arc::new(FakeSource::failing(
+            source_id("jira"),
+            SourceCategory::IssueTracking,
+            PortError::unavailable("jira", "503"),
+        ));
+
+        let polled = engine(vec![github, jira]).poll(&profile(&[])).await;
+
+        let answers: Vec<_> = polled
+            .iter()
+            .map(|polled| {
+                (
+                    polled.source.as_str().to_owned(),
+                    polled.outcome.as_ref().map(Vec::len).ok(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            vec![("github".to_owned(), Some(1)), ("jira".to_owned(), None)]
+        );
     }
 
     #[tokio::test]

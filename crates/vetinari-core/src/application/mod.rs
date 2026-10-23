@@ -7,6 +7,7 @@ pub mod config;
 pub mod keymap_engine;
 pub mod observed;
 pub mod ports;
+pub mod queue;
 pub mod skills;
 pub mod workflows;
 pub mod workspaces;

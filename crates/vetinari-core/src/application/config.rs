@@ -13,14 +13,17 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use time::Duration;
 
 use crate::domain::action::Action;
 use crate::domain::agent::TaskClass;
+use crate::domain::attention::SourceCategory;
 use crate::domain::credentials::{AuthMethod, Provider};
 use crate::domain::ids::{AgentId, ProfileId, Slug, SourceId};
 use crate::domain::keymap::{Keymap, Mode};
 use crate::domain::keys::KeySequence;
 use crate::domain::profile::{Profile, ProfileSet};
+use crate::domain::queue::rules::QueueRules;
 use crate::domain::routing::RoutingTable;
 use crate::domain::text::NonEmptyText;
 use crate::domain::workspace::TargetKind;
@@ -273,6 +276,8 @@ pub struct Config {
     pub sources: Vec<SourceConfig>,
     /// The OAuth clients for device-code flows.
     pub oauth_clients: Vec<OAuthClientConfig>,
+    /// When the attention queue brings items back.
+    pub queue: QueueRules,
 }
 
 impl Config {
@@ -287,6 +292,7 @@ impl Config {
         let targets = parse_targets(&raw.targets, context, &mut problems);
         let sources = parse_sources(&raw.sources, &mut problems);
         let oauth_clients = parse_oauth(&raw.oauth, &mut problems);
+        let queue = parse_queue(&raw.queue, &mut problems);
 
         let profiles = match profiles {
             Some(mut set) => {
@@ -320,6 +326,7 @@ impl Config {
             targets,
             sources,
             oauth_clients,
+            queue,
         })
     }
 
@@ -405,6 +412,60 @@ fn parse_general(raw: RawGeneral) -> General {
             .unwrap_or(defaults.refresh_secs)
             .max(General::MIN_REFRESH_SECS),
     }
+}
+
+fn parse_queue(raw: &RawQueue, problems: &mut Vec<ConfigProblem>) -> QueueRules {
+    let defaults = QueueRules::default();
+    let minutes = |raw: Option<u32>, default| raw.map_or(default, |m| Duration::minutes(m.into()));
+    let focus_mutes = match &raw.focus_mutes {
+        None => defaults.focus_mutes,
+        Some(names) => names
+            .iter()
+            .filter_map(|name| {
+                let category = parse_category(name);
+                if category.is_none() {
+                    problems.push(ConfigProblem {
+                        path: "queue.focus_mutes".to_owned(),
+                        message: format!(
+                            "{name} is not a category; expected one of {}",
+                            CATEGORY_NAMES
+                                .iter()
+                                .map(|(name, _)| *name)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
+                category
+            })
+            .collect(),
+    };
+    QueueRules {
+        switched_away_park: minutes(raw.switched_away_park_minutes, defaults.switched_away_park),
+        close_when_gone: raw.close_when_gone.unwrap_or(defaults.close_when_gone),
+        reopen_finished: raw.reopen_finished.unwrap_or(defaults.reopen_finished),
+        urgent_breaks_snooze: raw
+            .urgent_breaks_snooze
+            .unwrap_or(defaults.urgent_breaks_snooze),
+        follow_up_after: minutes(raw.follow_up_after_minutes, defaults.follow_up_after),
+        focus_mutes,
+        fold_agents: raw.fold_agents.unwrap_or(defaults.fold_agents),
+    }
+}
+
+const CATEGORY_NAMES: &[(&str, SourceCategory)] = &[
+    ("code-review", SourceCategory::CodeReview),
+    ("issue-tracking", SourceCategory::IssueTracking),
+    ("messaging", SourceCategory::Messaging),
+    ("calendar", SourceCategory::Calendar),
+    ("agent-state", SourceCategory::AgentState),
+];
+
+fn parse_category(name: &str) -> Option<SourceCategory> {
+    CATEGORY_NAMES
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, category)| *category)
 }
 
 fn parse_profiles(
@@ -882,6 +943,28 @@ pub struct RawConfig {
     pub sources: BTreeMap<String, RawSource>,
     /// OAuth clients, keyed by provider.
     pub oauth: BTreeMap<String, RawOAuthClient>,
+    /// The attention queue's rules.
+    pub queue: RawQueue,
+}
+
+/// The `[queue]` table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawQueue {
+    /// How long switching away parks an item, in minutes.
+    pub switched_away_park_minutes: Option<u32>,
+    /// Whether items that go away at their source are closed.
+    pub close_when_gone: Option<bool>,
+    /// Whether finished items reopen when they need the developer again.
+    pub reopen_finished: Option<bool>,
+    /// Whether an urgent change cuts a timed park short.
+    pub urgent_breaks_snooze: Option<bool>,
+    /// How long to wait on a reply before following up, in minutes.
+    pub follow_up_after_minutes: Option<u32>,
+    /// The categories focus time holds back.
+    pub focus_mutes: Option<Vec<String>>,
+    /// Whether agents are shown inside the item they are working on.
+    pub fold_agents: Option<bool>,
 }
 
 /// One `[oauth.<provider>]` table.
@@ -1012,8 +1095,10 @@ mod tests {
 
     use super::*;
     use crate::domain::action::Action;
+    use crate::domain::attention::SourceCategory;
     use crate::domain::keymap::{Lookup, Mode};
     use crate::domain::keys::KeySequence;
+    use crate::domain::queue::rules::QueueRules;
 
     fn parse(toml_text: &str) -> Result<Config, ConfigError> {
         let raw: RawConfig = toml::from_str(toml_text).expect("the fixture is valid TOML");
@@ -1025,6 +1110,59 @@ mod tests {
             Mode::Normal,
             KeySequence::parse(sequence).expect("sequence").chords(),
         )
+    }
+
+    #[test]
+    fn the_queue_rules_default_to_the_settled_ones() {
+        let config = parse("").expect("defaults");
+
+        assert_eq!(config.queue, QueueRules::default());
+    }
+
+    #[test]
+    fn every_queue_rule_can_be_tuned() {
+        let config = parse(
+            r#"
+            [queue]
+            switched_away_park_minutes = 0
+            follow_up_after_minutes = 30
+            close_when_gone = false
+            reopen_finished = false
+            urgent_breaks_snooze = false
+            focus_mutes = ["messaging", "calendar"]
+            fold_agents = false
+            "#,
+        )
+        .expect("tuned");
+
+        assert_eq!(
+            config.queue,
+            QueueRules {
+                switched_away_park: time::Duration::ZERO,
+                close_when_gone: false,
+                reopen_finished: false,
+                urgent_breaks_snooze: false,
+                follow_up_after: time::Duration::minutes(30),
+                focus_mutes: [SourceCategory::Messaging, SourceCategory::Calendar].into(),
+                fold_agents: false,
+            }
+        );
+    }
+
+    #[test]
+    fn focus_time_can_mute_nothing() {
+        let config = parse("[queue]\nfocus_mutes = []").expect("tuned");
+
+        assert!(config.queue.focus_mutes.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_category_to_mute_is_reported() {
+        let error = parse("[queue]\nfocus_mutes = [\"email\"]").expect_err("unknown");
+
+        assert_eq!(error.problems().len(), 1);
+        assert_eq!(error.problems()[0].path, "queue.focus_mutes");
+        assert!(error.problems()[0].message.contains("email"));
     }
 
     #[test]
