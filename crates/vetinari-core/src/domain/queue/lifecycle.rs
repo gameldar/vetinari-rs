@@ -16,6 +16,8 @@ pub enum Lifecycle {
         /// How it came to be parked.
         reason: ParkReason,
     },
+    /// Handed to someone else, coming back when they respond.
+    Waiting(WaitingOn),
     /// Nothing more is wanted from it.
     Done {
         /// How it was closed.
@@ -46,6 +48,16 @@ pub enum ParkReason {
     },
 }
 
+/// Who or what a waiting item is waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitingOn {
+    /// A person's reply, followed up if none arrives in time.
+    Reply {
+        /// When to chase it.
+        follow_up_at: OffsetDateTime,
+    },
+}
+
 /// How an item was closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Closure {
@@ -70,6 +82,12 @@ pub enum Rule {
     UrgentChange,
     /// It needed the developer again after they finished it.
     Reopened,
+    /// The reply it was waiting on arrived.
+    ReplyArrived,
+    /// No reply arrived in time.
+    FollowUpDue,
+    /// It arrived or changed while focus time held it back.
+    ArrivedDuringFocus,
 }
 
 /// A return to the queue, kept on the item until the developer acts on it.

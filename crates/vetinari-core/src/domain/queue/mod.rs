@@ -8,14 +8,15 @@
 
 pub mod lifecycle;
 pub mod rules;
+pub mod view;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use time::OffsetDateTime;
 
-use self::lifecycle::{Closure, Lifecycle, ParkReason, ParkUntil, Resurfaced, Rule};
+use self::lifecycle::{Closure, Lifecycle, ParkReason, ParkUntil, Resurfaced, Rule, WaitingOn};
 use self::rules::QueueRules;
-use super::attention::{AttentionItem, ItemState};
+use super::attention::{AttentionItem, ItemState, SourceCategory};
 use super::ids::{ItemId, SourceId};
 
 /// Whether an item's source still reports it.
@@ -34,6 +35,7 @@ pub struct Entry {
     upstream: Upstream,
     returned: Option<Resurfaced>,
     queued_at: OffsetDateTime,
+    held_by_focus: bool,
 }
 
 impl Entry {
@@ -43,6 +45,7 @@ impl Entry {
             upstream: Upstream::Present,
             returned: None,
             queued_at: now,
+            held_by_focus: false,
         }
     }
 
@@ -133,6 +136,10 @@ pub enum Happened {
     Finished,
     /// The developer silenced it.
     Silenced,
+    /// The developer is waiting on a reply to it.
+    WaitingOnReply,
+    /// It arrived during focus time and is held back until it ends.
+    HeldForFocus,
 }
 
 /// How long to park an item for.
@@ -155,6 +162,15 @@ pub enum Decision {
     Silence(ItemId),
     /// Put it out of the way.
     Park(ItemId, ParkFor),
+    /// Wait on someone's reply to it.
+    WaitOnReply(ItemId),
+    /// Hold back the muted categories until a moment.
+    StartFocus {
+        /// When focus time ends.
+        until: OffsetDateTime,
+    },
+    /// End focus time now.
+    EndFocus,
 }
 
 /// Why a decision could not be made.
@@ -169,6 +185,21 @@ pub enum Refusal {
     /// The item is already closed.
     #[error("that is already closed")]
     AlreadyDone,
+    /// Focus time has already started.
+    #[error("focus time has already started")]
+    AlreadyFocused,
+    /// Focus time has not started.
+    #[error("focus time has not started")]
+    NotFocused,
+}
+
+/// A stretch of time when some categories are held back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Focus {
+    /// When it ends.
+    pub until: OffsetDateTime,
+    /// What it holds back.
+    pub mutes: BTreeSet<SourceCategory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +214,7 @@ pub struct Queue {
     rules: QueueRules,
     held: BTreeMap<ItemId, (Entry, Lifecycle)>,
     active: Option<Active>,
+    focus: Option<Focus>,
 }
 
 impl Queue {
@@ -193,6 +225,7 @@ impl Queue {
             rules,
             held: BTreeMap::new(),
             active: None,
+            focus: None,
         }
     }
 
@@ -200,6 +233,42 @@ impl Queue {
     #[must_use]
     pub const fn rules(&self) -> &QueueRules {
         &self.rules
+    }
+
+    /// Focus time, while it lasts.
+    #[must_use]
+    pub const fn focus(&self) -> Option<&Focus> {
+        self.focus.as_ref()
+    }
+
+    /// Bring back whatever time has caught up with.
+    pub fn tick(&mut self, now: OffsetDateTime) -> Vec<Note> {
+        let mut notes = Vec::new();
+        for (id, (entry, lifecycle)) in &mut self.held {
+            let rule = match lifecycle {
+                Lifecycle::Parked {
+                    until: ParkUntil::Time(at),
+                    reason,
+                } if *at <= now => Some(match reason {
+                    ParkReason::SwitchedAway { .. } => Rule::SwitchedAway,
+                    ParkReason::Chosen => Rule::SnoozeEnded,
+                }),
+                Lifecycle::Waiting(WaitingOn::Reply { follow_up_at }) if *follow_up_at <= now => {
+                    Some(Rule::FollowUpDue)
+                }
+                _ => None,
+            };
+            if let Some(rule) = rule {
+                notes.push(Note::new(
+                    id.clone(),
+                    resurface(now, entry, lifecycle, rule),
+                ));
+            }
+        }
+        if self.focus.as_ref().is_some_and(|focus| focus.until <= now) {
+            notes.extend(self.end_focus(now));
+        }
+        notes
     }
 
     /// Where an item stands.
@@ -257,12 +326,19 @@ impl Queue {
             }
             match self.held.get_mut(&id) {
                 None => {
-                    self.held
-                        .insert(id.clone(), (Entry::new(item, now), Lifecycle::Inbox));
-                    notes.push(Note::new(id, Happened::Arrived));
+                    let mut entry = Entry::new(item, now);
+                    entry.held_by_focus = mutes(self.focus.as_ref(), &entry);
+                    let happened = if entry.held_by_focus {
+                        Happened::HeldForFocus
+                    } else {
+                        Happened::Arrived
+                    };
+                    self.held.insert(id.clone(), (entry, Lifecycle::Inbox));
+                    notes.push(Note::new(id, happened));
                 }
                 Some((entry, lifecycle)) => {
                     if entry.refresh(item) {
+                        entry.held_by_focus |= mutes(self.focus.as_ref(), entry);
                         let happened = changed(&self.rules, now, entry, lifecycle);
                         notes.push(Note::new(id, happened));
                     }
@@ -308,7 +384,50 @@ impl Queue {
             Decision::Finish(id) => self.close(now, id, Closure::Finished, Happened::Finished),
             Decision::Silence(id) => self.close(now, id, Closure::Silenced, Happened::Silenced),
             Decision::Park(id, park_for) => self.park(id, park_for),
+            Decision::WaitOnReply(id) => self.wait_on_reply(now, id),
+            Decision::StartFocus { until } => {
+                if self.focus.is_some() {
+                    return Err(Refusal::AlreadyFocused);
+                }
+                self.focus = Some(Focus {
+                    until,
+                    mutes: self.rules.focus_mutes.clone(),
+                });
+                Ok(Vec::new())
+            }
+            Decision::EndFocus => {
+                if self.focus.is_none() {
+                    return Err(Refusal::NotFocused);
+                }
+                Ok(self.end_focus(now))
+            }
         }
+    }
+
+    fn wait_on_reply(&mut self, now: OffsetDateTime, id: ItemId) -> Result<Vec<Note>, Refusal> {
+        let follow_up_at = now + self.rules.follow_up_after;
+        let (entry, lifecycle) = self.open_item(&id)?;
+        entry.returned = None;
+        *lifecycle = Lifecycle::Waiting(WaitingOn::Reply { follow_up_at });
+        Ok(vec![Note::new(id, Happened::WaitingOnReply)])
+    }
+
+    /// Release what focus time held back. Anything that arrived or changed
+    /// during it comes back marked as such, unless a rule already brought
+    /// it back with a better reason.
+    fn end_focus(&mut self, now: OffsetDateTime) -> Vec<Note> {
+        self.focus = None;
+        let mut notes = Vec::new();
+        for (id, (entry, lifecycle)) in &mut self.held {
+            if !std::mem::take(&mut entry.held_by_focus) {
+                continue;
+            }
+            if *lifecycle == Lifecycle::Inbox && entry.returned.is_none() {
+                let happened = resurface(now, entry, lifecycle, Rule::ArrivedDuringFocus);
+                notes.push(Note::new(id.clone(), happened));
+            }
+        }
+        notes
     }
 
     fn take(&mut self, now: OffsetDateTime, id: ItemId) -> Result<Vec<Note>, Refusal> {
@@ -321,6 +440,7 @@ impl Queue {
             notes.push(self.switch_away(now, previous));
         }
         entry.returned = None;
+        entry.held_by_focus = false;
         self.active = Some(Active { entry, since: now });
         notes.push(Note::new(id, Happened::Taken));
         Ok(notes)
@@ -393,6 +513,10 @@ impl Note {
     }
 }
 
+fn mutes(focus: Option<&Focus>, entry: &Entry) -> bool {
+    focus.is_some_and(|focus| focus.mutes.contains(&entry.item.category()))
+}
+
 /// What counts as a change: a new state, new activity, or a new deadline.
 /// Retitling or reworded details do not bring anything back.
 fn fingerprint(item: &AttentionItem) -> (ItemState, OffsetDateTime, Option<OffsetDateTime>) {
@@ -416,6 +540,7 @@ fn changed(
             until: ParkUntil::Time(_),
             ..
         } => (rules.urgent_breaks_snooze && state.is_urgent()).then_some(Rule::UrgentChange),
+        Lifecycle::Waiting(WaitingOn::Reply { .. }) => Some(Rule::ReplyArrived),
         Lifecycle::Done {
             closure: Closure::Silenced,
             ..
@@ -1067,5 +1192,333 @@ mod tests {
         for item in &ids {
             assert!(queue.entry(item).is_some(), "{item}");
         }
+    }
+
+    fn slack() -> SourceId {
+        SourceId::parse("slack").expect("slug")
+    }
+
+    fn message(native: &str, occurred_at: OffsetDateTime) -> AttentionItem {
+        AttentionItem::builder(
+            &slack(),
+            native,
+            SourceCategory::Messaging,
+            NonEmptyText::parse(&format!("message {native}")).expect("title"),
+        )
+        .state(ItemState::Unread)
+        .occurred_at(occurred_at)
+        .build()
+    }
+
+    #[test]
+    fn a_timed_park_comes_back_when_it_runs_out() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        let until = NOW + Duration::hours(1);
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(review.clone(), ParkFor::Until(until)),
+        );
+
+        assert!(queue.tick(until - Duration::minutes(1)).is_empty());
+        let notes = queue.tick(until);
+
+        assert_eq!(
+            notes,
+            vec![note(&review, Happened::Resurfaced(Rule::SnoozeEnded))]
+        );
+        assert_eq!(held(&queue, &review), Lifecycle::Inbox);
+        assert_eq!(queue.entry(&review).expect("entry").queued_at(), until);
+    }
+
+    #[test]
+    fn switching_away_comes_back_once_the_short_park_runs_out() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview), ("12", ItemState::CiFailed)]);
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+        decide(&mut queue, NOW, Decision::Take(id(&github(), "12")));
+
+        let notes = queue.tick(NOW + Duration::minutes(10));
+
+        assert_eq!(
+            notes,
+            vec![note(&review, Happened::Resurfaced(Rule::SwitchedAway))]
+        );
+    }
+
+    #[test]
+    fn time_alone_never_brings_back_an_item_parked_until_it_changes() {
+        let mut queue = queue_with(&[("12", ItemState::CiFailed)]);
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(id(&github(), "12"), ParkFor::Changed),
+        );
+
+        assert!(queue.tick(NOW + Duration::days(7)).is_empty());
+    }
+
+    #[test]
+    fn waiting_on_a_reply_comes_back_when_they_respond() {
+        let mut queue = Queue::new(QueueRules::default());
+        queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+        let dm = id(&slack(), "dm-1");
+
+        let notes = decide(&mut queue, NOW, Decision::WaitOnReply(dm.clone()));
+        assert_eq!(notes, vec![note(&dm, Happened::WaitingOnReply)]);
+        assert_eq!(
+            held(&queue, &dm),
+            Lifecycle::Waiting(WaitingOn::Reply {
+                follow_up_at: NOW + Duration::hours(2)
+            })
+        );
+
+        let later = NOW + Duration::minutes(30);
+        let notes = queue.observe(later, &slack(), vec![message("dm-1", later)]);
+
+        assert_eq!(
+            notes,
+            vec![note(&dm, Happened::Resurfaced(Rule::ReplyArrived))]
+        );
+        assert_eq!(held(&queue, &dm), Lifecycle::Inbox);
+    }
+
+    #[test]
+    fn waiting_on_a_reply_comes_back_to_follow_up() {
+        let mut queue = Queue::new(QueueRules::default());
+        queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+        let dm = id(&slack(), "dm-1");
+        decide(&mut queue, NOW, Decision::WaitOnReply(dm.clone()));
+
+        let notes = queue.tick(NOW + Duration::hours(2));
+
+        assert_eq!(
+            notes,
+            vec![note(&dm, Happened::Resurfaced(Rule::FollowUpDue))]
+        );
+    }
+
+    #[test]
+    fn waiting_on_a_closed_item_is_refused() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Finish(review.clone()));
+
+        assert_eq!(
+            queue.decide(NOW, Decision::WaitOnReply(review)),
+            Err(Refusal::AlreadyDone)
+        );
+    }
+
+    #[test]
+    fn focus_cannot_start_twice_or_end_before_it_starts() {
+        let mut queue = queue_with(&[]);
+        assert_eq!(
+            queue.decide(NOW, Decision::EndFocus),
+            Err(Refusal::NotFocused)
+        );
+
+        let until = NOW + Duration::hours(1);
+        assert_eq!(
+            queue.decide(NOW, Decision::StartFocus { until }),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            queue.focus(),
+            Some(&Focus {
+                until,
+                mutes: BTreeSet::from([SourceCategory::Messaging])
+            })
+        );
+        assert_eq!(
+            queue.decide(NOW, Decision::StartFocus { until }),
+            Err(Refusal::AlreadyFocused)
+        );
+    }
+
+    #[test]
+    fn a_muted_arrival_during_focus_is_held_back() {
+        let mut queue = queue_with(&[]);
+        decide(
+            &mut queue,
+            NOW,
+            Decision::StartFocus {
+                until: NOW + Duration::hours(1),
+            },
+        );
+
+        let notes = queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+
+        assert_eq!(
+            notes,
+            vec![note(&id(&slack(), "dm-1"), Happened::HeldForFocus)]
+        );
+    }
+
+    #[test]
+    fn focus_leaves_other_categories_alone() {
+        let mut queue = queue_with(&[]);
+        decide(
+            &mut queue,
+            NOW,
+            Decision::StartFocus {
+                until: NOW + Duration::hours(1),
+            },
+        );
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::NeedsReview)],
+        );
+
+        assert_eq!(notes, vec![note(&id(&github(), "41"), Happened::Arrived)]);
+    }
+
+    #[test]
+    fn focus_running_out_brings_back_what_arrived_during_it() {
+        let mut queue = queue_with(&[]);
+        let until = NOW + Duration::hours(1);
+        decide(&mut queue, NOW, Decision::StartFocus { until });
+        queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+        let dm = id(&slack(), "dm-1");
+
+        let notes = queue.tick(until);
+
+        assert_eq!(
+            notes,
+            vec![note(&dm, Happened::Resurfaced(Rule::ArrivedDuringFocus))]
+        );
+        assert_eq!(queue.focus(), None);
+        assert_eq!(queue.entry(&dm).expect("entry").queued_at(), until);
+    }
+
+    #[test]
+    fn ending_focus_early_brings_back_what_arrived_during_it() {
+        let mut queue = queue_with(&[]);
+        decide(
+            &mut queue,
+            NOW,
+            Decision::StartFocus {
+                until: NOW + Duration::hours(1),
+            },
+        );
+        queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+
+        let later = NOW + Duration::minutes(20);
+        let notes = decide(&mut queue, later, Decision::EndFocus);
+
+        assert_eq!(
+            notes,
+            vec![note(
+                &id(&slack(), "dm-1"),
+                Happened::Resurfaced(Rule::ArrivedDuringFocus)
+            )]
+        );
+        assert_eq!(queue.focus(), None);
+    }
+
+    #[test]
+    fn a_muted_item_that_changes_during_focus_comes_back_after_it() {
+        let mut queue = Queue::new(QueueRules::default());
+        queue.observe(NOW, &slack(), vec![message("thread", NOW)]);
+        let thread = id(&slack(), "thread");
+        decide(
+            &mut queue,
+            NOW,
+            Decision::StartFocus {
+                until: NOW + Duration::hours(1),
+            },
+        );
+
+        let later = NOW + Duration::minutes(5);
+        assert_eq!(
+            queue.observe(later, &slack(), vec![message("thread", later)]),
+            vec![note(&thread, Happened::Updated)]
+        );
+        let notes = decide(&mut queue, later, Decision::EndFocus);
+
+        assert_eq!(
+            notes,
+            vec![note(
+                &thread,
+                Happened::Resurfaced(Rule::ArrivedDuringFocus)
+            )]
+        );
+    }
+
+    #[test]
+    fn muted_items_untouched_during_focus_come_back_quietly() {
+        let mut queue = Queue::new(QueueRules::default());
+        queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+        decide(
+            &mut queue,
+            NOW,
+            Decision::StartFocus {
+                until: NOW + Duration::hours(1),
+            },
+        );
+
+        assert!(decide(&mut queue, NOW, Decision::EndFocus).is_empty());
+        assert_eq!(
+            queue
+                .entry(&id(&slack(), "dm-1"))
+                .expect("entry")
+                .returned(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reason_found_during_focus_outlives_it() {
+        let mut queue = Queue::new(QueueRules::default());
+        queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+        let dm = id(&slack(), "dm-1");
+        decide(&mut queue, NOW, Decision::WaitOnReply(dm.clone()));
+        decide(
+            &mut queue,
+            NOW,
+            Decision::StartFocus {
+                until: NOW + Duration::hours(1),
+            },
+        );
+        let later = NOW + Duration::minutes(5);
+        queue.observe(later, &slack(), vec![message("dm-1", later)]);
+
+        assert!(decide(&mut queue, later, Decision::EndFocus).is_empty());
+        assert_eq!(
+            queue
+                .entry(&dm)
+                .expect("entry")
+                .returned()
+                .map(|back| back.rule),
+            Some(Rule::ReplyArrived)
+        );
+    }
+
+    #[test]
+    fn an_item_looked_at_during_focus_does_not_come_back_after_it() {
+        let mut queue = Queue::new(QueueRules {
+            switched_away_park: Duration::ZERO,
+            ..QueueRules::default()
+        });
+        queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::NeedsReview)],
+        );
+        decide(
+            &mut queue,
+            NOW,
+            Decision::StartFocus {
+                until: NOW + Duration::hours(1),
+            },
+        );
+        queue.observe(NOW, &slack(), vec![message("dm-1", NOW)]);
+        decide(&mut queue, NOW, Decision::Take(id(&slack(), "dm-1")));
+        decide(&mut queue, NOW, Decision::Take(id(&github(), "41")));
+
+        assert!(decide(&mut queue, NOW, Decision::EndFocus).is_empty());
     }
 }

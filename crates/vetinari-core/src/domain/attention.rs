@@ -205,6 +205,12 @@ impl ItemState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Priority(u32);
 
+impl Priority {
+    pub(crate) const fn raised(self, by: u32) -> Self {
+        Self(self.0.saturating_add(by))
+    }
+}
+
 /// A pull request or merge request, with everything a review workflow needs
 /// to create a worktree for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
