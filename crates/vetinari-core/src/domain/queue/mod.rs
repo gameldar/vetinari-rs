@@ -7,6 +7,7 @@
 //! owned data, so it can be stored and restored without touching the rules.
 
 pub mod lifecycle;
+pub mod record;
 pub mod rules;
 pub mod view;
 
@@ -15,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 
 use self::lifecycle::{Closure, Lifecycle, ParkReason, ParkUntil, Resurfaced, Rule, WaitingOn};
+use self::record::RecordEntry;
 use self::rules::QueueRules;
 use super::attention::{AttentionItem, ItemState, SourceCategory};
 use super::ids::{ItemId, SourceId};
@@ -259,6 +261,7 @@ pub struct Queue {
     held: BTreeMap<ItemId, (Entry, Lifecycle)>,
     active: Option<Active>,
     focus: Option<Focus>,
+    record: Vec<RecordEntry>,
 }
 
 impl Queue {
@@ -270,6 +273,7 @@ impl Queue {
             held: BTreeMap::new(),
             active: None,
             focus: None,
+            record: Vec::new(),
         }
     }
 
@@ -312,6 +316,7 @@ impl Queue {
         if self.focus.as_ref().is_some_and(|focus| focus.until <= now) {
             notes.extend(self.end_focus(now));
         }
+        self.keep_record(now, &notes);
         notes
     }
 
@@ -425,6 +430,7 @@ impl Queue {
         for (agent, signal) in signals {
             notes.extend(self.agent_signal(now, &agent, signal));
         }
+        self.keep_record(now, &notes);
         notes
     }
 
@@ -481,7 +487,7 @@ impl Queue {
         now: OffsetDateTime,
         decision: Decision,
     ) -> Result<Vec<Note>, Refusal> {
-        match decision {
+        let notes = match decision {
             Decision::Take(id) => self.take(now, id),
             Decision::Finish(id) => self.close(now, id, Closure::Finished, Happened::Finished),
             Decision::Silence(id) => self.close(now, id, Closure::Silenced, Happened::Silenced),
@@ -514,7 +520,9 @@ impl Queue {
                 }
                 Ok(self.end_focus(now))
             }
-        }
+        }?;
+        self.keep_record(now, &notes);
+        Ok(notes)
     }
 
     /// Wait on the item's agent, bringing it straight back if the agent
