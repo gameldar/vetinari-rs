@@ -24,6 +24,9 @@ pub struct QueueRules {
     pub follow_up_after: Duration,
     /// What focus time holds back.
     pub focus_mutes: BTreeSet<SourceCategory>,
+    /// Show an agent inside the item it is working on rather than as an
+    /// item of its own, so its signals bring that item back instead.
+    pub fold_agents: bool,
 }
 
 impl Default for QueueRules {
@@ -35,6 +38,7 @@ impl Default for QueueRules {
             urgent_breaks_snooze: true,
             follow_up_after: Duration::hours(2),
             focus_mutes: BTreeSet::from([SourceCategory::Messaging]),
+            fold_agents: true,
         }
     }
 }

@@ -36,6 +36,7 @@ pub struct Entry {
     returned: Option<Resurfaced>,
     queued_at: OffsetDateTime,
     held_by_focus: bool,
+    agent: Option<ItemId>,
 }
 
 impl Entry {
@@ -46,6 +47,7 @@ impl Entry {
             returned: None,
             queued_at: now,
             held_by_focus: false,
+            agent: None,
         }
     }
 
@@ -75,6 +77,12 @@ impl Entry {
     #[must_use]
     pub const fn returned(&self) -> Option<Resurfaced> {
         self.returned
+    }
+
+    /// The agent item working on it, once it has been handed to one.
+    #[must_use]
+    pub const fn agent(&self) -> Option<&ItemId> {
+        self.agent.as_ref()
     }
 
     /// When it last joined the inbox.
@@ -140,6 +148,16 @@ pub enum Happened {
     WaitingOnReply,
     /// It arrived during focus time and is held back until it ends.
     HeldForFocus,
+    /// The developer handed it to an agent and is waiting on it.
+    HandedToAgent,
+    /// The developer is waiting on the agent already working on it.
+    WaitingOnAgent,
+    /// Its agent needs the developer, who is already working on it.
+    AgentNeedsYouWhileActive,
+    /// Its agent went away; it is no longer linked to one.
+    AgentClosed,
+    /// An agent closed along with the item it was working on.
+    ClosedWithItem,
 }
 
 /// How long to park an item for.
@@ -164,6 +182,15 @@ pub enum Decision {
     Park(ItemId, ParkFor),
     /// Wait on someone's reply to it.
     WaitOnReply(ItemId),
+    /// Hand it to an agent, identified by the agent's own item, and wait.
+    Delegate {
+        /// The item handed over.
+        item: ItemId,
+        /// The agent's item, which may not have been reported yet.
+        agent: ItemId,
+    },
+    /// Wait on the agent it was already handed to.
+    WaitOnAgent(ItemId),
     /// Hold back the muted categories until a moment.
     StartFocus {
         /// When focus time ends.
@@ -185,6 +212,9 @@ pub enum Refusal {
     /// The item is already closed.
     #[error("that is already closed")]
     AlreadyDone,
+    /// The item has not been handed to an agent.
+    #[error("no agent is working on that")]
+    NoAgent,
     /// Focus time has already started.
     #[error("focus time has already started")]
     AlreadyFocused,
@@ -200,6 +230,20 @@ pub struct Focus {
     pub until: OffsetDateTime,
     /// What it holds back.
     pub mutes: BTreeSet<SourceCategory>,
+}
+
+/// What an agent's own report means for the item it is working on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSignal {
+    NeedsYou,
+    Closed,
+}
+
+impl AgentSignal {
+    fn from_report(entry: &Entry) -> Option<Self> {
+        (entry.item.category() == SourceCategory::AgentState && entry.item.state().needs_you())
+            .then_some(Self::NeedsYou)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +354,7 @@ impl Queue {
     ) -> Vec<Note> {
         let mut notes = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut signals = Vec::new();
 
         for item in items {
             let id = item.id().clone();
@@ -320,6 +365,8 @@ impl Queue {
                 .filter(|active| active.entry.item.id() == &id)
             {
                 if active.entry.refresh(item) {
+                    signals
+                        .extend(AgentSignal::from_report(&active.entry).map(|s| (id.clone(), s)));
                     notes.push(Note::new(id, Happened::Updated));
                 }
                 continue;
@@ -333,6 +380,7 @@ impl Queue {
                     } else {
                         Happened::Arrived
                     };
+                    signals.extend(AgentSignal::from_report(&entry).map(|s| (id.clone(), s)));
                     self.held.insert(id.clone(), (entry, Lifecycle::Inbox));
                     notes.push(Note::new(id, happened));
                 }
@@ -340,6 +388,7 @@ impl Queue {
                     if entry.refresh(item) {
                         entry.held_by_focus |= mutes(self.focus.as_ref(), entry);
                         let happened = changed(&self.rules, now, entry, lifecycle);
+                        signals.extend(AgentSignal::from_report(entry).map(|s| (id.clone(), s)));
                         notes.push(Note::new(id, happened));
                     }
                 }
@@ -365,10 +414,63 @@ impl Queue {
         for (id, (entry, lifecycle)) in &mut self.held {
             if vanished(entry) {
                 entry.upstream = Upstream::Gone;
+                if entry.item.category() == SourceCategory::AgentState {
+                    signals.push((id.clone(), AgentSignal::Closed));
+                }
                 if let Some(happened) = gone(&self.rules, now, entry, lifecycle) {
                     notes.push(Note::new(id.clone(), happened));
                 }
             }
+        }
+        for (agent, signal) in signals {
+            notes.extend(self.agent_signal(now, &agent, signal));
+        }
+        notes
+    }
+
+    /// Pass an agent's news on to the items linked to it. A folded agent is
+    /// not shown on its own, so its item has to come back in its place.
+    fn agent_signal(
+        &mut self,
+        now: OffsetDateTime,
+        agent: &ItemId,
+        signal: AgentSignal,
+    ) -> Vec<Note> {
+        let mut notes = Vec::new();
+        if let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.entry.agent.as_ref() == Some(agent))
+        {
+            let happened = match signal {
+                AgentSignal::NeedsYou => Happened::AgentNeedsYouWhileActive,
+                AgentSignal::Closed => {
+                    active.entry.agent = None;
+                    Happened::AgentClosed
+                }
+            };
+            notes.push(Note::new(active.entry.item.id().clone(), happened));
+        }
+        for (id, (entry, lifecycle)) in &mut self.held {
+            if entry.agent.as_ref() != Some(agent) || matches!(lifecycle, Lifecycle::Done { .. }) {
+                continue;
+            }
+            let waiting = *lifecycle == Lifecycle::Waiting(WaitingOn::Agent);
+            let happened = match signal {
+                AgentSignal::NeedsYou if waiting || self.rules.fold_agents => {
+                    resurface(now, entry, lifecycle, Rule::AgentNeedsYou)
+                }
+                AgentSignal::NeedsYou => continue,
+                AgentSignal::Closed => {
+                    entry.agent = None;
+                    if waiting {
+                        resurface(now, entry, lifecycle, Rule::AgentClosed)
+                    } else {
+                        Happened::AgentClosed
+                    }
+                }
+            };
+            notes.push(Note::new(id.clone(), happened));
         }
         notes
     }
@@ -385,6 +487,17 @@ impl Queue {
             Decision::Silence(id) => self.close(now, id, Closure::Silenced, Happened::Silenced),
             Decision::Park(id, park_for) => self.park(id, park_for),
             Decision::WaitOnReply(id) => self.wait_on_reply(now, id),
+            Decision::Delegate { item, agent } => {
+                let (entry, _) = self.open_item(&item)?;
+                entry.agent = Some(agent);
+                self.wait_on_agent(now, item, Happened::HandedToAgent)
+            }
+            Decision::WaitOnAgent(id) => {
+                if self.entry(&id).ok_or(Refusal::Unknown)?.agent.is_none() {
+                    return Err(Refusal::NoAgent);
+                }
+                self.wait_on_agent(now, id, Happened::WaitingOnAgent)
+            }
             Decision::StartFocus { until } => {
                 if self.focus.is_some() {
                     return Err(Refusal::AlreadyFocused);
@@ -402,6 +515,32 @@ impl Queue {
                 Ok(self.end_focus(now))
             }
         }
+    }
+
+    /// Wait on the item's agent, bringing it straight back if the agent
+    /// already needs the developer.
+    fn wait_on_agent(
+        &mut self,
+        now: OffsetDateTime,
+        id: ItemId,
+        happened: Happened,
+    ) -> Result<Vec<Note>, Refusal> {
+        let agent_needs_you = self
+            .entry(&id)
+            .and_then(|entry| entry.agent.as_ref())
+            .and_then(|agent| self.entry(agent))
+            .is_some_and(|agent| agent.item.state().needs_you());
+        let (entry, lifecycle) = self.open_item(&id)?;
+        entry.returned = None;
+        *lifecycle = Lifecycle::Waiting(WaitingOn::Agent);
+        let mut notes = vec![Note::new(id.clone(), happened)];
+        if agent_needs_you {
+            notes.push(Note::new(
+                id,
+                resurface(now, entry, lifecycle, Rule::AgentNeedsYou),
+            ));
+        }
+        Ok(notes)
     }
 
     fn wait_on_reply(&mut self, now: OffsetDateTime, id: ItemId) -> Result<Vec<Note>, Refusal> {
@@ -472,8 +611,22 @@ impl Queue {
     ) -> Result<Vec<Note>, Refusal> {
         let (entry, lifecycle) = self.open_item(&id)?;
         entry.returned = None;
+        let agent = entry.agent.clone();
         *lifecycle = Lifecycle::Done { closure, at: now };
-        Ok(vec![Note::new(id, happened)])
+        let mut notes = vec![Note::new(id.clone(), happened)];
+        if happened == Happened::Finished
+            && let Some(agent) = agent
+            && let Some((agent_entry, agent_lifecycle)) = self.held.get_mut(&agent)
+            && *agent_lifecycle == Lifecycle::Inbox
+            && agent_entry.item.state() == ItemState::AgentDone
+        {
+            *agent_lifecycle = Lifecycle::Done {
+                closure: Closure::WithItem(id),
+                at: now,
+            };
+            notes.push(Note::new(agent, Happened::ClosedWithItem));
+        }
+        Ok(notes)
     }
 
     fn park(&mut self, id: ItemId, park_for: ParkFor) -> Result<Vec<Note>, Refusal> {
@@ -541,6 +694,7 @@ fn changed(
             ..
         } => (rules.urgent_breaks_snooze && state.is_urgent()).then_some(Rule::UrgentChange),
         Lifecycle::Waiting(WaitingOn::Reply { .. }) => Some(Rule::ReplyArrived),
+        Lifecycle::Waiting(WaitingOn::Agent) => return Happened::Updated,
         Lifecycle::Done {
             closure: Closure::Silenced,
             ..
@@ -1520,5 +1674,274 @@ mod tests {
         decide(&mut queue, NOW, Decision::Take(id(&github(), "41")));
 
         assert!(decide(&mut queue, NOW, Decision::EndFocus).is_empty());
+    }
+
+    fn agents() -> SourceId {
+        SourceId::parse("agents").expect("slug")
+    }
+
+    fn agent_report(native: &str, state: ItemState, occurred_at: OffsetDateTime) -> AttentionItem {
+        AttentionItem::builder(
+            &agents(),
+            native,
+            SourceCategory::AgentState,
+            NonEmptyText::parse(&format!("agent {native}")).expect("title"),
+        )
+        .state(state)
+        .occurred_at(occurred_at)
+        .build()
+    }
+
+    /// A review handed to agent w9, which is reported as running.
+    fn delegated() -> (Queue, ItemId, ItemId) {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        let agent = id(&agents(), "w9");
+        queue.observe(
+            NOW,
+            &agents(),
+            vec![agent_report("w9", ItemState::AgentRunning, NOW)],
+        );
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Delegate {
+                item: review.clone(),
+                agent: agent.clone(),
+            },
+        );
+        (queue, review, agent)
+    }
+
+    fn agent_now(queue: &mut Queue, state: ItemState, minutes: i64) -> Vec<Note> {
+        let at = NOW + Duration::minutes(minutes);
+        queue.observe(at, &agents(), vec![agent_report("w9", state, at)])
+    }
+
+    #[test]
+    fn handing_an_item_to_an_agent_waits_on_it() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        let agent = id(&agents(), "w9");
+
+        let notes = decide(
+            &mut queue,
+            NOW,
+            Decision::Delegate {
+                item: review.clone(),
+                agent: agent.clone(),
+            },
+        );
+
+        assert_eq!(notes, vec![note(&review, Happened::HandedToAgent)]);
+        assert_eq!(held(&queue, &review), Lifecycle::Waiting(WaitingOn::Agent));
+        assert_eq!(queue.entry(&review).expect("entry").agent(), Some(&agent));
+    }
+
+    #[test]
+    fn the_agent_finishing_brings_its_item_back() {
+        let (mut queue, review, agent) = delegated();
+
+        let notes = agent_now(&mut queue, ItemState::AgentDone, 15);
+
+        assert_eq!(
+            notes,
+            vec![
+                note(&agent, Happened::Updated),
+                note(&review, Happened::Resurfaced(Rule::AgentNeedsYou)),
+            ]
+        );
+        assert_eq!(held(&queue, &review), Lifecycle::Inbox);
+    }
+
+    #[test]
+    fn the_agent_stopping_for_input_brings_its_item_back() {
+        let (mut queue, review, _) = delegated();
+
+        let notes = agent_now(&mut queue, ItemState::AgentWaiting, 5);
+
+        assert!(notes.contains(&note(&review, Happened::Resurfaced(Rule::AgentNeedsYou))));
+    }
+
+    #[test]
+    fn an_agent_still_working_changes_nothing_for_its_item() {
+        let (mut queue, review, agent) = delegated();
+
+        let notes = agent_now(&mut queue, ItemState::AgentRunning, 5);
+
+        assert_eq!(notes, vec![note(&agent, Happened::Updated)]);
+        assert_eq!(held(&queue, &review), Lifecycle::Waiting(WaitingOn::Agent));
+    }
+
+    #[test]
+    fn the_agent_finishing_while_you_watch_leaves_you_on_it() {
+        let (mut queue, review, _) = delegated();
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        let notes = agent_now(&mut queue, ItemState::AgentDone, 5);
+
+        assert!(notes.contains(&note(&review, Happened::AgentNeedsYouWhileActive)));
+        assert_eq!(
+            queue.position(&review),
+            Some(Position::Active { since: NOW })
+        );
+    }
+
+    #[test]
+    fn a_parked_item_comes_back_when_its_folded_agent_needs_you() {
+        let (mut queue, review, _) = delegated();
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(review.clone(), ParkFor::Until(NOW + Duration::hours(2))),
+        );
+
+        let notes = agent_now(&mut queue, ItemState::AgentWaiting, 5);
+
+        assert!(notes.contains(&note(&review, Happened::Resurfaced(Rule::AgentNeedsYou))));
+    }
+
+    #[test]
+    fn a_parked_item_stays_parked_when_agents_are_not_folded() {
+        let (mut queue, review, _) = delegated();
+        queue.rules.fold_agents = false;
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(review.clone(), ParkFor::Until(NOW + Duration::hours(2))),
+        );
+
+        agent_now(&mut queue, ItemState::AgentWaiting, 5);
+
+        assert!(matches!(held(&queue, &review), Lifecycle::Parked { .. }));
+    }
+
+    #[test]
+    fn waiting_on_an_agent_needs_one() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+
+        assert_eq!(
+            queue.decide(NOW, Decision::WaitOnAgent(id(&github(), "41"))),
+            Err(Refusal::NoAgent)
+        );
+    }
+
+    #[test]
+    fn waiting_on_an_agent_that_already_finished_comes_straight_back() {
+        let (mut queue, review, _) = delegated();
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+        agent_now(&mut queue, ItemState::AgentDone, 5);
+
+        let notes = decide(&mut queue, NOW, Decision::WaitOnAgent(review.clone()));
+
+        assert_eq!(
+            notes,
+            vec![
+                note(&review, Happened::WaitingOnAgent),
+                note(&review, Happened::Resurfaced(Rule::AgentNeedsYou)),
+            ]
+        );
+    }
+
+    #[test]
+    fn waiting_on_an_agent_still_working_waits() {
+        let (mut queue, review, _) = delegated();
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        let notes = decide(&mut queue, NOW, Decision::WaitOnAgent(review.clone()));
+
+        assert_eq!(notes, vec![note(&review, Happened::WaitingOnAgent)]);
+        assert_eq!(held(&queue, &review), Lifecycle::Waiting(WaitingOn::Agent));
+    }
+
+    #[test]
+    fn the_agent_going_away_frees_its_item() {
+        let (mut queue, review, agent) = delegated();
+
+        let notes = queue.observe(NOW, &agents(), Vec::new());
+
+        assert_eq!(
+            notes,
+            vec![
+                note(&agent, Happened::ClosedUpstream),
+                note(&review, Happened::Resurfaced(Rule::AgentClosed)),
+            ]
+        );
+        assert_eq!(queue.entry(&review).expect("entry").agent(), None);
+    }
+
+    #[test]
+    fn the_agent_going_away_unlinks_an_item_not_waiting_on_it() {
+        let (mut queue, review, _) = delegated();
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        let notes = queue.observe(NOW, &agents(), Vec::new());
+
+        assert!(notes.contains(&note(&review, Happened::AgentClosed)));
+        assert_eq!(queue.entry(&review).expect("entry").agent(), None);
+    }
+
+    #[test]
+    fn an_agent_reported_for_the_first_time_already_blocked_brings_its_item_back() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        let agent = id(&agents(), "w9");
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Delegate {
+                item: review.clone(),
+                agent: agent.clone(),
+            },
+        );
+
+        let notes = queue.observe(
+            NOW,
+            &agents(),
+            vec![agent_report("w9", ItemState::AgentWaiting, NOW)],
+        );
+
+        assert_eq!(
+            notes,
+            vec![
+                note(&agent, Happened::Arrived),
+                note(&review, Happened::Resurfaced(Rule::AgentNeedsYou)),
+            ]
+        );
+    }
+
+    #[test]
+    fn finishing_an_item_closes_its_finished_agent_with_it() {
+        let (mut queue, review, agent) = delegated();
+        agent_now(&mut queue, ItemState::AgentDone, 5);
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        let notes = decide(&mut queue, NOW, Decision::Finish(review.clone()));
+
+        assert_eq!(
+            notes,
+            vec![
+                note(&review, Happened::Finished),
+                note(&agent, Happened::ClosedWithItem)
+            ]
+        );
+        assert_eq!(
+            held(&queue, &agent),
+            Lifecycle::Done {
+                closure: Closure::WithItem(review),
+                at: NOW
+            }
+        );
+    }
+
+    #[test]
+    fn finishing_an_item_leaves_an_agent_still_working_open() {
+        let (mut queue, review, agent) = delegated();
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        let notes = decide(&mut queue, NOW, Decision::Finish(review.clone()));
+
+        assert_eq!(notes, vec![note(&review, Happened::Finished)]);
+        assert_eq!(held(&queue, &agent), Lifecycle::Inbox);
     }
 }

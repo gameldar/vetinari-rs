@@ -3,6 +3,8 @@
 
 use time::OffsetDateTime;
 
+use crate::domain::ids::ItemId;
+
 /// Where a held item stands. The item being worked on is not held: the
 /// queue keeps it apart, so there can only ever be one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,10 +58,12 @@ pub enum WaitingOn {
         /// When to chase it.
         follow_up_at: OffsetDateTime,
     },
+    /// The agent the item was handed to.
+    Agent,
 }
 
 /// How an item was closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Closure {
     /// The developer finished it; it reopens if it needs them again.
     Finished,
@@ -67,6 +71,8 @@ pub enum Closure {
     Silenced,
     /// It went away at its source.
     Upstream,
+    /// An agent's output, closed along with the item it was working on.
+    WithItem(ItemId),
 }
 
 /// Why an item came back to the queue.
@@ -88,6 +94,10 @@ pub enum Rule {
     FollowUpDue,
     /// It arrived or changed while focus time held it back.
     ArrivedDuringFocus,
+    /// The agent working on it finished or stopped for input.
+    AgentNeedsYou,
+    /// The agent working on it went away before finishing.
+    AgentClosed,
 }
 
 /// A return to the queue, kept on the item until the developer acts on it.

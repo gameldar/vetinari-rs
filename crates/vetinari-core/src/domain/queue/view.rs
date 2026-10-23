@@ -1,11 +1,14 @@
 //! The queue as the developer reads it: what they are on, what to do next,
 //! and what is held back and why.
 
+use std::collections::BTreeSet;
+
 use time::OffsetDateTime;
 
 use super::lifecycle::{Lifecycle, ParkUntil};
 use super::{Entry, Queue, mutes};
 use crate::domain::attention::Priority;
+use crate::domain::ids::ItemId;
 
 /// How far an item that came back is lifted: enough to pass others in the
 /// same state, never enough to pass a state a tier more urgent.
@@ -54,9 +57,11 @@ impl Queue {
         };
         let mut parked = Vec::new();
         let mut done = Vec::new();
+        let folded = self.folded_agents();
 
         for (entry, lifecycle) in self.held.values() {
             match lifecycle {
+                Lifecycle::Inbox if folded.contains(entry.item.id()) => {}
                 Lifecycle::Inbox if mutes(self.focus.as_ref(), entry) => {
                     view.held_for_focus.push(entry);
                 }
@@ -88,6 +93,24 @@ impl Queue {
         done.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
         view.done = done.into_iter().map(|(_, entry)| entry).collect();
         view
+    }
+}
+
+impl Queue {
+    /// Agents shown inside the open items they are working on.
+    fn folded_agents(&self) -> BTreeSet<&ItemId> {
+        if !self.rules.fold_agents {
+            return BTreeSet::new();
+        }
+        let open_held = self
+            .held
+            .values()
+            .filter(|(_, lifecycle)| !matches!(lifecycle, Lifecycle::Done { .. }))
+            .map(|(entry, _)| entry);
+        open_held
+            .chain(self.active.as_ref().map(|active| &active.entry))
+            .filter_map(|entry| entry.agent.as_ref())
+            .collect()
     }
 }
 
@@ -336,5 +359,60 @@ mod tests {
 
         decide(&mut queue, Decision::EndFocus);
         assert_eq!(next_ids(&queue.view(NOW)), ["slack:dm"]);
+    }
+
+    fn agent(native: &str, state: ItemState) -> AttentionItem {
+        report("agents", native, SourceCategory::AgentState, state)
+    }
+
+    fn delegated_review() -> Queue {
+        let mut queue = queue_of(vec![pr("review", ItemState::NeedsReview)]);
+        queue.observe(
+            NOW,
+            &source("agents"),
+            vec![agent("w9", ItemState::AgentRunning)],
+        );
+        decide(
+            &mut queue,
+            Decision::Delegate {
+                item: id("github", "review"),
+                agent: id("agents", "w9"),
+            },
+        );
+        queue
+    }
+
+    fn agent_reports(queue: &mut Queue, state: ItemState) {
+        queue.observe(NOW, &source("agents"), vec![agent("w9", state)]);
+    }
+
+    #[test]
+    fn an_agent_is_folded_into_the_item_it_is_working_on() {
+        let mut queue = delegated_review();
+        assert!(queue.view(NOW).quiet.is_empty());
+
+        agent_reports(&mut queue, ItemState::AgentDone);
+
+        assert_eq!(next_ids(&queue.view(NOW)), ["github:review"]);
+    }
+
+    #[test]
+    fn an_agent_is_listed_on_its_own_when_folding_is_off() {
+        let mut queue = delegated_review();
+        queue.rules.fold_agents = false;
+        assert_eq!(ids(&queue.view(NOW).quiet), ["agents:w9"]);
+
+        agent_reports(&mut queue, ItemState::AgentDone);
+
+        assert_eq!(next_ids(&queue.view(NOW)), ["github:review", "agents:w9"]);
+    }
+
+    #[test]
+    fn an_agent_unfolds_once_its_item_is_closed() {
+        let mut queue = delegated_review();
+        agent_reports(&mut queue, ItemState::AgentWaiting);
+        decide(&mut queue, Decision::Finish(id("github", "review")));
+
+        assert_eq!(next_ids(&queue.view(NOW)), ["agents:w9"]);
     }
 }
