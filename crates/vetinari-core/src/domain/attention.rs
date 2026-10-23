@@ -157,6 +157,30 @@ impl ItemState {
         !matches!(self, ItemState::AgentDone | ItemState::Resolved)
     }
 
+    /// Whether anything is wanted from the developer right now. Work still in
+    /// flight belongs out of the way until it lands.
+    #[must_use]
+    pub const fn needs_you(&self) -> bool {
+        !matches!(
+            self,
+            ItemState::CiRunning | ItemState::AgentRunning | ItemState::Resolved
+        )
+    }
+
+    /// Whether every minute this waits costs someone, so it should cut a
+    /// snooze short.
+    #[must_use]
+    pub const fn is_urgent(&self) -> bool {
+        matches!(
+            self,
+            ItemState::AgentWaiting
+                | ItemState::Blocked
+                | ItemState::AgentFailed
+                | ItemState::CiFailed
+                | ItemState::ChangesRequested
+        )
+    }
+
     const fn base_score(&self) -> u32 {
         match self {
             ItemState::AgentWaiting => 900,
@@ -805,5 +829,49 @@ mod tests {
             },
         );
         assert_eq!(past.relative_time(NOW).as_deref(), Some("1h 30m ago"));
+    }
+
+    #[test]
+    fn work_in_flight_needs_nothing_from_you() {
+        for state in [
+            ItemState::CiRunning,
+            ItemState::AgentRunning,
+            ItemState::Resolved,
+        ] {
+            assert!(!state.needs_you(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn finished_agent_output_still_needs_you_to_look() {
+        assert!(ItemState::AgentDone.needs_you());
+        assert!(ItemState::Unread.needs_you());
+        assert!(
+            ItemState::Scheduled {
+                starts_at: NOW + Duration::hours(3)
+            }
+            .needs_you()
+        );
+    }
+
+    #[test]
+    fn only_states_that_cost_time_now_are_urgent() {
+        for state in [
+            ItemState::AgentWaiting,
+            ItemState::Blocked,
+            ItemState::AgentFailed,
+            ItemState::CiFailed,
+            ItemState::ChangesRequested,
+        ] {
+            assert!(state.is_urgent(), "{state:?}");
+        }
+        for state in [
+            ItemState::NeedsReview,
+            ItemState::Unread,
+            ItemState::Assigned,
+            ItemState::AgentDone,
+        ] {
+            assert!(!state.is_urgent(), "{state:?}");
+        }
     }
 }

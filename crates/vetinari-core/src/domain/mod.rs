@@ -11,6 +11,7 @@ pub mod ids;
 pub mod keymap;
 pub mod keys;
 pub mod profile;
+pub mod queue;
 pub mod routing;
 pub mod skill;
 pub mod text;

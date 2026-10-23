@@ -1,0 +1,1071 @@
+//! The attention queue: what the developer has decided about each item, kept
+//! across refreshes, and the rules that bring items back.
+//!
+//! Sources only report facts. The queue reconciles each source's snapshot
+//! against what it already holds, so "this changed", "this went away" and
+//! "you walked away from this" can be noticed at all. Its state is plain
+//! owned data, so it can be stored and restored without touching the rules.
+
+pub mod lifecycle;
+pub mod rules;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use time::OffsetDateTime;
+
+use self::lifecycle::{Closure, Lifecycle, ParkReason, ParkUntil, Resurfaced, Rule};
+use self::rules::QueueRules;
+use super::attention::{AttentionItem, ItemState};
+use super::ids::{ItemId, SourceId};
+
+/// Whether an item's source still reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upstream {
+    /// The last snapshot from its source included it.
+    Present,
+    /// Its source stopped reporting it.
+    Gone,
+}
+
+/// An item and the queue's bookkeeping for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    item: AttentionItem,
+    upstream: Upstream,
+    returned: Option<Resurfaced>,
+    queued_at: OffsetDateTime,
+}
+
+impl Entry {
+    const fn new(item: AttentionItem, now: OffsetDateTime) -> Self {
+        Self {
+            item,
+            upstream: Upstream::Present,
+            returned: None,
+            queued_at: now,
+        }
+    }
+
+    /// Take a fresh report of the item, saying whether it changed. A report
+    /// after the item went away is always a change.
+    fn refresh(&mut self, item: AttentionItem) -> bool {
+        let changed =
+            self.upstream == Upstream::Gone || fingerprint(&self.item) != fingerprint(&item);
+        self.item = item;
+        self.upstream = Upstream::Present;
+        changed
+    }
+
+    /// The item, as its source last reported it.
+    #[must_use]
+    pub const fn item(&self) -> &AttentionItem {
+        &self.item
+    }
+
+    /// Whether its source still reports it.
+    #[must_use]
+    pub const fn upstream(&self) -> Upstream {
+        self.upstream
+    }
+
+    /// Why it came back, until the developer acts on it.
+    #[must_use]
+    pub const fn returned(&self) -> Option<Resurfaced> {
+        self.returned
+    }
+
+    /// When it last joined the inbox.
+    #[must_use]
+    pub const fn queued_at(&self) -> OffsetDateTime {
+        self.queued_at
+    }
+}
+
+/// Where an item stands in the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position<'a> {
+    /// The developer is working on it.
+    Active {
+        /// Since when.
+        since: OffsetDateTime,
+    },
+    /// Anywhere else.
+    Held(&'a Lifecycle),
+}
+
+/// Something the queue did, for the log and for anything watching it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// The item it happened to.
+    pub item: ItemId,
+    /// What happened.
+    pub happened: Happened,
+}
+
+/// What happened to an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Happened {
+    /// Its source reported it for the first time.
+    Arrived,
+    /// It changed, and where it stands did not.
+    Updated,
+    /// It changed while parked, and the park holds.
+    StayedParked,
+    /// It changed after being silenced.
+    IgnoredSilenced,
+    /// It changed after being finished, and stays closed.
+    LeftClosed,
+    /// A rule brought it back to the queue.
+    Resurfaced(Rule),
+    /// It went away at its source while being worked on.
+    GoneWhileActive,
+    /// It went away at its source and was closed.
+    ClosedUpstream,
+    /// It went away at its source and was left where it was.
+    KeptAfterGone,
+    /// The developer took it.
+    Taken,
+    /// The developer switched away from it to something else.
+    SwitchedAway,
+    /// The developer parked it.
+    Parked,
+    /// The developer finished it.
+    Finished,
+    /// The developer silenced it.
+    Silenced,
+}
+
+/// How long to park an item for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkFor {
+    /// Until a moment.
+    Until(OffsetDateTime),
+    /// Until its source reports a change that needs the developer.
+    Changed,
+}
+
+/// A choice the developer makes about an item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// Work on it now.
+    Take(ItemId),
+    /// Mark it finished.
+    Finish(ItemId),
+    /// Close it and ignore its later changes.
+    Silence(ItemId),
+    /// Put it out of the way.
+    Park(ItemId, ParkFor),
+}
+
+/// Why a decision could not be made.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    /// The queue holds no such item.
+    #[error("there is no such item")]
+    Unknown,
+    /// The item is already being worked on.
+    #[error("you are already on this")]
+    AlreadyActive,
+    /// The item is already closed.
+    #[error("that is already closed")]
+    AlreadyDone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Active {
+    entry: Entry,
+    since: OffsetDateTime,
+}
+
+/// Every item the developer has been shown, and what they decided about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queue {
+    rules: QueueRules,
+    held: BTreeMap<ItemId, (Entry, Lifecycle)>,
+    active: Option<Active>,
+}
+
+impl Queue {
+    /// An empty queue.
+    #[must_use]
+    pub const fn new(rules: QueueRules) -> Self {
+        Self {
+            rules,
+            held: BTreeMap::new(),
+            active: None,
+        }
+    }
+
+    /// The rules in force.
+    #[must_use]
+    pub const fn rules(&self) -> &QueueRules {
+        &self.rules
+    }
+
+    /// Where an item stands.
+    #[must_use]
+    pub fn position(&self, id: &ItemId) -> Option<Position<'_>> {
+        if let Some(active) = self.active_on(id) {
+            return Some(Position::Active {
+                since: active.since,
+            });
+        }
+        self.held
+            .get(id)
+            .map(|(_, lifecycle)| Position::Held(lifecycle))
+    }
+
+    /// An item and its bookkeeping.
+    #[must_use]
+    pub fn entry(&self, id: &ItemId) -> Option<&Entry> {
+        if let Some(active) = self.active_on(id) {
+            return Some(&active.entry);
+        }
+        self.held.get(id).map(|(entry, _)| entry)
+    }
+
+    fn active_on(&self, id: &ItemId) -> Option<&Active> {
+        self.active
+            .as_ref()
+            .filter(|active| active.entry.item.id() == id)
+    }
+
+    /// Reconcile one source's complete snapshot. Only call this for a source
+    /// that was polled successfully: anything it no longer reports is
+    /// treated as gone.
+    pub fn observe(
+        &mut self,
+        now: OffsetDateTime,
+        source: &SourceId,
+        items: Vec<AttentionItem>,
+    ) -> Vec<Note> {
+        let mut notes = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        for item in items {
+            let id = item.id().clone();
+            seen.insert(id.clone());
+            if let Some(active) = self
+                .active
+                .as_mut()
+                .filter(|active| active.entry.item.id() == &id)
+            {
+                if active.entry.refresh(item) {
+                    notes.push(Note::new(id, Happened::Updated));
+                }
+                continue;
+            }
+            match self.held.get_mut(&id) {
+                None => {
+                    self.held
+                        .insert(id.clone(), (Entry::new(item, now), Lifecycle::Inbox));
+                    notes.push(Note::new(id, Happened::Arrived));
+                }
+                Some((entry, lifecycle)) => {
+                    if entry.refresh(item) {
+                        let happened = changed(&self.rules, now, entry, lifecycle);
+                        notes.push(Note::new(id, happened));
+                    }
+                }
+            }
+        }
+
+        let vanished = |entry: &Entry| {
+            entry.item.source() == source
+                && entry.upstream == Upstream::Present
+                && !seen.contains(entry.item.id())
+        };
+        if let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| vanished(&active.entry))
+        {
+            active.entry.upstream = Upstream::Gone;
+            notes.push(Note::new(
+                active.entry.item.id().clone(),
+                Happened::GoneWhileActive,
+            ));
+        }
+        for (id, (entry, lifecycle)) in &mut self.held {
+            if vanished(entry) {
+                entry.upstream = Upstream::Gone;
+                if let Some(happened) = gone(&self.rules, now, entry, lifecycle) {
+                    notes.push(Note::new(id.clone(), happened));
+                }
+            }
+        }
+        notes
+    }
+
+    /// Apply a decision.
+    pub fn decide(
+        &mut self,
+        now: OffsetDateTime,
+        decision: Decision,
+    ) -> Result<Vec<Note>, Refusal> {
+        match decision {
+            Decision::Take(id) => self.take(now, id),
+            Decision::Finish(id) => self.close(now, id, Closure::Finished, Happened::Finished),
+            Decision::Silence(id) => self.close(now, id, Closure::Silenced, Happened::Silenced),
+            Decision::Park(id, park_for) => self.park(id, park_for),
+        }
+    }
+
+    fn take(&mut self, now: OffsetDateTime, id: ItemId) -> Result<Vec<Note>, Refusal> {
+        if self.active_on(&id).is_some() {
+            return Err(Refusal::AlreadyActive);
+        }
+        let (mut entry, _) = self.held.remove(&id).ok_or(Refusal::Unknown)?;
+        let mut notes = Vec::new();
+        if let Some(previous) = self.active.take() {
+            notes.push(self.switch_away(now, previous));
+        }
+        entry.returned = None;
+        self.active = Some(Active { entry, since: now });
+        notes.push(Note::new(id, Happened::Taken));
+        Ok(notes)
+    }
+
+    fn switch_away(&mut self, now: OffsetDateTime, previous: Active) -> Note {
+        let mut entry = previous.entry;
+        let park = self.rules.switched_away_park;
+        let lifecycle = if park.is_zero() {
+            entry.queued_at = now;
+            Lifecycle::Inbox
+        } else {
+            Lifecycle::Parked {
+                until: ParkUntil::Time(now + park),
+                reason: ParkReason::SwitchedAway { at: now },
+            }
+        };
+        let id = entry.item.id().clone();
+        self.held.insert(id.clone(), (entry, lifecycle));
+        Note::new(id, Happened::SwitchedAway)
+    }
+
+    fn close(
+        &mut self,
+        now: OffsetDateTime,
+        id: ItemId,
+        closure: Closure,
+        happened: Happened,
+    ) -> Result<Vec<Note>, Refusal> {
+        let (entry, lifecycle) = self.open_item(&id)?;
+        entry.returned = None;
+        *lifecycle = Lifecycle::Done { closure, at: now };
+        Ok(vec![Note::new(id, happened)])
+    }
+
+    fn park(&mut self, id: ItemId, park_for: ParkFor) -> Result<Vec<Note>, Refusal> {
+        let until = match park_for {
+            ParkFor::Until(at) => ParkUntil::Time(at),
+            ParkFor::Changed => ParkUntil::Changed,
+        };
+        let (entry, lifecycle) = self.open_item(&id)?;
+        entry.returned = None;
+        *lifecycle = Lifecycle::Parked {
+            until,
+            reason: ParkReason::Chosen,
+        };
+        Ok(vec![Note::new(id, Happened::Parked)])
+    }
+
+    /// An item that is not closed, with the active one moved back into the
+    /// held set so the caller can give it a lifecycle.
+    fn open_item(&mut self, id: &ItemId) -> Result<&mut (Entry, Lifecycle), Refusal> {
+        if self.active_on(id).is_some()
+            && let Some(active) = self.active.take()
+        {
+            self.held
+                .insert(id.clone(), (active.entry, Lifecycle::Inbox));
+        }
+        let held = self.held.get_mut(id).ok_or(Refusal::Unknown)?;
+        if matches!(held.1, Lifecycle::Done { .. }) {
+            return Err(Refusal::AlreadyDone);
+        }
+        Ok(held)
+    }
+}
+
+impl Note {
+    const fn new(item: ItemId, happened: Happened) -> Self {
+        Self { item, happened }
+    }
+}
+
+/// What counts as a change: a new state, new activity, or a new deadline.
+/// Retitling or reworded details do not bring anything back.
+fn fingerprint(item: &AttentionItem) -> (ItemState, OffsetDateTime, Option<OffsetDateTime>) {
+    (item.state(), item.occurred_at(), item.due_at())
+}
+
+fn changed(
+    rules: &QueueRules,
+    now: OffsetDateTime,
+    entry: &mut Entry,
+    lifecycle: &mut Lifecycle,
+) -> Happened {
+    let state = entry.item.state();
+    let rule = match lifecycle {
+        Lifecycle::Inbox => return Happened::Updated,
+        Lifecycle::Parked {
+            until: ParkUntil::Changed,
+            ..
+        } => state.needs_you().then_some(Rule::Changed),
+        Lifecycle::Parked {
+            until: ParkUntil::Time(_),
+            ..
+        } => (rules.urgent_breaks_snooze && state.is_urgent()).then_some(Rule::UrgentChange),
+        Lifecycle::Done {
+            closure: Closure::Silenced,
+            ..
+        } => return Happened::IgnoredSilenced,
+        Lifecycle::Done { .. } => {
+            return if rules.reopen_finished && state.needs_you() {
+                resurface(now, entry, lifecycle, Rule::Reopened)
+            } else {
+                Happened::LeftClosed
+            };
+        }
+    };
+    rule.map_or(Happened::StayedParked, |rule| {
+        resurface(now, entry, lifecycle, rule)
+    })
+}
+
+fn resurface(
+    now: OffsetDateTime,
+    entry: &mut Entry,
+    lifecycle: &mut Lifecycle,
+    rule: Rule,
+) -> Happened {
+    *lifecycle = Lifecycle::Inbox;
+    entry.returned = Some(Resurfaced { rule, at: now });
+    entry.queued_at = now;
+    Happened::Resurfaced(rule)
+}
+
+fn gone(
+    rules: &QueueRules,
+    now: OffsetDateTime,
+    entry: &mut Entry,
+    lifecycle: &mut Lifecycle,
+) -> Option<Happened> {
+    if matches!(lifecycle, Lifecycle::Done { .. }) {
+        return None;
+    }
+    if !rules.close_when_gone {
+        return Some(Happened::KeptAfterGone);
+    }
+    entry.returned = None;
+    *lifecycle = Lifecycle::Done {
+        closure: Closure::Upstream,
+        at: now,
+    };
+    Some(Happened::ClosedUpstream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::attention::SourceCategory;
+    use crate::domain::text::NonEmptyText;
+    use time::Duration;
+    use time::macros::datetime;
+
+    const NOW: OffsetDateTime = datetime!(2026-10-22 09:00 UTC);
+
+    fn github() -> SourceId {
+        SourceId::parse("github").expect("slug")
+    }
+
+    fn jira() -> SourceId {
+        SourceId::parse("jira").expect("slug")
+    }
+
+    fn report(source: &SourceId, native: &str, state: ItemState) -> AttentionItem {
+        reported_at(source, native, state, NOW - Duration::hours(1))
+    }
+
+    fn reported_at(
+        source: &SourceId,
+        native: &str,
+        state: ItemState,
+        occurred_at: OffsetDateTime,
+    ) -> AttentionItem {
+        AttentionItem::builder(
+            source,
+            native,
+            SourceCategory::CodeReview,
+            NonEmptyText::parse(&format!("item {native}")).expect("title"),
+        )
+        .state(state)
+        .occurred_at(occurred_at)
+        .build()
+    }
+
+    fn id(source: &SourceId, native: &str) -> ItemId {
+        ItemId::from_parts(source, native)
+    }
+
+    fn note(item: &ItemId, happened: Happened) -> Note {
+        Note {
+            item: item.clone(),
+            happened,
+        }
+    }
+
+    fn queue_with(items: &[(&str, ItemState)]) -> Queue {
+        let mut queue = Queue::new(QueueRules::default());
+        queue.observe(
+            NOW,
+            &github(),
+            items
+                .iter()
+                .map(|(native, state)| report(&github(), native, *state))
+                .collect(),
+        );
+        queue
+    }
+
+    fn held(queue: &Queue, item: &ItemId) -> Lifecycle {
+        match queue.position(item) {
+            Some(Position::Held(lifecycle)) => lifecycle.clone(),
+            other => panic!("{item} is not held: {other:?}"),
+        }
+    }
+
+    fn decide(queue: &mut Queue, at: OffsetDateTime, decision: Decision) -> Vec<Note> {
+        queue.decide(at, decision).expect("decision accepted")
+    }
+
+    #[test]
+    fn a_new_item_arrives_in_the_inbox() {
+        let mut queue = Queue::new(QueueRules::default());
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::NeedsReview)],
+        );
+
+        let pr = id(&github(), "41");
+        assert_eq!(notes, vec![note(&pr, Happened::Arrived)]);
+        assert_eq!(held(&queue, &pr), Lifecycle::Inbox);
+        let entry = queue.entry(&pr).expect("entry");
+        assert_eq!(entry.upstream(), Upstream::Present);
+        assert_eq!(entry.queued_at(), NOW);
+        assert_eq!(entry.returned(), None);
+    }
+
+    #[test]
+    fn a_snapshot_that_only_retitles_an_item_is_not_a_change() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let retitled = AttentionItem::builder(
+            &github(),
+            "41",
+            SourceCategory::CodeReview,
+            NonEmptyText::parse("a better title").expect("title"),
+        )
+        .state(ItemState::NeedsReview)
+        .occurred_at(NOW - Duration::hours(1))
+        .build();
+
+        let notes = queue.observe(NOW, &github(), vec![retitled]);
+
+        assert!(notes.is_empty());
+        let entry = queue.entry(&id(&github(), "41")).expect("entry");
+        assert_eq!(entry.item().title().as_str(), "a better title");
+    }
+
+    #[test]
+    fn taking_an_item_makes_it_active() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let pr = id(&github(), "41");
+
+        let notes = decide(&mut queue, NOW, Decision::Take(pr.clone()));
+
+        assert_eq!(notes, vec![note(&pr, Happened::Taken)]);
+        assert_eq!(queue.position(&pr), Some(Position::Active { since: NOW }));
+    }
+
+    #[test]
+    fn taking_the_active_item_again_is_refused() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let pr = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Take(pr.clone()));
+
+        assert_eq!(
+            queue.decide(NOW, Decision::Take(pr)),
+            Err(Refusal::AlreadyActive)
+        );
+    }
+
+    #[test]
+    fn deciding_about_an_unknown_item_is_refused() {
+        let mut queue = queue_with(&[]);
+        assert_eq!(
+            queue.decide(NOW, Decision::Take(id(&github(), "nope"))),
+            Err(Refusal::Unknown)
+        );
+    }
+
+    #[test]
+    fn switching_to_another_item_parks_the_first_briefly() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview), ("12", ItemState::CiFailed)]);
+        let (review, mine) = (id(&github(), "41"), id(&github(), "12"));
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        let later = NOW + Duration::minutes(3);
+        let notes = decide(&mut queue, later, Decision::Take(mine.clone()));
+
+        assert_eq!(
+            notes,
+            vec![
+                note(&review, Happened::SwitchedAway),
+                note(&mine, Happened::Taken)
+            ]
+        );
+        assert_eq!(
+            held(&queue, &review),
+            Lifecycle::Parked {
+                until: ParkUntil::Time(later + Duration::minutes(10)),
+                reason: ParkReason::SwitchedAway { at: later },
+            }
+        );
+        assert_eq!(
+            queue.position(&mine),
+            Some(Position::Active { since: later })
+        );
+    }
+
+    #[test]
+    fn with_no_switch_away_park_the_first_item_goes_straight_back() {
+        let mut queue = Queue::new(QueueRules {
+            switched_away_park: Duration::ZERO,
+            ..QueueRules::default()
+        });
+        queue.observe(
+            NOW,
+            &github(),
+            vec![
+                report(&github(), "41", ItemState::NeedsReview),
+                report(&github(), "12", ItemState::CiFailed),
+            ],
+        );
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        let later = NOW + Duration::minutes(3);
+        decide(&mut queue, later, Decision::Take(id(&github(), "12")));
+
+        assert_eq!(held(&queue, &review), Lifecycle::Inbox);
+        assert_eq!(queue.entry(&review).expect("entry").queued_at(), later);
+    }
+
+    #[test]
+    fn finishing_the_active_item_closes_it() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let pr = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Take(pr.clone()));
+
+        let notes = decide(&mut queue, NOW, Decision::Finish(pr.clone()));
+
+        assert_eq!(notes, vec![note(&pr, Happened::Finished)]);
+        assert_eq!(
+            held(&queue, &pr),
+            Lifecycle::Done {
+                closure: Closure::Finished,
+                at: NOW
+            }
+        );
+    }
+
+    #[test]
+    fn closing_an_item_twice_is_refused() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let pr = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Silence(pr.clone()));
+
+        assert_eq!(
+            queue.decide(NOW, Decision::Finish(pr.clone())),
+            Err(Refusal::AlreadyDone)
+        );
+        assert_eq!(
+            queue.decide(NOW, Decision::Park(pr, ParkFor::Changed)),
+            Err(Refusal::AlreadyDone)
+        );
+    }
+
+    #[test]
+    fn parked_until_changed_holds_through_a_change_that_needs_nothing() {
+        let mut queue = queue_with(&[("12", ItemState::CiFailed)]);
+        let mine = id(&github(), "12");
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(mine.clone(), ParkFor::Changed),
+        );
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "12", ItemState::CiRunning)],
+        );
+
+        assert_eq!(notes, vec![note(&mine, Happened::StayedParked)]);
+        assert!(matches!(held(&queue, &mine), Lifecycle::Parked { .. }));
+    }
+
+    #[test]
+    fn parked_until_changed_comes_back_when_it_needs_you() {
+        let mut queue = queue_with(&[("12", ItemState::CiRunning)]);
+        let mine = id(&github(), "12");
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(mine.clone(), ParkFor::Changed),
+        );
+
+        let later = NOW + Duration::minutes(20);
+        let notes = queue.observe(
+            later,
+            &github(),
+            vec![report(&github(), "12", ItemState::ChangesRequested)],
+        );
+
+        assert_eq!(
+            notes,
+            vec![note(&mine, Happened::Resurfaced(Rule::Changed))]
+        );
+        assert_eq!(held(&queue, &mine), Lifecycle::Inbox);
+        let entry = queue.entry(&mine).expect("entry");
+        assert_eq!(
+            entry.returned(),
+            Some(Resurfaced {
+                rule: Rule::Changed,
+                at: later
+            })
+        );
+        assert_eq!(entry.queued_at(), later);
+    }
+
+    #[test]
+    fn new_activity_on_the_same_state_is_a_change() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Finish(review.clone()));
+
+        let pushed = reported_at(
+            &github(),
+            "41",
+            ItemState::NeedsReview,
+            NOW + Duration::minutes(5),
+        );
+        let notes = queue.observe(NOW + Duration::minutes(5), &github(), vec![pushed]);
+
+        assert_eq!(
+            notes,
+            vec![note(&review, Happened::Resurfaced(Rule::Reopened))]
+        );
+    }
+
+    #[test]
+    fn a_timed_park_holds_through_a_change_that_is_not_urgent() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        let until = NOW + Duration::hours(1);
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(review.clone(), ParkFor::Until(until)),
+        );
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::Unread)],
+        );
+
+        assert_eq!(notes, vec![note(&review, Happened::StayedParked)]);
+        assert_eq!(
+            held(&queue, &review),
+            Lifecycle::Parked {
+                until: ParkUntil::Time(until),
+                reason: ParkReason::Chosen
+            }
+        );
+    }
+
+    #[test]
+    fn an_urgent_change_cuts_a_timed_park_short() {
+        let mut queue = queue_with(&[("12", ItemState::NeedsReview)]);
+        let mine = id(&github(), "12");
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(mine.clone(), ParkFor::Until(NOW + Duration::hours(1))),
+        );
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "12", ItemState::ChangesRequested)],
+        );
+
+        assert_eq!(
+            notes,
+            vec![note(&mine, Happened::Resurfaced(Rule::UrgentChange))]
+        );
+        assert_eq!(held(&queue, &mine), Lifecycle::Inbox);
+    }
+
+    #[test]
+    fn an_urgent_change_holds_when_the_rule_is_off() {
+        let mut queue = queue_with(&[("12", ItemState::NeedsReview)]);
+        queue.rules.urgent_breaks_snooze = false;
+        let mine = id(&github(), "12");
+        decide(
+            &mut queue,
+            NOW,
+            Decision::Park(mine.clone(), ParkFor::Until(NOW + Duration::hours(1))),
+        );
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "12", ItemState::ChangesRequested)],
+        );
+
+        assert_eq!(notes, vec![note(&mine, Happened::StayedParked)]);
+    }
+
+    #[test]
+    fn a_finished_item_reopens_when_it_needs_you_again() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Finish(review.clone()));
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::ChangesRequested)],
+        );
+
+        assert_eq!(
+            notes,
+            vec![note(&review, Happened::Resurfaced(Rule::Reopened))]
+        );
+        assert_eq!(held(&queue, &review), Lifecycle::Inbox);
+    }
+
+    #[test]
+    fn a_finished_item_stays_closed_when_the_change_needs_nothing() {
+        let mut queue = queue_with(&[("12", ItemState::CiFailed)]);
+        let mine = id(&github(), "12");
+        decide(&mut queue, NOW, Decision::Finish(mine.clone()));
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "12", ItemState::CiRunning)],
+        );
+
+        assert_eq!(notes, vec![note(&mine, Happened::LeftClosed)]);
+    }
+
+    #[test]
+    fn a_finished_item_stays_closed_when_reopening_is_off() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        queue.rules.reopen_finished = false;
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Finish(review.clone()));
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::ChangesRequested)],
+        );
+
+        assert_eq!(notes, vec![note(&review, Happened::LeftClosed)]);
+    }
+
+    #[test]
+    fn a_silenced_item_ignores_its_changes() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        let notes = decide(&mut queue, NOW, Decision::Silence(review.clone()));
+        assert_eq!(notes, vec![note(&review, Happened::Silenced)]);
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::ChangesRequested)],
+        );
+
+        assert_eq!(notes, vec![note(&review, Happened::IgnoredSilenced)]);
+        assert_eq!(
+            held(&queue, &review),
+            Lifecycle::Done {
+                closure: Closure::Silenced,
+                at: NOW
+            }
+        );
+    }
+
+    #[test]
+    fn a_change_to_the_active_item_leaves_it_active() {
+        let mut queue = queue_with(&[("12", ItemState::CiFailed)]);
+        let mine = id(&github(), "12");
+        decide(&mut queue, NOW, Decision::Take(mine.clone()));
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "12", ItemState::CiRunning)],
+        );
+
+        assert_eq!(notes, vec![note(&mine, Happened::Updated)]);
+        assert_eq!(queue.position(&mine), Some(Position::Active { since: NOW }));
+        assert_eq!(
+            queue.entry(&mine).expect("entry").item().state(),
+            ItemState::CiRunning
+        );
+    }
+
+    #[test]
+    fn an_item_gone_upstream_is_closed_for_you() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+
+        let notes = queue.observe(NOW, &github(), Vec::new());
+
+        assert_eq!(notes, vec![note(&review, Happened::ClosedUpstream)]);
+        assert_eq!(
+            held(&queue, &review),
+            Lifecycle::Done {
+                closure: Closure::Upstream,
+                at: NOW
+            }
+        );
+        assert_eq!(
+            queue.entry(&review).expect("entry").upstream(),
+            Upstream::Gone
+        );
+    }
+
+    #[test]
+    fn an_item_gone_upstream_is_kept_when_closing_is_off() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        queue.rules.close_when_gone = false;
+        let review = id(&github(), "41");
+
+        let notes = queue.observe(NOW, &github(), Vec::new());
+
+        assert_eq!(notes, vec![note(&review, Happened::KeptAfterGone)]);
+        assert_eq!(held(&queue, &review), Lifecycle::Inbox);
+    }
+
+    #[test]
+    fn the_active_item_going_away_upstream_stays_yours() {
+        let mut queue = queue_with(&[("12", ItemState::CiFailed)]);
+        let mine = id(&github(), "12");
+        decide(&mut queue, NOW, Decision::Take(mine.clone()));
+
+        let notes = queue.observe(NOW, &github(), Vec::new());
+
+        assert_eq!(notes, vec![note(&mine, Happened::GoneWhileActive)]);
+        assert_eq!(queue.position(&mine), Some(Position::Active { since: NOW }));
+        assert_eq!(
+            queue.entry(&mine).expect("entry").upstream(),
+            Upstream::Gone
+        );
+    }
+
+    #[test]
+    fn an_item_is_reported_gone_only_once() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        queue.rules.close_when_gone = false;
+        queue.observe(NOW, &github(), Vec::new());
+
+        assert!(queue.observe(NOW, &github(), Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn an_item_reported_again_after_going_away_has_changed() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        queue.rules.close_when_gone = false;
+        let review = id(&github(), "41");
+        queue.observe(NOW, &github(), Vec::new());
+
+        let notes = queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::NeedsReview)],
+        );
+
+        assert_eq!(notes, vec![note(&review, Happened::Updated)]);
+        assert_eq!(
+            queue.entry(&review).expect("entry").upstream(),
+            Upstream::Present
+        );
+    }
+
+    #[test]
+    fn a_snapshot_only_reconciles_its_own_source() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+
+        let notes = queue.observe(
+            NOW,
+            &jira(),
+            vec![report(&jira(), "PLAT-311", ItemState::Assigned)],
+        );
+
+        let ticket = id(&jira(), "PLAT-311");
+        assert_eq!(notes, vec![note(&ticket, Happened::Arrived)]);
+        assert_eq!(held(&queue, &id(&github(), "41")), Lifecycle::Inbox);
+    }
+
+    #[test]
+    fn taking_an_item_that_came_back_clears_why_it_came_back() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Finish(review.clone()));
+        queue.observe(
+            NOW,
+            &github(),
+            vec![report(&github(), "41", ItemState::ChangesRequested)],
+        );
+
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        assert_eq!(queue.entry(&review).expect("entry").returned(), None);
+    }
+
+    #[test]
+    fn taking_a_closed_item_reopens_it_by_hand() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        let review = id(&github(), "41");
+        decide(&mut queue, NOW, Decision::Silence(review.clone()));
+
+        decide(&mut queue, NOW, Decision::Take(review.clone()));
+
+        assert_eq!(
+            queue.position(&review),
+            Some(Position::Active { since: NOW })
+        );
+    }
+
+    #[test]
+    fn the_queue_tracks_items_seen_by_any_source() {
+        let mut queue = queue_with(&[("41", ItemState::NeedsReview)]);
+        queue.observe(
+            NOW,
+            &jira(),
+            vec![report(&jira(), "PLAT-311", ItemState::Assigned)],
+        );
+        let ids: BTreeSet<_> = [id(&github(), "41"), id(&jira(), "PLAT-311")].into();
+        for item in &ids {
+            assert!(queue.entry(item).is_some(), "{item}");
+        }
+    }
+}
