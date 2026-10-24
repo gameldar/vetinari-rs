@@ -83,13 +83,16 @@ impl ObservedAgents {
     }
 
     fn as_item(source: &SourceId, agent: &ObservedAgent) -> AttentionItem {
-        let title = NonEmptyText::parse(&format!(
-            "{} in {}",
-            agent.name(),
-            agent
-                .workspace()
-                .map_or_else(|| agent.pane().as_str(), |id| id.as_str())
-        ))
+        let title = NonEmptyText::parse(&match agent.title() {
+            Some(title) => format!("{}: {title}", agent.name()),
+            None => format!(
+                "{} in {}",
+                agent.name(),
+                agent
+                    .workspace()
+                    .map_or_else(|| agent.pane().as_str(), |id| id.as_str())
+            ),
+        })
         .unwrap_or_else(|_| NonEmptyText::parse("agent").expect("the fallback title is non-empty"));
 
         let mut builder = AttentionItem::builder(
@@ -194,6 +197,16 @@ mod tests {
         assert_eq!(items[1].state(), ItemState::AgentRunning);
         assert!(items[0].title().as_str().contains("claude in w1"));
         assert_eq!(items[0].category(), SourceCategory::AgentState);
+    }
+
+    #[test]
+    fn an_agent_the_target_has_titled_is_queued_under_its_title() {
+        let titled = agent("w1:p1", Some("w1"), ObservedAgentState::Done)
+            .with_title(NonEmptyText::parse("Herdr attention queue").expect("title"));
+
+        let items = ObservedAgents::attention_items(&[titled]);
+
+        assert_eq!(items[0].title().as_str(), "claude: Herdr attention queue");
     }
 
     #[test]

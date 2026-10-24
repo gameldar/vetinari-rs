@@ -37,6 +37,7 @@ use vetinari_core::application::ports::{
 };
 use vetinari_core::domain::agent::{ObservedAgent, ObservedAgentState};
 use vetinari_core::domain::ids::SpaceId;
+use vetinari_core::domain::text::NonEmptyText;
 use vetinari_core::domain::workspace::{Space, SpaceName, TargetKind};
 
 use super::shell_join;
@@ -176,6 +177,12 @@ struct RawAgent {
     agent: String,
     #[serde(default)]
     agent_status: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    terminal_title_stripped: Option<String>,
     #[serde(default)]
     source: String,
 }
@@ -319,14 +326,22 @@ fn observed(raw: RawAgent) -> Option<ObservedAgent> {
     } else {
         raw.agent
     };
-    Some(ObservedAgent::new(
+    let title = [raw.name, raw.title, raw.terminal_title_stripped]
+        .into_iter()
+        .flatten()
+        .find_map(|title| NonEmptyText::parse(&title).ok());
+    let agent = ObservedAgent::new(
         pane,
         workspace,
         name,
         ObservedAgentState::parse(&raw.agent_status),
         TargetKind::Herdr,
         (!raw.source.trim().is_empty()).then_some(raw.source),
-    ))
+    );
+    Some(match title {
+        Some(title) => agent.with_title(title),
+        None => agent,
+    })
 }
 
 /// Turn Herdr's error code into something the front-end can act on.
@@ -988,6 +1003,38 @@ mod tests {
         assert_eq!(agents[1].state(), ObservedAgentState::Working);
         assert_eq!(agents[1].source(), None);
         assert_eq!(agents[2].state(), ObservedAgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_titled_by_its_name_then_herdrs_title_then_its_terminals() {
+        let (_dir, socket) = socket_path();
+        let _fake = FakeHerdr::serve(
+            socket.clone(),
+            results(vec![(
+                "agent.list",
+                serde_json::json!({ "agents": [
+                    { "pane_id": "w1:p1", "agent": "claude", "agent_status": "done",
+                      "name": "auth work", "title": "Fix login",
+                      "terminal_title_stripped": "Claude Code" },
+                    { "pane_id": "w2:p1", "agent": "claude", "agent_status": "done",
+                      "name": null, "title": "  ",
+                      "terminal_title_stripped": "Herdr attention queue" },
+                    { "pane_id": "w3:p1", "agent": "claude", "agent_status": "idle" }
+                ]}),
+            )]),
+        );
+        let target = HerdrSocketTarget::new(socket);
+
+        let agents = target.observed_agents().await.expect("list");
+
+        let titles: Vec<Option<&str>> = agents
+            .iter()
+            .map(|agent| agent.title().map(NonEmptyText::as_str))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![Some("auth work"), Some("Herdr attention queue"), None]
+        );
     }
 
     #[tokio::test]
