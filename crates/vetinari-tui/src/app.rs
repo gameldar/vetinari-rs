@@ -939,7 +939,7 @@ impl App {
                 let mut prompt = Prompt::line(
                     PromptKind::Filter,
                     "Filter",
-                    "narrow the feed; RET keeps it, ESC restores it",
+                    "narrow the queue; RET keeps it, ESC restores it",
                 );
                 prompt.input =
                     crate::text_input::TextInput::single_line().with_value(self.cursor.filter());

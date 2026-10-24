@@ -78,7 +78,7 @@ actions! {
     PaneRight => "pane-right", "Focus pane to the right";
     PaneNext => "pane-next", "Focus next pane";
     PanePrev => "pane-prev", "Focus previous pane";
-    FilterStart => "filter-start", "Filter the feed";
+    FilterStart => "filter-start", "Filter the queue";
     FilterClear => "filter-clear", "Clear the filter";
     Select => "select", "Open the selected entry";
 

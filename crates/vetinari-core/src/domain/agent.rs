@@ -753,11 +753,11 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_observed_agent_is_not_actionable() {
-        assert!(ObservedAgentState::Blocked.as_item_state().is_actionable());
-        assert!(ObservedAgentState::Working.as_item_state().is_actionable());
-        assert!(!ObservedAgentState::Done.as_item_state().is_actionable());
-        assert!(!ObservedAgentState::Idle.as_item_state().is_actionable());
+    fn an_observed_agent_needs_you_once_it_is_blocked_or_done() {
+        assert!(ObservedAgentState::Blocked.as_item_state().needs_you());
+        assert!(!ObservedAgentState::Working.as_item_state().needs_you());
+        assert!(ObservedAgentState::Done.as_item_state().needs_you());
+        assert!(!ObservedAgentState::Idle.as_item_state().needs_you());
     }
 
     #[test]

@@ -153,7 +153,7 @@ impl Runtime {
             }
         }
 
-        let mut attention = AttentionEngine::new(clock.clone());
+        let mut attention = AttentionEngine::default();
         let mut code_hosts: BTreeMap<SourceId, Arc<dyn CodeHostSource>> = BTreeMap::new();
         let mut issue_trackers: BTreeMap<SourceId, Arc<dyn IssueTrackerSource>> = BTreeMap::new();
         let mut chats: BTreeMap<SourceId, Arc<dyn ChatSource>> = BTreeMap::new();

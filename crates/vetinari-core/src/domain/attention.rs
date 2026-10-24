@@ -151,12 +151,6 @@ impl ItemState {
         }
     }
 
-    /// Whether the item still wants something from the developer.
-    #[must_use]
-    pub const fn is_actionable(&self) -> bool {
-        !matches!(self, ItemState::AgentDone | ItemState::Resolved)
-    }
-
     /// Whether anything is wanted from the developer right now. Work still in
     /// flight belongs out of the way until it lands.
     #[must_use]
@@ -756,8 +750,6 @@ mod tests {
         );
         let unread = item("slack", "D1", SourceCategory::Messaging, ItemState::Unread);
         assert!(done.priority(NOW) < unread.priority(NOW));
-        assert!(!done.state().is_actionable());
-        assert!(unread.state().is_actionable());
     }
 
     #[test]
