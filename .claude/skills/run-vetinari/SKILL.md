@@ -19,28 +19,31 @@ token under its own `drive` account, leaving real accounts alone).
 ```bash
 .claude/skills/run-vetinari/driver.sh start       # builds, starts fakegh + vetinari, prints the queue
 .claude/skills/run-vetinari/driver.sh keys "SPC n" "SPC n"
-.claude/skills/run-vetinari/driver.sh queue       # left pane as plain text
-.claude/skills/run-vetinari/driver.sh details     # details pane for the selected row
+.claude/skills/run-vetinari/driver.sh queue       # the queue and recent actions as plain text
+.claude/skills/run-vetinari/driver.sh details     # the selected row's details popup
 .claude/skills/run-vetinari/driver.sh stop
 ```
 
 | command | what it does |
 |---|---|
-| `start` | `cargo build`, launches `fakegh.py` on 127.0.0.1:8765 and vetinari (200x50) with `drive.toml`, waits for the first PR |
+| `start` | `cargo build`, launches `fakegh.py` on 127.0.0.1:8765 and vetinari (80x24, or `VETINARI_DRIVE_SIZE=60x12` for a zax-panel-sized one) with `drive.toml`, waits for the first PR |
 | `keys "SPC d p c" j ...` | sends keys in vetinari's spelling (`SPC`, `ESC`, `RET`, `TAB`, `C-c`, letters) |
-| `queue` / `details` | the queue pane / details pane, box drawing stripped |
+| `queue` | the pane minus its bottom line, box drawing stripped |
+| `details` | presses `RET`, prints the details popup, presses `ESC` |
 | `screen` | the whole screen |
-| `status` | the status line (fades after a few seconds - read it straight after the key) |
+| `status` | the bottom line: a status message while one shows (they fade after a few seconds - read it straight after the key), the key hints otherwise |
 | `wait TEXT [SECS]` | blocks until TEXT is on screen, dumps the screen on timeout |
 | `prs FILE` | replaces the PRs fakegh serves; seen on the next refresh (every 2s) |
 | `stop` | quits vetinari and the fake |
 
-Changing what the source reports, e.g. to see the queue react when a PR
-disappears:
+Changing what the source reports, e.g. to see the queue react when the PR
+being worked on disappears (#101's failing CI always ranks it first, so the
+first `SPC n` takes it):
 
 ```bash
-python3 -I -c "import json,sys;json.dump([p for p in json.load(open(sys.argv[1])) if p['n']!=103],open(sys.argv[2],'w'))" .claude/skills/run-vetinari/prs.json /tmp/no103.json
-.claude/skills/run-vetinari/driver.sh prs /tmp/no103.json
+.claude/skills/run-vetinari/driver.sh keys "SPC n"
+python3 -I -c "import json,sys;json.dump([p for p in json.load(open(sys.argv[1])) if p['n']!=101],open(sys.argv[2],'w'))" .claude/skills/run-vetinari/prs.json /tmp/no101.json
+.claude/skills/run-vetinari/driver.sh prs /tmp/no101.json
 .claude/skills/run-vetinari/driver.sh wait "gone from github" 10
 ```
 
@@ -73,11 +76,18 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 - **Running against your real config shows no PRs if the stored GitHub token
   belongs to another user** - `gh` may list review requests that vetinari's
   `home` credential does not see. That is why the driver uses fakegh.
-- **Focus time is shown in the machine's local time** ("Focus until 16:47"),
+- **The order of the other PRs drifts with the real clock**, since how long a
+  PR has waited counts towards its rank and `prs.json`'s times are fixed. Only
+  #101 (CI failed) reliably comes first; pick rows by title, not position.
+- **Focus time is shown in the machine's local time** ("focus until 16:47" in the title),
   not UTC.
-- **There is no in-app log view.** Resurfacing is logged as
-  `INFO queue: ... came back (Rule)` in the feedback log only; on screen,
-  watch the row note ("back: it changed") and `status`.
+- **The recent actions under the queue are the on-screen log** ("09:20 back,
+  it changed: Add billing export"). In a 12-row panel the default five of them
+  leave the queue four lines, and the list scrolls to keep the selected row in
+  view, so a row can be off screen - select it (`G`, `j`) before asserting on
+  it.
+- **The details popup is clipped to the screen**, so at 60x12 its last fields
+  do not show; use the default size when they matter.
 
 ## Troubleshooting
 

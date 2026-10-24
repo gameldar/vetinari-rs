@@ -12,6 +12,8 @@ APP=vetdrive-app
 FAKE=vetdrive-fake
 BIN=$ROOT/target/debug/vetinari
 CONFIG=$SKILL/drive.toml
+# WIDTHxHEIGHT; 60x12 is about what a zax panel section gives it.
+SIZE=${VETINARI_DRIVE_SIZE:-80x24}
 
 screen() { tmux capture-pane -t "$APP" -p; }
 
@@ -29,13 +31,27 @@ for line in sys.stdin:
     if text:
         print(text)' "$1" "$2"; }
 
-# The queue is the left pane, the details the lower right.
-queue() { screen | sed -n '1,47p' | cols 0 90; }
+# Everything but the bottom line, which is the status or the key hints.
+queue() { screen | sed '$d' | cols 0 1000; }
 
-details() { screen | sed -n '/CONTEXT \/ DETAILS/,47p' | cols 90 200; }
+# RET opens the details popup over the queue; read it, then close it.
+details() {
+    keys RET
+    screen | python3 -I -c 'import sys
+lines = sys.stdin.read().splitlines()
+top = next(i for i, line in enumerate(lines) if "┌ Details" in line)
+left = lines[top].index("┌ Details")
+right = lines[top].index("┐", left)
+for line in lines[top + 1:]:
+    if line[left] == "└":
+        break
+    print(line[left + 1:right].rstrip())'
+    keys ESC
+}
 
-# Line 49 is the status line; it fades after a few seconds.
-status() { screen | sed -n 49p | sed -E 's/ +$//'; }
+# The bottom line: a status message while one shows (they fade after a few
+# seconds), the key hints otherwise.
+status() { screen | tail -n 1 | sed -E 's/ +$//'; }
 
 # Vetinari spells keys like Doom ("SPC d p h", "ESC", "RET"); tmux wants Space/Escape/Enter.
 keys() {
@@ -64,7 +80,7 @@ start() {
     timeout 5 bash -c 'until curl -s -o /dev/null -X POST http://127.0.0.1:8765/graphql -d "{}"; do sleep 0.2; done'
     printf 'drive-fake-token\n' | "$BIN" auth github --config "$CONFIG" --account drive >/dev/null
     tmux kill-session -t "$APP" 2>/dev/null || true
-    tmux new-session -d -s "$APP" -x 200 -y 50 "'$BIN' --config '$CONFIG'"
+    tmux new-session -d -s "$APP" -x "${SIZE%x*}" -y "${SIZE#*x}" "'$BIN' --config '$CONFIG'"
     wait_for "Fix login redirect" 20
     queue
 }
