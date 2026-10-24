@@ -6,3 +6,6 @@
 //! is parsed from bytes the adapter read. No clock is read and no I/O is done.
 
 pub mod ids;
+pub mod outcome;
+pub mod result;
+pub mod step;

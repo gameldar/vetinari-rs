@@ -313,6 +313,13 @@ impl BranchLabel {
         Ok(Self(raw.to_owned()))
     }
 
+    /// One of the constants in [`super::outcome::label`], which are valid by
+    /// construction.
+    pub(crate) fn known(label: &'static str) -> Self {
+        debug_assert!(Self::parse(label).is_ok(), "{label} is not a label");
+        Self(label.to_owned())
+    }
+
     /// Borrow the label.
     #[must_use]
     pub fn as_str(&self) -> &str {

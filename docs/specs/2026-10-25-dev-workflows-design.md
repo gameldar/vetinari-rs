@@ -319,11 +319,11 @@ pub enum StepOutcome {
 }
 
 pub enum PreflightOutcome { Ready { summary: Summary },
-                            NeedsInfo { questions: NonEmpty<Line> } }
+                            NeedsInfo { questions: ShortList<Line> } }
 pub enum ImplementOutcome { Implemented { summary: Summary } }
 pub enum ReviewOutcome    { Approved { summary: Summary },
-                            ChangesRequested { findings: NonEmpty<Finding> } }
-pub enum OpenPrOutcome    { Opened { number: u64, url: Url } }
+                            ChangesRequested { findings: ShortList<Finding> } }
+pub enum OpenPrOutcome    { Opened { number: u64, url: Line } }
 pub enum GateAnswer       { Recheck { note: Option<Line> },   // InfoNeeded
                             OpenAnyway }                       // ReviewStuck
 
@@ -332,8 +332,9 @@ impl StepOutcome {
 }
 ```
 
-`Summary`, `Line` and `Finding` are length-capped on construction (summary 2 KB, 20 findings
-of 500 chars). Engine gap 4 says outputs are unbounded and the worker should keep them small.
+`Summary`, `Line` and `Finding` are length-capped on construction (summary 2048 bytes, a line
+500 bytes), and `ShortList` holds one to 20 entries, so both questions and findings are bounded
+by type. A PR url is a `Line`: vetinari only shows it. Engine gap 4 says outputs are unbounded and the worker should keep them small.
 This is where that happens.
 
 The labels `compile` writes on edges and the labels `branch()` returns are the same constants.
@@ -446,8 +447,10 @@ crates/
 
 ### 5.2 Hexagonal rules
 
-- `domain/devflow` has no async, no serde_json, no clock reads. It takes `OffsetDateTime`
-  arguments.
+- `domain/devflow` has no async, no I/O and no clock reads. It takes `OffsetDateTime`
+  arguments. It does use `serde_json`, but only to read and write the JSON documents it
+  defines itself (the result file, a step's config, a step's output): `StepResult::parse`
+  takes bytes, so the parser has to live where the contract does.
 - `application/devflow` defines every port it calls and depends on nothing outside
   `vetinari-core`. It is async through `async-trait`, as the existing services are.
 - `vetinari-core` gains no tokio dependency. Waiting, timers and task spawning are the daemon
@@ -510,7 +513,12 @@ untouched. The path is also passed as `VETINARI_STEP_RESULT`.
 ```
 
 `outcome` must be one of the labels the step kind can produce. Each label has its own required
-fields: `needs-info` needs non-empty `questions`, `changes-requested` non-empty `findings`.
+fields: `ready`, `implemented` and `approved` need `summary`, `needs-info` non-empty `questions`,
+`changes-requested` non-empty `findings` (a `summary` beside them is ignored), `opened` needs
+`number` and `url`, `recheck` takes an optional `note`. The same field names are used for every
+step kind, gates and open-pr included, so a step's output to the engine (below) is read back with
+the same code when it comes round again as `previous`. Text over its cap is a parse error, not
+truncated.
 
 **Parsing** is `StepResult::parse(kind, &[u8]) -> Result<StepOutcome, ResultError>`, pure, in
 the domain. The adapter only reads bytes.
