@@ -12,4 +12,5 @@ pub mod ids;
 pub mod outcome;
 pub mod result;
 pub mod step;
+pub mod task;
 pub mod template;

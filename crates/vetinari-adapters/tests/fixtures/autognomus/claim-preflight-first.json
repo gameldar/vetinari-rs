@@ -1,0 +1,33 @@
+{
+  "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX~preflight@1~1",
+  "lease": "01JB7ZS9D1F4G7H2J5K8M3N6P0",
+  "expires_at": "2026-10-25T10:05:00Z",
+  "run": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
+  "workflow": "vetinari-feature-01JB7ZQ3XK",
+  "instance": "preflight@1",
+  "attempt": 1,
+  "queue": "vetinari-hex-agent",
+  "config": {
+    "schema": 1,
+    "step": "preflight",
+    "template": "feature-from-ticket",
+    "ticket": {
+      "source": "jira",
+      "key": "ENG-412",
+      "title": "Rate-limit webhook retries",
+      "url": "https://acme.atlassian.net/browse/ENG-412"
+    },
+    "repo": {
+      "path": "/work/repos/web",
+      "remote": "acme/web"
+    },
+    "profile": "work",
+    "branch": "vetinari/eng-412-rate-limit-webhook-retries",
+    "base": "main",
+    "skill": "ticket-preflight"
+  },
+  "input": {
+    "input": {},
+    "iteration": 1
+  }
+}

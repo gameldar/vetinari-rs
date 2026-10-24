@@ -5,9 +5,16 @@
 //! a copy of the part it uses. Fixtures under
 //! `tests/fixtures/autognomus/` keep the copy honest.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
+use vetinari_core::application::ports::PortError;
 use vetinari_core::domain::devflow::compile::{GraphEdge, GraphNode, WorkflowGraph};
+use vetinari_core::domain::devflow::ids::{LeaseToken, TaskId, TaskQueue};
+use vetinari_core::domain::devflow::task::RawTask;
+
+/// How errors from this backend name it.
+const WHAT: &str = "autognomus";
 
 /// `POST /v1/workflows`: a definition to register.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -148,6 +155,45 @@ impl From<&GraphEdge> for PublicEdge {
     }
 }
 
+/// `200` from `POST /v1/tasks/claim`. The reply also names the run,
+/// workflow, instance and attempt; all but the workflow are inside `id`,
+/// which is authoritative, so they are not read.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ClaimReply {
+    /// `<run>~<instance>~<attempt>`.
+    pub id: String,
+    /// The lease token.
+    pub lease: String,
+    /// When the lease runs out.
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    /// The queue it was claimed from.
+    pub queue: String,
+    /// The node's config.
+    #[serde(default)]
+    pub config: Value,
+    /// The node's input.
+    #[serde(default)]
+    pub input: Value,
+}
+
+impl ClaimReply {
+    /// Parse the identifiers; `config` and `input` are the domain's to read.
+    pub fn into_raw(self) -> Result<RawTask, PortError> {
+        let invalid = |what: &str, error: &dyn std::fmt::Display| {
+            PortError::protocol(WHAT, format!("claim reply {what}: {error}"))
+        };
+        Ok(RawTask::new(
+            TaskId::parse(&self.id).map_err(|error| invalid("id", &error))?,
+            LeaseToken::parse(&self.lease).map_err(|error| invalid("lease", &error))?,
+            self.expires_at,
+            TaskQueue::parse(&self.queue).map_err(|error| invalid("queue", &error))?,
+            self.config,
+            self.input,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -155,6 +201,9 @@ mod tests {
     use super::*;
     use vetinari_core::domain::devflow::compile::{StepPolicies, WorkerQueues, compile};
     use vetinari_core::domain::devflow::ids::{DefinitionId, Rounds, WorkerName};
+    use vetinari_core::domain::devflow::outcome::{ReviewOutcome, StepOutcome};
+    use vetinari_core::domain::devflow::step::StepKind;
+    use vetinari_core::domain::devflow::task::{ClaimedTask, StepInput};
     use vetinari_core::domain::devflow::template::{
         DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
     };
@@ -163,15 +212,30 @@ mod tests {
     use vetinari_core::domain::text::NonEmptyText;
 
     fn fixture(name: &str) -> Value {
-        let text = match name {
+        serde_json::from_str(fixture_text(name)).expect("fixture is JSON")
+    }
+
+    fn fixture_text(name: &str) -> &'static str {
+        match name {
             "feature" => {
                 include_str!("../../tests/fixtures/autognomus/feature-from-ticket.workflow.json")
             }
             "external" => include_str!("../../tests/fixtures/autognomus/public-node-external.json"),
             "loop" => include_str!("../../tests/fixtures/autognomus/public-node-loop.json"),
+            "claim-preflight" => {
+                include_str!("../../tests/fixtures/autognomus/claim-preflight-first.json")
+            }
+            "claim-implement" => {
+                include_str!("../../tests/fixtures/autognomus/claim-implement-rework.json")
+            }
+            "claim-open-pr" => include_str!("../../tests/fixtures/autognomus/claim-open-pr.json"),
             other => panic!("no fixture {other}"),
-        };
-        serde_json::from_str(text).expect("fixture is JSON")
+        }
+    }
+
+    fn claimed(name: &str) -> ClaimedTask {
+        let reply: ClaimReply = serde_json::from_str(fixture_text(name)).expect("claim reply");
+        ClaimedTask::parse(&reply.into_raw().expect("identifiers")).expect("a vetinari step")
     }
 
     fn json(value: &impl Serialize) -> Value {
@@ -234,5 +298,69 @@ mod tests {
             &StepPolicies::default(),
         );
         assert_eq!(json(&WorkflowBody::from(&graph)), fixture("feature"));
+    }
+
+    #[test]
+    fn a_first_iteration_claim_reads_as_preflight_with_no_previous() {
+        let task = claimed("claim-preflight");
+        assert_eq!(task.id.run().as_str(), "01JB7ZR2M4Q9V8C6T3N5HKD0WX");
+        assert_eq!(task.id.instance().to_string(), "preflight@1");
+        assert_eq!(task.id.attempt().get(), 1);
+        assert_eq!(task.lease.as_str(), "01JB7ZS9D1F4G7H2J5K8M3N6P0");
+        assert_eq!(
+            task.expires_at,
+            time::macros::datetime!(2026-10-25 10:05:00 UTC)
+        );
+        assert_eq!(task.queue.as_str(), "vetinari-hex-agent");
+        assert_eq!(task.config.step, StepKind::Preflight);
+        assert_eq!(task.config.ticket, feature().ticket);
+        assert_eq!(task.config.branch, feature().branch());
+        assert_eq!(
+            task.input,
+            StepInput::Iteration {
+                iteration: std::num::NonZeroU32::MIN,
+                previous: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_rework_claim_carries_the_previous_reviews_findings() {
+        let task = claimed("claim-implement");
+        assert_eq!(task.config.step, StepKind::Implement);
+        let StepInput::Iteration {
+            iteration,
+            previous: Some(StepOutcome::Review(ReviewOutcome::ChangesRequested { findings })),
+        } = task.input
+        else {
+            panic!("expected review findings, got {:?}", task.input);
+        };
+        assert_eq!(iteration.get(), 2);
+        assert_eq!(
+            findings.as_slice()[0].text.as_str(),
+            "Retry-After ignored on 503"
+        );
+    }
+
+    #[test]
+    fn a_claim_after_a_loop_has_plain_input() {
+        let task = claimed("claim-open-pr");
+        assert_eq!(task.config.step, StepKind::OpenPr);
+        assert_eq!(task.id.attempt().get(), 2);
+        assert_eq!(task.input, StepInput::Plain);
+    }
+
+    #[test]
+    fn a_claim_with_unreadable_identifiers_is_a_protocol_error() {
+        let mut reply: ClaimReply =
+            serde_json::from_str(fixture_text("claim-open-pr")).expect("claim reply");
+        reply.id = "01JB7ZR2M4Q9V8C6T3N5HKD0WX/open-pr/2".to_owned();
+        assert!(matches!(
+            reply.clone().into_raw(),
+            Err(PortError::Protocol { .. })
+        ));
+        reply.id = "r~open-pr~2".to_owned();
+        reply.queue = "Not A Queue".to_owned();
+        assert!(matches!(reply.into_raw(), Err(PortError::Protocol { .. })));
     }
 }

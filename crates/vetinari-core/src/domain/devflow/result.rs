@@ -11,7 +11,7 @@
 
 use std::num::NonZeroU32;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::outcome::{
     Finding, GateAnswer, ImplementOutcome, Line, ListError, OpenPrOutcome, PreflightOutcome,
@@ -105,21 +105,77 @@ struct ResultFile {
 
 /// The fields an outcome may carry, as both a result file and a step's
 /// output to the engine spell them.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(super) struct OutcomeFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     questions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     findings: Option<Vec<FindingFields>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct FindingFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<NonZeroU32>,
     text: String,
+}
+
+impl From<&StepOutcome> for OutcomeFields {
+    fn from(outcome: &StepOutcome) -> Self {
+        let lines = |lines: &ShortList<Line>| {
+            lines
+                .as_slice()
+                .iter()
+                .map(|line| line.as_str().to_owned())
+                .collect()
+        };
+        match outcome {
+            StepOutcome::Preflight(PreflightOutcome::Ready { summary })
+            | StepOutcome::Implement(ImplementOutcome::Implemented { summary })
+            | StepOutcome::Review(ReviewOutcome::Approved { summary }) => Self {
+                summary: Some(summary.as_str().to_owned()),
+                ..Self::default()
+            },
+            StepOutcome::Preflight(PreflightOutcome::NeedsInfo { questions }) => Self {
+                questions: Some(lines(questions)),
+                ..Self::default()
+            },
+            StepOutcome::Review(ReviewOutcome::ChangesRequested { findings }) => Self {
+                findings: Some(
+                    findings
+                        .as_slice()
+                        .iter()
+                        .map(|finding| FindingFields {
+                            file: finding.file.as_ref().map(|file| file.as_str().to_owned()),
+                            line: finding.line,
+                            text: finding.text.as_str().to_owned(),
+                        })
+                        .collect(),
+                ),
+                ..Self::default()
+            },
+            StepOutcome::OpenPr(OpenPrOutcome::Opened { number, url }) => Self {
+                number: Some(*number),
+                url: Some(url.as_str().to_owned()),
+                ..Self::default()
+            },
+            StepOutcome::Gate(GateAnswer::Recheck { note }) => Self {
+                note: note.as_ref().map(|note| note.as_str().to_owned()),
+                ..Self::default()
+            },
+            StepOutcome::Gate(GateAnswer::OpenAnyway) => Self::default(),
+        }
+    }
 }
 
 impl OutcomeFields {

@@ -351,12 +351,10 @@ ending a path (engine spec: "an unmatched branch ends a path without failing the
 
 ```rust
 pub struct ClaimedTask {
-    pub id: TaskId,
+    pub id: TaskId,                     // names the run, instance and attempt
     pub lease: LeaseToken,
     pub expires_at: OffsetDateTime,
-    pub run: RunId,
-    pub instance: NodeInstance,
-    pub attempt: NonZeroU32,
+    pub queue: TaskQueue,
     pub config: StepConfig,
     pub input: StepInput,
 }
@@ -368,6 +366,13 @@ pub enum StepInput {
     Iteration { iteration: NonZeroU32, previous: Option<StepOutcome> },
 }
 ```
+
+The claim reply's separate `run`, `instance` and `attempt` fields are not read: `TaskId` already
+holds them and is the one the engine routes on, so keeping both would only make room for them to
+disagree. An input is a loop envelope exactly when it is an object with an `iteration` key; no
+step output or loop output carries one. `previous` is a `StepOutput` document (6), read back with
+the result file's field rules, so the outcome a step completed with is the outcome the next
+iteration sees.
 
 A claim whose `config` does not parse as a `StepConfig` is failed permanently at once with the
 parse error. It is a task some other tool put on a vetinari queue, or a schema vetinari no
@@ -597,8 +602,10 @@ pub trait LeaseJournal: Send + Sync {
 }
 ```
 
-`RawTask` keeps `config` and `input` as the adapter's `serde_json::Value` behind an opaque type
-so the domain parser, not the adapter, decides what a vetinari step is.
+`RawTask` (in `domain/devflow/task.rs`) holds the claim's parsed identifiers and keeps `config`
+and `input` as `serde_json::Value` behind private fields, so the domain parser, not the adapter,
+decides what a vetinari step is. The adapter's `ClaimReply::into_raw` parses only the
+identifiers; one that does not parse is `PortError::Protocol`.
 
 The HTTP adapter maps statuses onto these, and nothing else does:
 

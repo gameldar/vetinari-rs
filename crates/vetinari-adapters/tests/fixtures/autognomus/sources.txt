@@ -12,3 +12,12 @@ feature-from-ticket.workflow.json
     Written by hand from the dev workflows design (4.3, 4.4) as the body
     vetinari must register for one feature-from-ticket run. `triggers`
     follows autognomus-gateway/src/http/workflows.rs at the same commit.
+
+claim-preflight-first.json
+claim-implement-rework.json
+claim-open-pr.json
+    autognomus 786bd8455783af3eaa1abba2357b5900d6afde1f, engine spec
+    section 5.3 (the `Task` a claim replies with) and 5.4 (the loop
+    envelope and loop output), with `TaskId` in the resolved
+    `<run>~<instance>~<attempt>` form. `config` is the matching node's
+    config from feature-from-ticket.workflow.json.

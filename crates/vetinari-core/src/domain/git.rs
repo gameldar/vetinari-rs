@@ -66,11 +66,32 @@ impl BranchName {
         Self(out)
     }
 
+    /// Accept a branch name only if it is already one Vetinari would have
+    /// generated, as when reading back a name it wrote.
+    pub fn parse(raw: &str) -> Result<Self, InvalidBranchName> {
+        let branch = Self::sanitized(raw);
+        if branch.0 == raw {
+            Ok(branch)
+        } else {
+            Err(InvalidBranchName {
+                raw: raw.to_owned(),
+            })
+        }
+    }
+
     /// Borrow the branch name.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// A branch name was not one Vetinari generates.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{raw:?} is not a branch name vetinari generates")]
+pub struct InvalidBranchName {
+    /// The offending name.
+    pub raw: String,
 }
 
 impl fmt::Display for BranchName {
@@ -228,6 +249,21 @@ mod tests {
     #[test]
     fn branch_names_never_end_with_dot_lock() {
         assert_eq!(BranchName::sanitized("wip.lock").as_str(), "wip-lock");
+    }
+
+    #[test]
+    fn a_generated_branch_name_parses_back_and_anything_else_is_refused() {
+        let branch = BranchName::sanitized("vetinari/ENG-412 retries");
+        assert_eq!(BranchName::parse(branch.as_str()), Ok(branch));
+        for raw in ["", "Main", "a b", "a/", "x.lock"] {
+            assert_eq!(
+                BranchName::parse(raw),
+                Err(InvalidBranchName {
+                    raw: raw.to_owned()
+                }),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
