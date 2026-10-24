@@ -5,6 +5,7 @@ pub mod action;
 pub mod agent;
 pub mod attention;
 pub mod credentials;
+pub mod devflow;
 pub mod feedback;
 pub mod git;
 pub mod ids;

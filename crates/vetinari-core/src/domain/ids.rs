@@ -129,6 +129,8 @@ macro_rules! opaque_id {
     };
 }
 
+pub(crate) use opaque_id;
+
 opaque_id!(
     /// A workspace space, window, or editor context owned by a target backend.
     SpaceId
