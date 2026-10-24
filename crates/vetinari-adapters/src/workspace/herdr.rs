@@ -175,7 +175,7 @@ struct RawAgent {
     #[serde(default)]
     agent: String,
     #[serde(default)]
-    status: String,
+    agent_status: String,
     #[serde(default)]
     source: String,
 }
@@ -323,7 +323,7 @@ fn observed(raw: RawAgent) -> Option<ObservedAgent> {
         pane,
         workspace,
         name,
-        ObservedAgentState::parse(&raw.status),
+        ObservedAgentState::parse(&raw.agent_status),
         TargetKind::Herdr,
         (!raw.source.trim().is_empty()).then_some(raw.source),
     ))
@@ -966,11 +966,11 @@ mod tests {
                 "agent.list",
                 serde_json::json!({ "agents": [
                     { "pane_id": "w1:p1", "workspace_id": "w1", "agent": "claude",
-                      "status": "blocked", "source": "integration" },
+                      "agent_status": "blocked", "source": "integration" },
                     { "pane_id": "w2:p1", "workspace_id": "w2", "agent": "codex",
-                      "status": "working" },
+                      "agent_status": "working" },
                     { "pane_id": "w3:p1", "workspace_id": "w3", "agent": "opencode",
-                      "status": "idle" }
+                      "agent_status": "idle" }
                 ]}),
             )]),
         );
@@ -998,8 +998,8 @@ mod tests {
             results(vec![(
                 "agent.list",
                 serde_json::json!({ "agents": [
-                    { "pane_id": "", "agent": "ghost", "status": "working" },
-                    { "pane_id": "w2:p1", "agent": "", "status": "mystery" }
+                    { "pane_id": "", "agent": "ghost", "agent_status": "working" },
+                    { "pane_id": "w2:p1", "agent": "", "agent_status": "mystery" }
                 ]}),
             )]),
         );

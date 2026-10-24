@@ -701,7 +701,7 @@ mod tests {
                             .to_owned(),
                             "agent.list" => concat!(
                                 r#"{"agents":[{"pane_id":"w1:p1","workspace_id":"w1","#,
-                                r#""agent":"claude","status":"blocked"}]}"#
+                                r#""agent":"claude","agent_status":"blocked"}]}"#
                             )
                             .to_owned(),
                             _ => "{}".to_owned(),
