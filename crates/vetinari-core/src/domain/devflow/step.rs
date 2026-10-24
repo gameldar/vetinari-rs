@@ -4,6 +4,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use super::outcome::label;
+use super::template::{RepoTarget, TemplateKind, TicketRef};
+use crate::domain::git::BranchName;
+use crate::domain::ids::{AgentId, ProfileId, SkillId};
 
 /// A decision the workflow author planned for, put to a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -102,6 +105,31 @@ impl fmt::Display for StepKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// What every `External` node's `config` holds: written by `compile`, read
+/// back from the claim, so a step carries everything it needs and no step
+/// has to agree with another about where the work is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepConfig {
+    /// What the step does.
+    pub step: StepKind,
+    /// The template the run was compiled from.
+    pub template: TemplateKind,
+    /// The ticket the run works on.
+    pub ticket: TicketRef,
+    /// The repository the work is in.
+    pub repo: RepoTarget,
+    /// Whose routing, worktree root and credentials to use.
+    pub profile: ProfileId,
+    /// The run's one branch, fixed at compile time.
+    pub branch: BranchName,
+    /// What the branch is cut from; the default branch when absent.
+    pub base: Option<BranchName>,
+    /// The skill an agent step runs.
+    pub skill: Option<SkillId>,
+    /// The agent an agent step is pinned to.
+    pub agent: Option<AgentId>,
 }
 
 #[cfg(test)]

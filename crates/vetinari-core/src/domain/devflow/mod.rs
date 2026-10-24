@@ -5,7 +5,11 @@
 //! template compiles to a graph the engine will register, and a step's result
 //! is parsed from bytes the adapter read. No clock is read and no I/O is done.
 
+pub mod compile;
+#[cfg(test)]
+mod engine_rules;
 pub mod ids;
 pub mod outcome;
 pub mod result;
 pub mod step;
+pub mod template;

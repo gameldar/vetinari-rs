@@ -145,8 +145,9 @@ pub struct FeatureFromTicket {
 pub struct Rounds(NonZeroU32);
 ```
 
-`TicketRef` wraps the existing `IssueRef` plus the item's title and url, so a run started from a
-queue item carries exactly what the item showed.
+`TicketRef` is the item's source, the tracker key, title and url, so a run started from a queue
+item carries exactly what the item showed. It does not wrap `IssueRef`: that type's status and
+transitions would be stale in a step's config within minutes, and no step reads them.
 
 ### 4.3 The feature graph
 
@@ -234,7 +235,7 @@ pub enum GraphNode {
 
 pub struct StepPolicy {
     pub lease: LeaseSecs,              // >= 30, the engine's floor
-    pub deadline: Option<Duration>,
+    pub deadline: Option<DeadlineSecs>, // whole seconds, as the wire carries them
     pub attempts: NonZeroU32,
 }
 
@@ -299,13 +300,17 @@ pub struct StepConfig {
     pub repo: RepoTarget,
     pub profile: ProfileId,
     pub branch: BranchName,             // vetinari/<ticket-key>-<slug>, fixed at compile time
+    pub base: Option<BranchName>,       // what the branch is cut from, else the default branch
     pub skill: Option<SkillId>,         // agent steps only
     pub agent: Option<AgentId>,
 }
 ```
 
 The branch is decided at compile time and written into every step, so no step has to agree with
-another about where the work is.
+another about where the work is. `base` is carried for the same reason: whichever step cuts the
+worktree first needs it, and `FeatureFromTicket` is not otherwise visible to the worker.
+A step's name in configs, results and outputs is `preflight`, `implement`, `review`, `open-pr`,
+`info-needed` or `review-stuck`.
 
 ### 4.7 Outcomes
 

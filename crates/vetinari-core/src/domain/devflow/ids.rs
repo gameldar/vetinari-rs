@@ -110,6 +110,12 @@ impl NodeId {
         Ok(Self(raw.to_owned()))
     }
 
+    /// A node id a template names, which is valid by construction.
+    pub(crate) fn known(id: &'static str) -> Self {
+        debug_assert!(Self::parse(id).is_ok(), "{id} is not a node id");
+        Self(id.to_owned())
+    }
+
     /// Borrow the id.
     #[must_use]
     pub fn as_str(&self) -> &str {
