@@ -1,28 +1,49 @@
 //! The attention queue as a service: polls go in, decisions go in, and a
 //! view of what needs the developer next comes out.
 
+use std::collections::VecDeque;
+
 use time::OffsetDateTime;
 
 use super::attention::{Polled, SourceProblem};
 use crate::domain::ids::ItemId;
 use crate::domain::queue::rules::QueueRules;
 use crate::domain::queue::view::QueueView;
-use crate::domain::queue::{Decision, Entry, Note, Queue, Refusal};
+use crate::domain::queue::{Decision, Entry, Happened, Note, Queue, Refusal};
 
-/// Owns the queue and what the last poll could not reach.
+/// Something that moved an item, as the developer would want it recalled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentAction {
+    /// When.
+    pub at: OffsetDateTime,
+    /// The item it happened to.
+    pub item: ItemId,
+    /// The item's title at the time, so it reads the same once the item is gone.
+    pub title: String,
+    /// What happened.
+    pub happened: Happened,
+}
+
+/// Owns the queue, what the last poll could not reach, and what recently
+/// moved items.
 #[derive(Debug, Clone)]
 pub struct QueueService {
     queue: Queue,
     problems: Vec<SourceProblem>,
+    recent: VecDeque<RecentAction>,
 }
 
 impl QueueService {
+    /// How many recent actions are kept.
+    pub const RECENT_KEPT: usize = 50;
+
     /// An empty queue under some rules.
     #[must_use]
     pub const fn new(rules: QueueRules) -> Self {
         Self {
             queue: Queue::new(rules),
             problems: Vec::new(),
+            recent: VecDeque::new(),
         }
     }
 
@@ -38,12 +59,15 @@ impl QueueService {
                 Err(error) => self.problems.push(SourceProblem { source, error }),
             }
         }
+        self.remember(now, &notes);
         notes
     }
 
     /// Bring back whatever time has caught up with.
     pub fn tick(&mut self, now: OffsetDateTime) -> Vec<Note> {
-        self.queue.tick(now)
+        let notes = self.queue.tick(now);
+        self.remember(now, &notes);
+        notes
     }
 
     /// Apply a decision.
@@ -52,7 +76,32 @@ impl QueueService {
         now: OffsetDateTime,
         decision: Decision,
     ) -> Result<Vec<Note>, Refusal> {
-        self.queue.decide(now, decision)
+        let notes = self.queue.decide(now, decision)?;
+        self.remember(now, &notes);
+        Ok(notes)
+    }
+
+    /// What recently moved items, newest first.
+    pub fn recent(&self) -> impl Iterator<Item = &RecentAction> {
+        self.recent.iter().rev()
+    }
+
+    fn remember(&mut self, now: OffsetDateTime, notes: &[Note]) {
+        for note in notes.iter().filter(|note| note.happened.moves_it()) {
+            let title = self.queue.entry(&note.item).map_or_else(
+                || note.item.to_string(),
+                |entry| entry.item().title().single_line(),
+            );
+            self.recent.push_back(RecentAction {
+                at: now,
+                item: note.item.clone(),
+                title,
+                happened: note.happened,
+            });
+            if self.recent.len() > Self::RECENT_KEPT {
+                self.recent.pop_front();
+            }
+        }
     }
 
     /// The queue, laid out for a client.
@@ -316,6 +365,79 @@ mod tests {
                 ),
             )
             .expect("parked");
+    }
+
+    fn recent(service: &QueueService) -> Vec<(OffsetDateTime, String, Happened)> {
+        service
+            .recent()
+            .map(|action| (action.at, action.title.clone(), action.happened))
+            .collect()
+    }
+
+    #[test]
+    fn what_moved_items_is_kept_newest_first() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(NOW, vec![answered("github", vec![pr("1"), pr("2")])]);
+        let later = NOW + Duration::minutes(5);
+
+        service
+            .decide(NOW, Decision::Take(github("1")))
+            .expect("taken");
+        service
+            .decide(later, Decision::Take(github("2")))
+            .expect("taken");
+
+        assert_eq!(
+            recent(&service),
+            vec![
+                (later, "PR 2".to_owned(), Happened::Taken),
+                (later, "PR 1".to_owned(), Happened::SwitchedAway),
+                (NOW, "PR 1".to_owned(), Happened::Taken),
+            ]
+        );
+    }
+
+    #[test]
+    fn arrivals_and_changes_that_move_nothing_are_not_kept() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(NOW, vec![answered("github", vec![pr("1")])]);
+        parked_for(&mut service, "1", 60);
+        let changed = AttentionItem::builder(
+            &source("github"),
+            "1",
+            SourceCategory::CodeReview,
+            NonEmptyText::parse("PR 1").expect("title"),
+        )
+        .state(ItemState::NeedsReview)
+        .occurred_at(NOW + Duration::minutes(1))
+        .build();
+
+        service.absorb(
+            NOW + Duration::minutes(1),
+            vec![answered("github", vec![changed])],
+        );
+
+        assert_eq!(
+            recent(&service),
+            vec![(NOW, "PR 1".to_owned(), Happened::Parked)]
+        );
+    }
+
+    #[test]
+    fn only_the_latest_actions_are_kept() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(NOW, vec![answered("github", vec![pr("1")])]);
+
+        for minute in 0..=i64::try_from(QueueService::RECENT_KEPT).expect("small") {
+            service
+                .decide(
+                    NOW + Duration::minutes(minute),
+                    Decision::Park(github("1"), ParkFor::Changed),
+                )
+                .expect("parked");
+        }
+
+        assert_eq!(service.recent().count(), QueueService::RECENT_KEPT);
     }
 
     fn row_ids(rows: &[Row<'_>]) -> Vec<(Lane, String)> {

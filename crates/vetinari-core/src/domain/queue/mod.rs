@@ -162,6 +162,24 @@ pub enum Happened {
     ClosedWithItem,
 }
 
+impl Happened {
+    /// Whether it changed where the item stands, as opposed to only what its
+    /// source says about it.
+    #[must_use]
+    pub const fn moves_it(self) -> bool {
+        !matches!(
+            self,
+            Self::Arrived
+                | Self::Updated
+                | Self::StayedParked
+                | Self::IgnoredSilenced
+                | Self::LeftClosed
+                | Self::KeptAfterGone
+                | Self::ClosedWithItem
+        )
+    }
+}
+
 /// How long to park an item for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkFor {
