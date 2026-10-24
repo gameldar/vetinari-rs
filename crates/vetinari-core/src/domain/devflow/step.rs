@@ -3,6 +3,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::Serialize;
+
 use super::outcome::label;
 use super::template::{RepoTarget, TemplateKind, TicketRef};
 use crate::domain::git::BranchName;
@@ -130,6 +132,69 @@ pub struct StepConfig {
     pub skill: Option<SkillId>,
     /// The agent an agent step is pinned to.
     pub agent: Option<AgentId>,
+}
+
+impl StepConfig {
+    /// The schema this version writes and reads.
+    pub const SCHEMA: u64 = 1;
+
+    /// The document an `External` node's `config` holds.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let document = ConfigDocument {
+            schema: Self::SCHEMA,
+            step: self.step.name().to_owned(),
+            template: self.template.name().to_owned(),
+            ticket: TicketDocument {
+                source: self.ticket.source.to_string(),
+                key: self.ticket.key.to_string(),
+                title: self.ticket.title.to_string(),
+                url: self.ticket.url.clone(),
+            },
+            repo: RepoDocument {
+                path: self.repo.path.to_string_lossy().into_owned(),
+                remote: self.repo.remote.to_string(),
+            },
+            profile: self.profile.to_string(),
+            branch: self.branch.to_string(),
+            base: self.base.as_ref().map(ToString::to_string),
+            skill: self.skill.as_ref().map(ToString::to_string),
+            agent: self.agent.as_ref().map(ToString::to_string),
+        };
+        serde_json::to_value(document).expect("a config document always serialises")
+    }
+}
+
+#[derive(Serialize)]
+struct ConfigDocument {
+    schema: u64,
+    step: String,
+    template: String,
+    ticket: TicketDocument,
+    repo: RepoDocument,
+    profile: String,
+    branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TicketDocument {
+    source: String,
+    key: String,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RepoDocument {
+    path: String,
+    remote: String,
 }
 
 #[cfg(test)]

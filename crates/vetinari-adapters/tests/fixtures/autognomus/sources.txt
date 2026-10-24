@@ -1,0 +1,14 @@
+Where each fixture came from. Regenerate from the gateway's own tests once
+its External and Loop endpoints land; any difference is a bug on one side.
+
+public-node-external.json
+public-node-loop.json
+    autognomus 786bd8455783af3eaa1abba2357b5900d6afde1f,
+    docs/superpowers/specs/2026-10-25-external-tasks-loops-and-run-visibility-design.md
+    section 8.4, rewritten to the resolved shape: internally tagged by
+    `kind` as `PublicNode` is, and `retry.attempts` as `RetrySpec` is.
+
+feature-from-ticket.workflow.json
+    Written by hand from the dev workflows design (4.3, 4.4) as the body
+    vetinari must register for one feature-from-ticket run. `triggers`
+    follows autognomus-gateway/src/http/workflows.rs at the same commit.

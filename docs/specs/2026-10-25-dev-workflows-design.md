@@ -497,6 +497,12 @@ catch-all: the adapter decides what an unknown value means.
 The copy is held honest by fixtures (11.3): JSON taken verbatim from the engine spec and from
 the gateway's own tests, with the autognomus commit they came from.
 
+The body vetinari registers always carries `"triggers": [{ "type": "manual" }]`: runs are
+started by the launcher, never by a schedule or an event. A step's `config` is the
+`StepConfig` document the domain writes (`StepConfig::to_json`), so the adapter never decides
+what a step's config holds. The wire types vetinari only writes (`WorkflowBody`, the nodes and
+edges) need no catch-all; that rule applies to the types it reads.
+
 ## 6. The step result contract
 
 An agent step reports through a file, because a coding agent's process exit says only that it

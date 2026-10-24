@@ -5,6 +5,7 @@
 //! keychain. Nothing in this crate is depended upon by the core.
 
 pub mod agent;
+pub mod autognomus;
 pub mod clock;
 pub mod config;
 pub mod credentials;
