@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use time::Duration;
 
+use super::queue::QueueService;
 use crate::domain::action::Action;
 use crate::domain::agent::TaskClass;
 use crate::domain::attention::SourceCategory;
@@ -232,6 +233,8 @@ pub struct General {
     pub log_lines: usize,
     /// How often sources are refreshed, in seconds.
     pub refresh_secs: u64,
+    /// How many recent queue actions to show; none hides them.
+    pub recent_actions: usize,
 }
 
 impl General {
@@ -247,6 +250,8 @@ impl General {
     pub const DEFAULT_REFRESH_SECS: u64 = 60;
     /// The shortest source refresh interval accepted.
     pub const MIN_REFRESH_SECS: u64 = 5;
+    /// The default number of recent queue actions shown.
+    pub const DEFAULT_RECENT_ACTIONS: usize = 5;
 }
 
 impl Default for General {
@@ -255,6 +260,7 @@ impl Default for General {
             tick_rate_ms: Self::DEFAULT_TICK_RATE_MS,
             log_lines: Self::DEFAULT_LOG_LINES,
             refresh_secs: Self::DEFAULT_REFRESH_SECS,
+            recent_actions: Self::DEFAULT_RECENT_ACTIONS,
         }
     }
 }
@@ -411,6 +417,10 @@ fn parse_general(raw: RawGeneral) -> General {
             .refresh_secs
             .unwrap_or(defaults.refresh_secs)
             .max(General::MIN_REFRESH_SECS),
+        recent_actions: raw
+            .recent_actions
+            .unwrap_or(defaults.recent_actions)
+            .min(QueueService::RECENT_KEPT),
     }
 }
 
@@ -989,6 +999,8 @@ pub struct RawGeneral {
     pub log_lines: Option<usize>,
     /// Source refresh interval in seconds.
     pub refresh_secs: Option<u64>,
+    /// How many recent queue actions to show.
+    pub recent_actions: Option<usize>,
 }
 
 /// One `[[profiles]]` entry.
@@ -1725,6 +1737,18 @@ mod tests {
         .expect("config");
         assert_eq!(config.general.tick_rate_ms, General::MIN_TICK_RATE_MS);
         assert_eq!(config.general.log_lines, General::MIN_LOG_LINES);
+    }
+
+    #[test]
+    fn recent_actions_default_to_five_and_cannot_exceed_what_is_kept() {
+        let recent = |toml: &str| parse(toml).expect("config").general.recent_actions;
+
+        assert_eq!(recent(""), 5);
+        assert_eq!(recent("[general]\nrecent_actions = 0"), 0);
+        assert_eq!(
+            recent("[general]\nrecent_actions = 500"),
+            crate::application::queue::QueueService::RECENT_KEPT
+        );
     }
     #[test]
     fn the_default_targets_cover_every_default_profiles_target() {

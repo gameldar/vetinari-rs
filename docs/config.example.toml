@@ -16,6 +16,9 @@ refresh_secs = 60
 # How many log lines to keep for feedback capture (<Space> f f sends these
 # to the implementing agent).
 log_lines = 200
+# How many recent queue actions (taken, parked, came back...) to show under
+# the queue. 0 hides them.
+recent_actions = 5
 
 
 # --- Attention queue ---------------------------------------------------------
