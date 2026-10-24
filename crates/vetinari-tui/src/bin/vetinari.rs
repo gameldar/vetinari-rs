@@ -252,6 +252,7 @@ async fn run(cli: Cli) -> Fallible<()> {
     let tick = Duration::from_millis(loaded.config.general.tick_rate_ms);
     let refresh_every = Duration::from_secs(loaded.config.general.refresh_secs);
     let log_lines = loaded.config.general.log_lines;
+    let recent_actions = loaded.config.general.recent_actions;
     let keymap = loaded.config.keymap.clone();
     let profiles = loaded.config.profiles.clone();
     let rules = loaded.config.queue.clone();
@@ -274,6 +275,7 @@ async fn run(cli: Cli) -> Fallible<()> {
         clock.now(),
     );
     app.set_config_path(config_path);
+    app.set_recent_actions(recent_actions);
     for problem in &problems {
         app.apply(Update::Log(format!("WARN {problem}")));
     }

@@ -11,12 +11,13 @@ use std::path::PathBuf;
 use time::{Duration, OffsetDateTime};
 use vetinari_core::application::agents::AgentRegistry;
 use vetinari_core::application::attention::Polled;
+use vetinari_core::application::config::General;
 use vetinari_core::application::keymap_engine::{KeymapEngine, Keystroke};
 use vetinari_core::application::ports::{DeviceCodeChallenge, PortError};
 use vetinari_core::application::queue::{Lane, QueueCursor, QueueService, Row, lanes};
 use vetinari_core::application::skills::SkillDraft;
 use vetinari_core::domain::action::Action;
-use vetinari_core::domain::agent::{AgentSession, ObservedAgent, ObservedAgentState};
+use vetinari_core::domain::agent::AgentSession;
 use vetinari_core::domain::attention::{
     AttentionItem, EventRef, IssueRef, ItemContext, ItemState, MessageRef, PullRequestRef, humanize,
 };
@@ -46,49 +47,6 @@ pub const VERSION: &str = concat!(
     ".",
     env!("CARGO_PKG_VERSION_MINOR")
 );
-
-/// Which pane has the keyboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pane {
-    /// The attention feed.
-    Feed,
-    /// The workspace and agent monitor.
-    Monitor,
-    /// The details of the selected row.
-    Details,
-}
-
-impl Pane {
-    const ORDER: &'static [Pane] = &[Pane::Feed, Pane::Monitor, Pane::Details];
-
-    /// The pane's title.
-    #[must_use]
-    pub const fn title(&self) -> &'static str {
-        match self {
-            Pane::Feed => "ATTENTION QUEUE",
-            Pane::Monitor => "WORKSPACE & AGENT MONITOR",
-            Pane::Details => "CONTEXT / DETAILS",
-        }
-    }
-
-    fn shifted(self, by: isize) -> Self {
-        let index = Self::ORDER
-            .iter()
-            .position(|pane| *pane == self)
-            .unwrap_or(0) as isize;
-        let next = (index + by).clamp(0, Self::ORDER.len() as isize - 1);
-        Self::ORDER[next as usize]
-    }
-
-    fn cycled(self, by: isize) -> Self {
-        let len = Self::ORDER.len() as isize;
-        let index = Self::ORDER
-            .iter()
-            .position(|pane| *pane == self)
-            .unwrap_or(0) as isize;
-        Self::ORDER[((index + by).rem_euclid(len)) as usize]
-    }
-}
 
 /// How loud a status message is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,32 +197,6 @@ impl SpaceRow {
     }
 }
 
-/// One agent in the monitor that Vetinari did not start.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedAgentRow {
-    /// The terminal it occupies.
-    pub pane: SpaceId,
-    /// The space it is running in, when the target says.
-    pub space: Option<SpaceId>,
-    /// How to describe it.
-    pub label: String,
-    /// Whether it is waiting on somebody.
-    pub blocked: bool,
-}
-
-impl ObservedAgentRow {
-    /// Summarise an observed agent for the monitor.
-    #[must_use]
-    pub fn from_observed(agent: &ObservedAgent) -> Self {
-        Self {
-            pane: agent.pane().clone(),
-            space: agent.workspace().cloned(),
-            label: agent.describe(),
-            blocked: agent.state() == ObservedAgentState::Blocked,
-        }
-    }
-}
-
 /// Work for the event loop to do against the adapters.
 #[derive(Debug, Clone)]
 pub enum Task {
@@ -393,9 +325,7 @@ pub enum Update {
     Sessions(Vec<SessionRow>),
     /// The workspace spaces as they now stand.
     Spaces(Vec<SpaceRow>),
-    /// The agents a workspace target is running that Vetinari did not start.
-    ObservedAgents(Vec<ObservedAgentRow>),
-    /// The keychain summary for the header.
+    /// The keychain summary.
     Keychain(String),
     /// A reloaded skill library.
     Library(SkillLibrary),
@@ -423,7 +353,6 @@ pub struct App {
     profiles: ProfileSet,
     library: SkillLibrary,
     feedback_target: FeedbackTarget,
-    focus: Pane,
     overlay: Option<Overlay>,
     which_key: Option<WhichKeyView>,
     status: Option<(StatusMessage, OffsetDateTime)>,
@@ -431,9 +360,8 @@ pub struct App {
     log_limit: usize,
     sessions: Vec<SessionRow>,
     spaces: Vec<SpaceRow>,
-    observed: Vec<ObservedAgentRow>,
-    monitor_cursor: usize,
     keychain: String,
+    recent_shown: usize,
     config_path: Option<PathBuf>,
     last_feedback: Option<FeedbackRequest>,
     filter_backup: Option<String>,
@@ -466,7 +394,6 @@ impl App {
             profiles,
             library,
             feedback_target,
-            focus: Pane::Feed,
             overlay: None,
             which_key: None,
             status: None,
@@ -474,15 +401,19 @@ impl App {
             log_limit: log_limit.max(1),
             sessions: Vec::new(),
             spaces: Vec::new(),
-            observed: Vec::new(),
-            monitor_cursor: 0,
             keychain: "Keychain: unknown".to_owned(),
+            recent_shown: General::DEFAULT_RECENT_ACTIONS,
             config_path: None,
             last_feedback: None,
             filter_backup: None,
             now,
             quit: false,
         }
+    }
+
+    /// How many recent queue actions to show.
+    pub fn set_recent_actions(&mut self, shown: usize) {
+        self.recent_shown = shown;
     }
 
     /// Record which configuration file is in force, for feedback capture.
@@ -594,12 +525,6 @@ impl App {
         &self.library
     }
 
-    /// Which pane has the keyboard.
-    #[must_use]
-    pub const fn focus(&self) -> Pane {
-        self.focus
-    }
-
     /// Whatever has the foreground.
     #[must_use]
     pub const fn overlay(&self) -> Option<&Overlay> {
@@ -636,22 +561,15 @@ impl App {
         &self.spaces
     }
 
-    /// The agents a workspace target is running on its own.
-    #[must_use]
-    pub fn observed_agents(&self) -> &[ObservedAgentRow] {
-        &self.observed
-    }
-
-    /// Which monitor row is highlighted.
-    #[must_use]
-    pub const fn monitor_cursor(&self) -> usize {
-        self.monitor_cursor
-    }
-
-    /// The highlighted session.
+    /// The session behind the selected row: the agent it is, or the agent
+    /// it was handed to.
     #[must_use]
     pub fn selected_session(&self) -> Option<&SessionRow> {
-        self.sessions.get(self.monitor_cursor)
+        let row = self.selected()?;
+        let agent = row.entry.agent().unwrap_or_else(|| row.entry.item().id());
+        self.sessions
+            .iter()
+            .find(|session| AgentRegistry::item_id(&session.id) == *agent)
     }
 
     /// The clock the relative times are shown against.
@@ -666,37 +584,57 @@ impl App {
         self.quit
     }
 
-    /// The left of the header.
+    /// The queue's title: whose it is, what is in it, and whether focus
+    /// time is holding anything back.
     #[must_use]
-    pub fn header_left(&self) -> String {
-        let header = format!(
-            "VETINARI v{VERSION} - [ Profile: {} ]",
-            self.profile().name()
-        );
-        match self.queue.queue().focus() {
-            Some(focus) => format!(
-                "{header} [ Focus until {:02}:{:02} ]",
+    pub fn title(&self) -> String {
+        let mut title = format!("Vetinari · {}", self.profile().name());
+        if self.filter().is_empty() {
+            let counts = self
+                .lane_counts()
+                .iter()
+                .map(|(lane, count)| format!("{} {count}", lane.title().to_lowercase()))
+                .collect::<Vec<_>>();
+            if !counts.is_empty() {
+                title.push_str(&format!(" ({})", counts.join(", ")));
+            }
+        } else {
+            title.push_str(&format!(" (/{} - {})", self.filter(), self.rows().len()));
+        }
+        if let Some(focus) = self.queue.queue().focus() {
+            title.push_str(&format!(
+                " · focus until {:02}:{:02}",
                 focus.until.hour(),
                 focus.until.minute()
-            ),
-            None => header,
+            ));
         }
+        title
     }
 
-    /// The right of the header.
+    /// What recently moved items, newest first, as many as are shown.
     #[must_use]
-    pub fn header_right(&self) -> String {
-        self.keychain.clone()
+    pub fn recent_actions(&self) -> Vec<String> {
+        self.queue
+            .recent()
+            .take(self.recent_shown)
+            .map(|action| {
+                format!(
+                    "{:02}:{:02} {}: {}",
+                    action.at.hour(),
+                    action.at.minute(),
+                    action_label(action.happened),
+                    action.title
+                )
+            })
+            .collect()
     }
 
     /// The footer's key hints, spelled as the keymap actually binds them.
     #[must_use]
     pub fn footer(&self) -> String {
         const HINTS: &[(Action, &str)] = &[
-            (Action::PrReviewSpawn, "PR Review"),
-            (Action::FeedbackOpen, "Feedback"),
-            (Action::SkillEditor, "Edit Skills"),
-            (Action::AgentMenu, "Agents"),
+            (Action::QueueTakeNext, "Next"),
+            (Action::Select, "Details"),
             (Action::Help, "Help"),
             (Action::Quit, "Quit"),
         ];
@@ -770,14 +708,8 @@ impl App {
                     self.set_status(StatusMessage::error(text));
                 }
             }
-            Update::Sessions(sessions) => {
-                self.sessions = sessions;
-                self.monitor_cursor = self
-                    .monitor_cursor
-                    .min(self.sessions.len().saturating_sub(1));
-            }
+            Update::Sessions(sessions) => self.sessions = sessions,
             Update::Spaces(spaces) => self.spaces = spaces,
-            Update::ObservedAgents(agents) => self.observed = agents,
             Update::Keychain(summary) => self.keychain = summary,
             Update::Library(library) => self.library = library,
             Update::Status(message) => self.set_status(message),
@@ -881,22 +813,6 @@ impl App {
             Action::NavBottom => self.navigate_to_end(true),
             Action::NavPageDown => self.navigate(Self::PAGE as isize),
             Action::NavPageUp => self.navigate(-(Self::PAGE as isize)),
-            Action::PaneLeft => {
-                self.focus = self.focus.shifted(-1);
-                Outcome::Nothing
-            }
-            Action::PaneRight => {
-                self.focus = self.focus.shifted(1);
-                Outcome::Nothing
-            }
-            Action::PaneNext => {
-                self.focus = self.focus.cycled(1);
-                Outcome::Nothing
-            }
-            Action::PanePrev => {
-                self.focus = self.focus.cycled(-1);
-                Outcome::Nothing
-            }
             Action::QueueTakeNext => {
                 let next = self
                     .queue
@@ -966,14 +882,10 @@ impl App {
                 Outcome::Nothing
             }
             Action::Select => {
-                self.focus = Pane::Details;
-                match self.selected_item() {
-                    Some(item) => {
-                        let label = item.row_label();
-                        self.info(label)
-                    }
-                    None => Outcome::Nothing,
+                if self.selected().is_some() {
+                    self.overlay = Some(Overlay::Details);
                 }
+                Outcome::Nothing
             }
 
             Action::FeedbackOpen => {
@@ -1150,41 +1062,16 @@ impl App {
     }
 
     fn navigate(&mut self, by: isize) -> Outcome {
-        match self.focus {
-            Pane::Feed | Pane::Details => {
-                self.cursor.move_by(&self.queue.view(self.now), by);
-            }
-            Pane::Monitor => {
-                let last = self.sessions.len().saturating_sub(1);
-                self.monitor_cursor = if by > 0 {
-                    #[allow(clippy::cast_sign_loss)]
-                    self.monitor_cursor.saturating_add(by as usize).min(last)
-                } else {
-                    #[allow(clippy::cast_sign_loss)]
-                    self.monitor_cursor.saturating_sub((-by) as usize)
-                };
-            }
-        }
+        self.cursor.move_by(&self.queue.view(self.now), by);
         Outcome::Nothing
     }
 
     fn navigate_to_end(&mut self, bottom: bool) -> Outcome {
-        match self.focus {
-            Pane::Feed | Pane::Details => {
-                let view = self.queue.view(self.now);
-                if bottom {
-                    self.cursor.select_last(&view);
-                } else {
-                    self.cursor.select_first(&view);
-                }
-            }
-            Pane::Monitor => {
-                self.monitor_cursor = if bottom {
-                    self.sessions.len().saturating_sub(1)
-                } else {
-                    0
-                };
-            }
+        let view = self.queue.view(self.now);
+        if bottom {
+            self.cursor.select_last(&view);
+        } else {
+            self.cursor.select_first(&view);
         }
         Outcome::Nothing
     }
@@ -1195,6 +1082,15 @@ impl App {
             Some(Overlay::Menu(menu)) => self.menu_key(menu, chord),
             Some(Overlay::Form(form)) => self.form_key(form, chord),
             Some(Overlay::Text(view)) => self.text_key(view, chord),
+            Some(Overlay::Details) => {
+                if !matches!(
+                    chord.code(),
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
+                ) {
+                    self.overlay = Some(Overlay::Details);
+                }
+                Outcome::Nothing
+            }
             Some(Overlay::DeviceCode(view)) => {
                 if chord.code() == KeyCode::Esc {
                     return Outcome::Nothing;
@@ -1328,11 +1224,21 @@ impl App {
                 }
             }
             (MenuKind::Agents, MenuTarget::Session(id)) => {
-                self.focus = Pane::Monitor;
-                if let Some(index) = self.sessions.iter().position(|row| row.id == id) {
-                    self.monitor_cursor = index;
+                let agent = AgentRegistry::item_id(&id);
+                let row = self
+                    .rows()
+                    .into_iter()
+                    .find(|row| {
+                        row.entry.item().id() == &agent || row.entry.agent() == Some(&agent)
+                    })
+                    .map(|row| row.entry.item().id().clone());
+                match row {
+                    Some(item) => {
+                        self.cursor.select_item(&self.queue.view(self.now), &item);
+                        Outcome::Nothing
+                    }
+                    None => self.warn(format!("{id} is not in the queue")),
                 }
-                Outcome::Nothing
             }
             (MenuKind::Spaces, MenuTarget::Space(id)) => Outcome::Task(Task::FocusSpace(id)),
             (MenuKind::Skills, MenuTarget::Skill(id)) => Outcome::Task(Task::RunSkill {
@@ -1586,7 +1492,7 @@ impl App {
             .collect();
         self.overlay = Some(Overlay::Menu(Menu::new(
             MenuKind::Providers,
-            "Authenticate",
+            format!("Authenticate - {}", self.keychain),
             items,
         )));
     }
@@ -1835,11 +1741,37 @@ const fn rule_label(rule: Rule) -> &'static str {
     }
 }
 
-/// Nine the next morning, in the clock's own offset.
 fn gone_from(entry: &Entry) -> Option<String> {
     (entry.upstream() == Upstream::Gone).then(|| format!("gone from {}", entry.item().source()))
 }
 
+fn action_label(happened: Happened) -> String {
+    match happened {
+        Happened::Taken => "taken".to_owned(),
+        Happened::SwitchedAway => "switched away".to_owned(),
+        Happened::Parked => "parked".to_owned(),
+        Happened::Finished => "finished".to_owned(),
+        Happened::Silenced => "silenced".to_owned(),
+        Happened::WaitingOnReply => "waiting on a reply".to_owned(),
+        Happened::HandedToAgent => "handed to an agent".to_owned(),
+        Happened::WaitingOnAgent => "waiting on its agent".to_owned(),
+        Happened::HeldForFocus => "held for focus".to_owned(),
+        Happened::Resurfaced(rule) => format!("back, {}", rule_label(rule)),
+        Happened::GoneWhileActive => "gone from its source".to_owned(),
+        Happened::ClosedUpstream => "closed at its source".to_owned(),
+        Happened::AgentNeedsYouWhileActive => "its agent needs you".to_owned(),
+        Happened::AgentClosed => "its agent went away".to_owned(),
+        Happened::Arrived
+        | Happened::Updated
+        | Happened::StayedParked
+        | Happened::IgnoredSilenced
+        | Happened::LeftClosed
+        | Happened::KeptAfterGone
+        | Happened::ClosedWithItem => "updated".to_owned(),
+    }
+}
+
+/// Nine the next morning, in the clock's own offset.
 fn tomorrow_morning(now: OffsetDateTime) -> OffsetDateTime {
     now.date()
         .next_day()
@@ -1890,6 +1822,18 @@ mod tests {
 
     fn source(name: &str) -> SourceId {
         SourceId::parse(name).expect("id")
+    }
+
+    fn agent_item(session: &str, state: ItemState) -> AttentionItem {
+        AttentionItem::builder(
+            &source("agents"),
+            session,
+            SourceCategory::AgentState,
+            NonEmptyText::parse(&format!("agent {session}")).expect("title"),
+        )
+        .state(state)
+        .occurred_at(NOW)
+        .build()
     }
 
     fn pr_item() -> AttentionItem {
@@ -2025,7 +1969,6 @@ mod tests {
     #[test]
     fn the_app_starts_on_the_most_urgent_row_with_no_overlay() {
         let app = app();
-        assert_eq!(app.focus(), Pane::Feed);
         assert!(app.overlay().is_none());
         assert_eq!(
             app.selected_item().expect("a row").title().as_str(),
@@ -2312,16 +2255,66 @@ mod tests {
     }
 
     #[test]
-    fn the_header_says_when_focus_time_ends() {
-        let mut app = app();
-        assert!(!app.header_left().contains("Focus"));
+    fn the_title_names_the_profile_and_when_focus_time_ends() {
+        let mut app = empty_app();
+        assert_eq!(app.title(), "Vetinari · Work");
 
         press(&mut app, "SPC t f");
 
-        assert_eq!(
-            app.header_left(),
-            "VETINARI v0.1 - [ Profile: Work ] [ Focus until 10:00 ]"
+        assert_eq!(app.title(), "Vetinari · Work · focus until 10:00");
+    }
+
+    #[test]
+    fn the_title_counts_each_lane() {
+        let mut app = app();
+        select_row(&mut app, "Fix memory leak in auth parser");
+
+        press(&mut app, "SPC d t");
+
+        assert!(
+            app.title().starts_with("Vetinari · Work (now 1, next 3)"),
+            "{}",
+            app.title()
         );
+    }
+
+    #[test]
+    fn return_opens_the_details_of_the_selected_row_and_escape_closes_them() {
+        let mut app = app();
+
+        press(&mut app, "RET");
+        assert!(matches!(app.overlay(), Some(Overlay::Details)));
+
+        press(&mut app, "<Esc>");
+        assert!(app.overlay().is_none());
+    }
+
+    #[test]
+    fn recent_actions_say_when_and_what_happened_to_which_item() {
+        let mut app = app();
+        select_row(&mut app, "Fix memory leak in auth parser");
+        press(&mut app, "SPC d p h");
+
+        app.apply(Update::Tick(NOW + Duration::hours(1)));
+
+        assert_eq!(
+            app.recent_actions(),
+            vec![
+                "10:00 back, its park ran out: Fix memory leak in auth parser".to_owned(),
+                "09:00 parked: Fix memory leak in auth parser".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_as_many_recent_actions_as_configured_are_shown() {
+        let mut app = app();
+        app.set_recent_actions(1);
+
+        press(&mut app, "SPC n");
+        press(&mut app, "SPC n");
+
+        assert_eq!(app.recent_actions().len(), 1);
     }
 
     #[test]
@@ -2333,36 +2326,6 @@ mod tests {
         assert_eq!(app.cursor(), 3);
         press(&mut app, "g g");
         assert_eq!(app.cursor(), 0);
-    }
-
-    #[test]
-    fn panes_are_switched_with_h_and_l_and_tab() {
-        let mut app = app();
-        press(&mut app, "l");
-        assert_eq!(app.focus(), Pane::Monitor);
-        press(&mut app, "l");
-        assert_eq!(app.focus(), Pane::Details);
-        press(&mut app, "h");
-        assert_eq!(app.focus(), Pane::Monitor);
-        press(&mut app, "TAB");
-        assert_eq!(app.focus(), Pane::Details);
-    }
-
-    #[test]
-    fn with_the_monitor_focused_the_arrows_move_between_sessions() {
-        let mut app = app();
-        app.apply(Update::Sessions(vec![
-            SessionRow::sample("s1", "claude-code", "writing tests", "running"),
-            SessionRow::sample("s2", "agy-gemini", "summarising", "done"),
-        ]));
-        press(&mut app, "l");
-        press(&mut app, "j");
-        assert_eq!(app.monitor_cursor(), 1);
-        assert_eq!(
-            app.selected_session().map(|row| row.id.as_str().to_owned()),
-            Some("s2".to_owned())
-        );
-        assert_eq!(app.cursor(), 0, "the feed selection is left alone");
     }
 
     #[test]
@@ -2624,12 +2587,16 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_menu_lists_sessions_and_choosing_one_focuses_it_in_the_monitor() {
+    fn the_agent_menu_lists_sessions_and_choosing_one_selects_its_row() {
         let mut app = app();
         app.apply(Update::Sessions(vec![
             SessionRow::sample("s1", "claude-code", "writing tests", "running"),
             SessionRow::sample("s2", "agy-gemini", "summarising", "waiting"),
         ]));
+        app.apply(Update::Polled(polled(vec![
+            agent_item("s1", ItemState::AgentRunning),
+            agent_item("s2", ItemState::AgentWaiting),
+        ])));
 
         press(&mut app, "SPC a a");
         let Some(Overlay::Menu(menu)) = app.overlay() else {
@@ -2641,19 +2608,25 @@ mod tests {
         press(&mut app, "j");
         press(&mut app, "RET");
 
-        assert_eq!(app.focus(), Pane::Monitor);
-        assert_eq!(app.monitor_cursor(), 1);
+        assert_eq!(
+            app.selected_item()
+                .map(|item| item.title().as_str().to_owned()),
+            Some("agent s2".to_owned())
+        );
     }
 
     #[test]
-    fn an_agent_can_be_cancelled_rerun_and_unblocked_from_the_monitor() {
+    fn agent_actions_act_on_the_agent_of_the_selected_row() {
         let mut app = app();
-        app.apply(Update::Sessions(vec![SessionRow::sample(
-            "s1",
-            "claude-code",
-            "writing tests",
-            "waiting",
-        )]));
+        app.apply(Update::Sessions(vec![
+            SessionRow::sample("s1", "claude-code", "writing tests", "waiting"),
+            SessionRow::sample("s2", "agy-gemini", "summarising", "running"),
+        ]));
+        app.apply(Update::Polled(polled(vec![
+            agent_item("s1", ItemState::AgentWaiting),
+            agent_item("s2", ItemState::AgentWaiting),
+        ])));
+        select_row(&mut app, "agent s1");
 
         assert!(matches!(
             press(&mut app, "SPC a c"),
@@ -2679,11 +2652,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_actions_follow_an_item_to_the_agent_working_on_it() {
+        let mut app = app();
+        app.apply(Update::Sessions(vec![SessionRow::sample(
+            "s1",
+            "claude-code",
+            "reviewing",
+            "running",
+        )]));
+        select_row(&mut app, "Fix memory leak in auth parser");
+        let Outcome::Task(Task::StartPrReview { item, .. }) = press(&mut app, "SPC p r") else {
+            panic!("expected a review task");
+        };
+        app.apply(Update::AgentStarted {
+            item,
+            session: SessionId::parse("s1").expect("session"),
+        });
+        select_row(&mut app, "Fix memory leak in auth parser");
+
+        let outcome = press(&mut app, "SPC a l");
+
+        let Outcome::Task(Task::ShowAgentOutput(session)) = outcome else {
+            panic!("expected the agent's output, got {outcome:?}");
+        };
+        assert_eq!(session.as_str(), "s1");
+    }
+
+    #[test]
     fn a_session_can_be_run_beside_the_developer_in_its_own_space() {
         let mut app = app();
         let mut row = SessionRow::sample("s1", "claude-code", "writing tests", "running");
         row.space = Some(SpaceId::parse("space-7").expect("id"));
         app.apply(Update::Sessions(vec![row]));
+        app.apply(Update::Polled(polled(vec![agent_item(
+            "s1",
+            ItemState::AgentWaiting,
+        )])));
+        select_row(&mut app, "agent s1");
 
         let outcome = press(&mut app, "SPC w r");
 
@@ -2702,6 +2707,11 @@ mod tests {
             "writing tests",
             "running",
         )]));
+        app.apply(Update::Polled(polled(vec![agent_item(
+            "s1",
+            ItemState::AgentWaiting,
+        )])));
+        select_row(&mut app, "agent s1");
 
         let outcome = press(&mut app, "SPC w r");
 
@@ -2747,6 +2757,11 @@ mod tests {
         let mut row = SessionRow::sample("s1", "claude-code", "writing tests", "running");
         row.space = Some(SpaceId::parse("space-7").expect("id"));
         app.apply(Update::Sessions(vec![row]));
+        app.apply(Update::Polled(polled(vec![agent_item(
+            "s1",
+            ItemState::AgentWaiting,
+        )])));
+        select_row(&mut app, "agent s1");
 
         let outcome = press(&mut app, "SPC w s");
 
@@ -2985,11 +3000,20 @@ mod tests {
     }
 
     #[test]
-    fn the_header_reports_the_profile_and_the_keychain() {
+    fn the_authenticate_menu_says_what_the_keychain_holds() {
         let mut app = app();
         app.apply(Update::Keychain("Keychain: 2 authenticated".to_owned()));
-        assert_eq!(app.header_left(), "VETINARI v0.1 - [ Profile: Work ]");
-        assert_eq!(app.header_right(), "Keychain: 2 authenticated");
+
+        press(&mut app, "SPC h a");
+
+        let Some(Overlay::Menu(menu)) = app.overlay() else {
+            panic!("expected the provider menu");
+        };
+        assert!(
+            menu.title.contains("Keychain: 2 authenticated"),
+            "{}",
+            menu.title
+        );
     }
 
     #[test]
@@ -3094,8 +3118,8 @@ mod tests {
     fn the_footer_shows_the_headline_bindings_as_the_keymap_defines_them() {
         let app = app();
         let footer = app.footer();
-        assert!(footer.contains("SPC p r"));
-        assert!(footer.contains("SPC f f"));
-        assert!(footer.contains("SPC q"));
+        assert!(footer.contains("SPC n: Next"), "{footer}");
+        assert!(footer.contains("RET: Details"), "{footer}");
+        assert!(footer.contains("SPC h k: Help"), "{footer}");
     }
 }

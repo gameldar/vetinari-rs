@@ -14,9 +14,7 @@ use vetinari_core::domain::ids::{ItemId, SourceId};
 use vetinari_core::domain::profile::Profile;
 use vetinari_core::domain::skill::SkillLibrary;
 
-use crate::app::{
-    ObservedAgentRow, SessionRow, SpaceRow, StatusMessage, Task, Update, describe_failure,
-};
+use crate::app::{SessionRow, SpaceRow, StatusMessage, Task, Update, describe_failure};
 
 /// Performs work against the adapters.
 pub struct Controller {
@@ -91,14 +89,6 @@ impl Controller {
             });
         }
         updates.push(Update::Polled(polled));
-
-        updates.push(Update::ObservedAgents(
-            observation
-                .agents
-                .iter()
-                .map(ObservedAgentRow::from_observed)
-                .collect(),
-        ));
 
         updates.push(Update::Sessions(
             self.runtime
@@ -736,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refresh_lists_the_agents_herdr_is_running_and_ranks_a_blocked_one_first() {
+    async fn a_refresh_queues_the_agents_herdr_is_running_and_ranks_a_blocked_one_first() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("herdr.sock");
         fake_herdr(socket.clone());
@@ -746,17 +736,6 @@ mod tests {
         ));
 
         let updates = h.controller.refresh(&h.profile).await;
-
-        let observed = updates
-            .iter()
-            .find_map(|update| match update {
-                Update::ObservedAgents(agents) => Some(agents.clone()),
-                _ => None,
-            })
-            .expect("the agents herdr is running");
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].label, "herdr claude [w1] (blocked)");
-        assert!(observed[0].blocked);
 
         let mut queue = QueueService::new(QueueRules::default());
         queue.absorb(NOW, polled_of(&updates));

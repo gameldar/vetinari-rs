@@ -74,10 +74,6 @@ actions! {
     NavBottom => "nav-bottom", "Jump to last entry";
     NavPageDown => "nav-page-down", "Scroll down a page";
     NavPageUp => "nav-page-up", "Scroll up a page";
-    PaneLeft => "pane-left", "Focus pane to the left";
-    PaneRight => "pane-right", "Focus pane to the right";
-    PaneNext => "pane-next", "Focus next pane";
-    PanePrev => "pane-prev", "Focus previous pane";
     FilterStart => "filter-start", "Filter the queue";
     FilterClear => "filter-clear", "Clear the filter";
     Select => "select", "Open the selected entry";

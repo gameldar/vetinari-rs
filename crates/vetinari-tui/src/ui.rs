@@ -1,122 +1,67 @@
 //! Drawing a frame from the state.
 //!
-//! The layout follows the PRD: a header, the feed beside the workspace and
-//! agent monitor with the details pane under it, then the status line and the
-//! key hints. Overlays and the which-key popup are drawn over the body.
+//! One pane, sized to sit in a corner of a larger layout: the queue with
+//! what recently happened under it, then a line that is the status when
+//! there is one and the key hints otherwise. The details, which-key and
+//! other overlays are drawn over it.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use vetinari_core::application::queue::Lane;
 use vetinari_core::domain::attention::ItemState;
 
-use crate::app::{App, Level, Pane};
+use crate::app::{App, Level};
 use crate::overlay::{Form, Menu, Overlay, Prompt, TextView};
 
 /// Draw the whole frame.
 pub fn render(frame: &mut Frame, app: &App) {
-    let [header, body, status, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let [body, bottom] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
 
-    render_header(frame, app, header);
-    render_body(frame, app, body);
-    render_status(frame, app, status);
-    render_footer(frame, app, footer);
+    render_queue(frame, app, body);
+    render_bottom(frame, app, bottom);
 
     if let Some(which_key) = app.which_key() {
         render_which_key(frame, which_key, body);
     }
     if let Some(overlay) = app.overlay() {
-        render_overlay(frame, overlay, frame.area());
+        render_overlay(frame, app, overlay, frame.area());
     }
 }
 
-fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    let left = Span::styled(
-        app.header_left(),
-        Style::default().fg(Color::Black).bg(Color::Cyan),
-    );
-    let right = Span::styled(
-        app.header_right(),
-        Style::default().fg(Color::Black).bg(Color::Cyan),
-    );
-    let [left_area, right_area] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(u16::try_from(app.header_right().chars().count()).unwrap_or(0)),
-    ])
-    .areas(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(left)).style(Style::default().bg(Color::Cyan)),
-        left_area,
-    );
-    frame.render_widget(Paragraph::new(Line::from(right)), right_area);
-}
-
-fn render_body(frame: &mut Frame, app: &App, area: Rect) {
-    let [feed_area, right] =
-        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
-    let [monitor_area, details_area] =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
-
-    render_feed(frame, app, feed_area);
-    render_monitor(frame, app, monitor_area);
-    render_details(frame, app, details_area);
-}
-
-fn pane_block(app: &App, pane: Pane, extra: &str) -> Block<'static> {
-    let focused = app.focus() == pane;
-    let title = if extra.is_empty() {
-        pane.title().to_owned()
-    } else {
-        format!("{} {extra}", pane.title())
-    };
-    let style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    Block::default()
+fn render_queue(frame: &mut Frame, app: &App, area: Rect) {
+    let style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
-        .title(Span::styled(
-            if focused {
-                format!("> {title}")
-            } else {
-                format!("  {title}")
-            },
-            style,
-        ))
+        .title(Span::styled(format!(" {} ", app.title()), style));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let recent = app.recent_actions();
+    let recent_height = if recent.is_empty() {
+        0
+    } else {
+        u16::try_from(recent.len() + 1).unwrap_or(u16::MAX)
+    };
+    let [rows_area, recent_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(recent_height)]).areas(inner);
+
+    render_rows(frame, app, rows_area);
+    render_recent(frame, &recent, recent_area);
 }
 
-fn render_feed(frame: &mut Frame, app: &App, area: Rect) {
+fn render_rows(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.rows();
-    let counts = app
-        .lane_counts()
-        .iter()
-        .map(|(lane, count)| format!("{} {count}", lane.title().to_lowercase()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let extra = if app.filter().is_empty() {
-        format!("({counts})")
-    } else {
-        format!("(/{} - {})", app.filter(), rows.len())
-    };
-    let block = pane_block(app, Pane::Feed, &extra);
-
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new("Nothing is waiting on you. Press r to refresh.")
-                .block(block)
                 .wrap(Wrap { trim: true }),
             area,
         );
@@ -125,6 +70,7 @@ fn render_feed(frame: &mut Frame, app: &App, area: Rect) {
 
     let cursor = app.cursor();
     let mut lines: Vec<ListItem> = Vec::new();
+    let mut selected_line = 0;
     let mut lane = None;
     for (index, row) in rows.iter().enumerate() {
         if lane != Some(row.lane) {
@@ -138,6 +84,9 @@ fn render_feed(frame: &mut Frame, app: &App, area: Rect) {
         }
         let item = row.entry.item();
         let selected = index == cursor;
+        if selected {
+            selected_line = lines.len();
+        }
         let marker = if selected { "> " } else { "  " };
         let relative = item
             .relative_time(app.now())
@@ -166,74 +115,26 @@ fn render_feed(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    frame.render_widget(List::new(lines).block(block), area);
+    let mut state = ListState::default().with_selected(Some(selected_line));
+    frame.render_stateful_widget(List::new(lines), area, &mut state);
 }
 
-fn render_monitor(frame: &mut Frame, app: &App, area: Rect) {
-    let block = pane_block(app, Pane::Monitor, "");
-    let mut rows: Vec<ListItem> = app
-        .sessions()
-        .iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let selected = app.focus() == Pane::Monitor && index == app.monitor_cursor();
-            let marker = if selected { "> " } else { "  " };
-            let style = if session.blocked {
-                Style::default().fg(Color::Magenta)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::styled(format!("{marker}{}", session.label()), style))
-        })
-        .collect();
-
-    if !app.observed_agents().is_empty() {
-        rows.push(ListItem::new(Line::styled(
-            "  -- agents Vetinari did not start --",
-            Style::default().fg(Color::DarkGray),
-        )));
-        rows.extend(app.observed_agents().iter().map(|agent| {
-            let style = if agent.blocked {
-                Style::default().fg(Color::Magenta)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            ListItem::new(Line::styled(format!("  {}", agent.label), style))
-        }));
-    }
-
-    if !app.spaces().is_empty() {
-        rows.push(ListItem::new(Line::styled(
-            "  -- spaces --",
-            Style::default().fg(Color::DarkGray),
-        )));
-        rows.extend(app.spaces().iter().map(|space| {
-            ListItem::new(Line::styled(
-                format!("  {}", space.label),
-                Style::default().fg(Color::Blue),
-            ))
-        }));
-    }
-
-    if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No agents running. SPC p r reviews a PR, SPC f f improves Vetinari.")
-                .block(block)
-                .wrap(Wrap { trim: true }),
-            area,
-        );
+fn render_recent(frame: &mut Frame, recent: &[String], area: Rect) {
+    if recent.is_empty() {
         return;
     }
-    frame.render_widget(List::new(rows).block(block), area);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![Line::styled("RECENT", dim.add_modifier(Modifier::BOLD))];
+    lines.extend(
+        recent
+            .iter()
+            .map(|action| Line::styled(action.clone(), dim)),
+    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_details(frame: &mut Frame, app: &App, area: Rect) {
-    let block = pane_block(app, Pane::Details, "");
     let details = app.details();
-    if details.is_empty() {
-        frame.render_widget(Paragraph::new("").block(block), area);
-        return;
-    }
     let lines: Vec<Line> = details
         .iter()
         .map(|(key, value)| {
@@ -243,35 +144,30 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect) {
             ])
         })
         .collect();
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centred(area, 90, height);
+    frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-        area,
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" Details "))
+            .wrap(Wrap { trim: true }),
+        popup,
     );
 }
 
-fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(message) = app.status() else {
-        return;
+fn render_bottom(frame: &mut Frame, app: &App, area: Rect) {
+    let line = match app.status() {
+        Some(message) => {
+            let style = match message.level {
+                Level::Info => Style::default().fg(Color::Green),
+                Level::Warn => Style::default().fg(Color::Yellow),
+                Level::Error => Style::default().fg(Color::Red),
+            };
+            Line::styled(message.text.clone(), style)
+        }
+        None => Line::styled(app.footer(), Style::default().fg(Color::DarkGray)),
     };
-    let style = match message.level {
-        Level::Info => Style::default().fg(Color::Green),
-        Level::Warn => Style::default().fg(Color::Yellow),
-        Level::Error => Style::default().fg(Color::Red),
-    };
-    frame.render_widget(
-        Paragraph::new(Line::styled(message.text.clone(), style)),
-        area,
-    );
-}
-
-fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            app.footer(),
-            Style::default().fg(Color::DarkGray),
-        )),
-        area,
-    );
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_which_key(frame: &mut Frame, which_key: &crate::app::WhichKeyView, area: Rect) {
@@ -315,8 +211,9 @@ fn centred(area: Rect, width_percent: u16, height: u16) -> Rect {
     vertical
 }
 
-fn render_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
+fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, area: Rect) {
     match overlay {
+        Overlay::Details => render_details(frame, app, area),
         Overlay::Prompt(prompt) => render_prompt(frame, prompt, area),
         Overlay::Menu(menu) => render_menu(frame, menu, area),
         Overlay::Form(form) => render_form(frame, form, area),
@@ -519,7 +416,7 @@ mod tests {
     use vetinari_core::domain::text::NonEmptyText;
     use vetinari_core::testing::polled;
 
-    use crate::app::{ObservedAgentRow, SessionRow, SpaceRow, StatusMessage, Update};
+    use crate::app::{StatusMessage, Update};
 
     const NOW: OffsetDateTime = datetime!(2026-10-21 09:00 UTC);
 
@@ -599,31 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_the_profile_and_the_keychain() {
+    fn the_queue_is_titled_with_the_profile() {
         let rendered = drawn(&app(), 100, 24);
-        assert!(rendered.contains("VETINARI"));
-        assert!(rendered.contains("Profile: Work"));
-        assert!(rendered.contains("Keychain: 2 authenticated"));
+        assert!(rendered.contains("Vetinari · Work"), "{rendered}");
     }
 
     #[test]
-    fn the_three_panes_are_all_titled() {
+    fn the_queue_is_the_only_pane() {
         let rendered = drawn(&app(), 100, 24);
-        assert!(rendered.contains("ATTENTION QUEUE"));
-        assert!(rendered.contains("WORKSPACE & AGENT MONITOR"));
-        assert!(rendered.contains("CONTEXT / DETAILS"));
-    }
-
-    #[test]
-    fn the_focused_pane_is_marked_so_the_developer_knows_where_keys_go() {
-        let mut app = app();
-        let rendered = drawn(&app, 100, 24);
-        assert!(rendered.contains("> ATTENTION QUEUE"));
-
-        press(&mut app, "l");
-        let rendered = drawn(&app, 100, 24);
-        assert!(rendered.contains("> WORKSPACE"));
-        assert!(!rendered.contains("> ATTENTION QUEUE"));
+        assert!(!rendered.contains("WORKSPACE"), "{rendered}");
+        assert!(!rendered.contains("CONTEXT / DETAILS"), "{rendered}");
     }
 
     #[test]
@@ -708,90 +590,77 @@ mod tests {
     }
 
     #[test]
-    fn the_monitor_lists_the_agents_vetinari_did_not_start_and_marks_a_blocked_one() {
-        let mut app = app();
-        app.apply(Update::ObservedAgents(vec![
-            ObservedAgentRow::from_observed(&vetinari_core::domain::agent::ObservedAgent::new(
-                vetinari_core::domain::ids::SpaceId::parse("w1:p1").expect("pane"),
-                Some(vetinari_core::domain::ids::SpaceId::parse("w1").expect("workspace")),
-                "claude",
-                vetinari_core::domain::agent::ObservedAgentState::Blocked,
-                vetinari_core::domain::workspace::TargetKind::Herdr,
-                None,
-            )),
-        ]));
-
-        let rendered = drawn(&app, 120, 30);
-
-        assert!(
-            rendered.contains("agents Vetinari did not start"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("herdr claude [w1] (blocked)"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn the_monitor_lists_sessions_and_spaces() {
-        let mut app = app();
-        app.apply(Update::Sessions(vec![SessionRow::from_session(
-            &vetinari_core::domain::agent::AgentSession::new(
-                vetinari_core::domain::ids::SessionId::parse("s1").expect("id"),
-                vetinari_core::domain::ids::AgentId::parse("claude-code").expect("id"),
-                &vetinari_core::domain::agent::TaskSpec::new(
-                    NonEmptyText::parse("writing tests").expect("prompt"),
-                    vetinari_core::domain::agent::TaskClass::DeepCodeChange,
-                    PathBuf::from("/repo"),
-                ),
-                NOW,
-            ),
-        )]));
-        app.apply(Update::Spaces(vec![SpaceRow::from_space(
-            &vetinari_core::domain::workspace::Space::new(
-                vetinari_core::domain::ids::SpaceId::parse("space-1").expect("id"),
-                vetinari_core::domain::workspace::SpaceName::sanitized("pr-142"),
-                PathBuf::from("/trees/pr-142"),
-                vetinari_core::domain::workspace::TargetKind::Herdr,
-            ),
-        )]));
-
-        let rendered = drawn(&app, 120, 30);
-
-        assert!(rendered.contains("claude-code: writing tests"));
-        assert!(rendered.contains("-- spaces --"));
-        assert!(rendered.contains("herdr"));
-    }
-
-    #[test]
-    fn an_idle_monitor_says_how_to_start_work() {
-        let rendered = drawn(&app(), 100, 24);
-        assert!(rendered.contains("No agents running"));
-    }
-
-    #[test]
-    fn the_details_pane_describes_the_selected_row() {
+    fn return_shows_the_details_of_the_selected_row_over_the_queue() {
         let mut app = app();
         press(&mut app, "j");
-        let rendered = drawn(&app, 120, 30);
-        assert!(rendered.contains("Title: Fix memory leak"));
-        assert!(rendered.contains("Author: developer"));
+        press(&mut app, "RET");
+
+        let rendered = drawn(&app, 100, 30);
+
+        assert!(rendered.contains("Title: Fix memory leak"), "{rendered}");
+        assert!(rendered.contains("Author: developer"), "{rendered}");
     }
 
     #[test]
-    fn the_footer_lists_the_headline_bindings() {
-        let rendered = drawn(&app(), 120, 24);
-        assert!(rendered.contains("SPC p r: PR Review"));
-        assert!(rendered.contains("SPC q: Quit"));
+    fn the_bottom_line_lists_the_headline_bindings() {
+        let rendered = drawn(&app(), 100, 24);
+        assert!(rendered.contains("SPC n: Next"), "{rendered}");
+        assert!(rendered.contains("RET: Details"), "{rendered}");
     }
 
     #[test]
-    fn a_status_message_is_shown_in_its_own_line() {
+    fn a_status_message_takes_the_place_of_the_key_hints() {
         let mut app = app();
         app.apply(Update::Status(StatusMessage::error("jira is unavailable")));
         let rendered = drawn(&app, 100, 24);
         assert!(rendered.contains("jira is unavailable"));
+        assert!(!rendered.contains("SPC n: Next"), "{rendered}");
+    }
+
+    #[test]
+    fn recent_actions_are_listed_under_the_queue() {
+        let mut app = app();
+        press(&mut app, "j");
+        press(&mut app, "SPC d p h");
+
+        let rendered = drawn(&app, 100, 24);
+
+        let row = rendered.find("[PR] Fix memory leak").expect("the row");
+        let recent = rendered.find("RECENT").expect("a recent heading");
+        let action = rendered
+            .find("09:00 parked: Fix memory leak")
+            .expect("the action");
+        assert!(row < recent && recent < action, "{rendered}");
+    }
+
+    #[test]
+    fn with_nothing_done_yet_there_is_no_recent_section() {
+        let rendered = drawn(&app(), 100, 24);
+        assert!(!rendered.contains("RECENT"), "{rendered}");
+    }
+
+    #[test]
+    fn the_selected_row_stays_in_view_in_a_short_panel() {
+        let mut app = app();
+        press(&mut app, "G");
+
+        let rendered = drawn(&app, 60, 5);
+
+        assert!(rendered.contains("> [PR] Fix memory leak"), "{rendered}");
+    }
+
+    #[test]
+    fn a_panel_the_size_of_a_zax_section_shows_the_queue_and_what_just_happened() {
+        let mut app = app();
+        press(&mut app, "SPC n");
+
+        let rendered = drawn(&app, 60, 12);
+
+        assert!(rendered.contains("> [CAL] Sprint planning"), "{rendered}");
+        assert!(
+            rendered.contains("09:00 taken: Sprint planning"),
+            "{rendered}"
+        );
     }
 
     #[test]
