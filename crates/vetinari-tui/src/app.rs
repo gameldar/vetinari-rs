@@ -29,7 +29,7 @@ use vetinari_core::domain::profile::{Profile, ProfileSet};
 use vetinari_core::domain::queue::Position;
 use vetinari_core::domain::queue::lifecycle::{Lifecycle, ParkUntil, Rule, WaitingOn};
 use vetinari_core::domain::queue::rules::QueueRules;
-use vetinari_core::domain::queue::{Decision, Entry, Happened, Note, ParkFor};
+use vetinari_core::domain::queue::{Decision, Entry, Happened, Note, ParkFor, Upstream};
 use vetinari_core::domain::skill::{Bindings, Skill, SkillLibrary};
 use vetinari_core::domain::text::NonEmptyText;
 use vetinari_core::domain::workspace::Space;
@@ -538,7 +538,7 @@ impl App {
     pub fn row_note(&self, row: &Row<'_>) -> Option<String> {
         let id = row.entry.item().id();
         let when = |at: OffsetDateTime| humanize(at - self.now);
-        match self.queue.queue().position(id)? {
+        let note = match self.queue.queue().position(id)? {
             Position::Held(Lifecycle::Parked {
                 until: ParkUntil::Time(at),
                 ..
@@ -556,6 +556,10 @@ impl App {
                 .returned()
                 .map(|returned| format!("back: {}", rule_label(returned.rule))),
             Position::Held(Lifecycle::Done { .. }) | Position::Active { .. } => None,
+        };
+        match gone_from(row.entry).filter(|_| row.lane != Lane::Done) {
+            Some(gone) => Some(note.map_or_else(|| gone.clone(), |note| format!("{gone}, {note}"))),
+            None => note,
         }
     }
 
@@ -665,10 +669,18 @@ impl App {
     /// The left of the header.
     #[must_use]
     pub fn header_left(&self) -> String {
-        format!(
+        let header = format!(
             "VETINARI v{VERSION} - [ Profile: {} ]",
             self.profile().name()
-        )
+        );
+        match self.queue.queue().focus() {
+            Some(focus) => format!(
+                "{header} [ Focus until {:02}:{:02} ]",
+                focus.until.hour(),
+                focus.until.minute()
+            ),
+            None => header,
+        }
     }
 
     /// The right of the header.
@@ -713,6 +725,9 @@ impl App {
         ];
         if let Some(returned) = row.entry.returned() {
             rows.push(("Came back".to_owned(), rule_label(returned.rule).to_owned()));
+        }
+        if let Some(gone) = gone_from(row.entry) {
+            rows.push(("Upstream".to_owned(), gone));
         }
         if let Some(author) = item.author() {
             rows.push(("Author".to_owned(), author.to_owned()));
@@ -1821,6 +1836,10 @@ const fn rule_label(rule: Rule) -> &'static str {
 }
 
 /// Nine the next morning, in the clock's own offset.
+fn gone_from(entry: &Entry) -> Option<String> {
+    (entry.upstream() == Upstream::Gone).then(|| format!("gone from {}", entry.item().source()))
+}
+
 fn tomorrow_morning(now: OffsetDateTime) -> OffsetDateTime {
     now.date()
         .next_day()
@@ -1946,6 +1965,10 @@ mod tests {
     }
 
     fn empty_app() -> App {
+        app_with_rules(QueueRules::default())
+    }
+
+    fn app_with_rules(rules: QueueRules) -> App {
         App::new(
             Keymap::doom_defaults(),
             ProfileSet::defaults(),
@@ -1954,7 +1977,7 @@ mod tests {
                 NonEmptyText::parse("vetinari").expect("name"),
                 PathBuf::from("/work/repos/vetinari"),
             ),
-            QueueRules::default(),
+            rules,
             200,
             NOW,
         )
@@ -2220,6 +2243,85 @@ mod tests {
         }]));
 
         assert_eq!(lane_of(&app, "Review spec"), Lane::Next);
+    }
+
+    #[test]
+    fn an_item_being_worked_on_says_when_its_source_drops_it() {
+        let mut app = app();
+        select_row(&mut app, "Fix memory leak in auth parser");
+        press(&mut app, "SPC d t");
+
+        app.apply(Update::Polled(vec![Polled {
+            source: source("github"),
+            outcome: Ok(Vec::new()),
+        }]));
+        select_row(&mut app, "Fix memory leak in auth parser");
+        let row = app.selected().expect("a row");
+
+        assert_eq!(row.lane, Lane::Now);
+        assert_eq!(app.row_note(&row).as_deref(), Some("gone from github"));
+        assert!(
+            app.details()
+                .iter()
+                .any(|(key, value)| key == "Upstream" && value == "gone from github")
+        );
+    }
+
+    #[test]
+    fn an_item_its_source_dropped_keeps_its_other_note() {
+        let mut app = app_with_rules(QueueRules {
+            close_when_gone: false,
+            ..QueueRules::default()
+        });
+        app.apply(Update::Polled(polled(vec![issue_item()])));
+        select_row(&mut app, "Review spec");
+        press(&mut app, "SPC d p h");
+
+        app.apply(Update::Polled(vec![Polled {
+            source: source("jira"),
+            outcome: Ok(Vec::new()),
+        }]));
+        let row = app
+            .rows()
+            .into_iter()
+            .find(|row| row.entry.item().title().as_str() == "Review spec")
+            .expect("a row");
+
+        assert_eq!(
+            app.row_note(&row).as_deref(),
+            Some("gone from jira, back in 1h")
+        );
+    }
+
+    #[test]
+    fn a_row_closed_because_its_source_dropped_it_needs_no_note() {
+        let mut app = app();
+
+        app.apply(Update::Polled(vec![Polled {
+            source: source("jira"),
+            outcome: Ok(Vec::new()),
+        }]));
+        let row = app
+            .rows()
+            .into_iter()
+            .find(|row| row.entry.item().title().as_str() == "Review spec")
+            .expect("a row");
+
+        assert_eq!(row.lane, Lane::Done);
+        assert_eq!(app.row_note(&row), None);
+    }
+
+    #[test]
+    fn the_header_says_when_focus_time_ends() {
+        let mut app = app();
+        assert!(!app.header_left().contains("Focus"));
+
+        press(&mut app, "SPC t f");
+
+        assert_eq!(
+            app.header_left(),
+            "VETINARI v0.1 - [ Profile: Work ] [ Focus until 10:00 ]"
+        );
     }
 
     #[test]
