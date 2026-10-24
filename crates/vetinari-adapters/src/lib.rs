@@ -9,6 +9,7 @@ pub mod autognomus;
 pub mod clock;
 pub mod config;
 pub mod credentials;
+pub mod devflow;
 pub mod git;
 pub mod oauth;
 pub mod runtime;

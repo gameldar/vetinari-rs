@@ -4,6 +4,7 @@ pub mod agents;
 pub mod attention;
 pub mod auth;
 pub mod config;
+pub mod devflow;
 pub mod keymap_engine;
 pub mod observed;
 pub mod ports;

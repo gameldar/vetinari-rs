@@ -424,7 +424,8 @@ template gets a strip without new code:
 ```
 crates/
   vetinari-core/src/
-    domain/devflow/             ids, template, compile, step, outcome, result, task, run_view
+    domain/devflow/             ids, template, compile, step, outcome, result, task, held,
+                                run_view; engine_rules (test-only)
     application/devflow/
       ports.rs                  TaskGateway, RunGateway, RunEvents, LeaseJournal, StepFiles
       launcher.rs               compile, register, start, refuse a second run per ticket
@@ -638,8 +639,8 @@ Pure, in `lease.rs`:
 ```rust
 /// When the next heartbeat is due: a third of the lease after the last extension.
 pub fn next_heartbeat(lease: LeaseSecs, extended_at: OffsetDateTime) -> OffsetDateTime;
-/// After a failed heartbeat: 2, 4, 8 s, capped at a sixth of the lease.
-pub fn retry_after(lease: LeaseSecs, failures: u32) -> Duration;
+/// After the n-th failed heartbeat in a row: 2, 4, 8 s, capped at a sixth of the lease.
+pub fn retry_after(lease: LeaseSecs, failures: NonZeroU32) -> Duration;
 ```
 
 With a 300 second lease that is a heartbeat every 100 seconds and two chances to fail before
@@ -725,10 +726,16 @@ pub struct HeldLease {
     pub expires_at: OffsetDateTime,
     pub queue: TaskQueue,
     pub step: StepKind,
-    pub state: HeldState,   // Starting | Running { session, worktree, space }
-                            // | AwaitingPerson | Completing { output }
+    pub state: HeldState,   // Starting | Running { session, worktree, space: Option<_> }
+                            // | AwaitingPerson | Completing { output: StepOutput }
 }
 ```
+
+`HeldLease` is a domain type (`domain/devflow/held.rs`); the file format is the adapter's own,
+versioned, with `output` stored as the `StepOutput` document. An entry that does not parse fails
+the whole load rather than being dropped, because a dropped entry is a lease nobody heartbeats.
+The path is the runtime's `state_dir` plus `vetinari/leases.json`, which is
+`$XDG_STATE_HOME/vetinari/leases.json` on Linux.
 
 On start, before any claim loop runs, the worker heartbeats every journal entry:
 

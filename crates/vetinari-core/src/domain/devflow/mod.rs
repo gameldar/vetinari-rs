@@ -8,6 +8,7 @@
 pub mod compile;
 #[cfg(test)]
 mod engine_rules;
+pub mod held;
 pub mod ids;
 pub mod outcome;
 pub mod result;
