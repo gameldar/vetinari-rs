@@ -110,7 +110,7 @@ impl CapturedContext {
         let _ = writeln!(out, "- Profile: {}", self.profile);
         let _ = writeln!(out, "- Mode: {}", self.mode.name());
         if let Some(row) = &self.selected_item {
-            let _ = writeln!(out, "- Selected feed row: {row}");
+            let _ = writeln!(out, "- Selected queue row: {row}");
         }
         if let Some(keys) = &self.pending_keys {
             let _ = writeln!(out, "- Pending key sequence: {keys}");

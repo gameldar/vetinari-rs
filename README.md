@@ -2,21 +2,26 @@
 
 An orchestrator for coding agents, attention, and technical leadership.
 
-Vetinari is a Rust TUI that puts one prioritised inbox in front of you -
+Vetinari is a Rust TUI that keeps one attention queue in front of you -
 pull requests, issues, messages, meetings, and the agents it has started on
 your behalf - and turns a keypress into the whole workflow behind it: cut a
-worktree, open a space, brief an agent, and tell you where it went.
+worktree, open a space, brief an agent, and tell you where it went. It is a
+single pane, sized to sit beside a workspace manager such as Herdr or inside
+a panel of a larger layout, which already shows spaces and agents.
 
 It is named after the Patrician of Ankh-Morpork, who kept the city running by
 knowing what deserved his attention and what did not.
 
 ## What it does
 
-- **One prioritised feed.** GitHub, Jira, Slack, Google Calendar, and running
-  agents in a single list, ranked by interruption cost: an agent waiting on an
-  answer is wasting time right now; a meeting in fifteen minutes cannot be
-  deferred; finished work sinks. That includes agents Vetinari did not start -
-  Herdr reports its own, and a blocked one ranks as highly as Vetinari's.
+- **One attention queue.** GitHub, Jira, Slack, Google Calendar, and running
+  agents in lanes - now, next, waiting, parked, done - ranked by interruption
+  cost: an agent waiting on an answer is wasting time right now; a meeting in
+  fifteen minutes cannot be deferred. What you decide about an item is kept
+  apart from what its source reports, and rules bring parked and waiting work
+  back when it needs you, saying why. That includes agents Vetinari did not
+  start - Herdr reports its own, and a blocked one ranks as highly as
+  Vetinari's. What recently moved items is listed under the queue.
 - **Doom Emacs keybindings.** Modal navigation (`hjkl`, `gg`, `G`, `/`) with a
   `<Space>` leader and a which-key popup, all rebindable in TOML or YAML.
 - **Workflows, not links.** `<Space> p r` on a pull request fetches its branch,
@@ -57,9 +62,14 @@ project; it defaults to the working directory.
 
 | Keys | Does |
 | :--- | :--- |
-| `hjkl`, `TAB` | move within a pane, and between panes |
-| `gg`, `G`, `C-d`, `C-u` | top, bottom, page down, page up |
-| `/`, `<Esc>` | filter the feed, clear the filter |
+| `jk`, `gg`, `G`, `C-d`, `C-u` | down, up, top, bottom, page down, page up |
+| `RET` | the selected item's details |
+| `/`, `<Esc>` | filter the queue, clear the filter |
+| `<Space> n` | take what needs you next |
+| `<Space> d t`, `<Space> d d`, `<Space> d x` | take, finish, silence the selected item |
+| `<Space> d p h`, `<Space> d p t`, `<Space> d p c` | park it for an hour, until tomorrow, until it changes |
+| `<Space> d w a`, `<Space> d w r` | wait on its agent, wait on a reply |
+| `<Space> t f` | focus time: hold messages back for an hour |
 | `?` | every binding in force |
 | `<Space> f f` | feedback / enhancement on this project |
 | `<Space> p r` | review the selected pull request in a worktree |
@@ -68,7 +78,7 @@ project; it defaults to the working directory.
 | `<Space> i u`, `<Space> i a`, `<Space> i s` | issue status, assign, standup summary |
 | `<Space> c r` | reply to a message |
 | `<Space> m m`, `<Space> m p`, `<Space> m s` | meetings, prepare, schedule |
-| `<Space> a a`, `<Space> a u`, `<Space> a c`, `<Space> a r`, `<Space> a l` | agents: menu, unblock, cancel, re-run, output |
+| `<Space> a a`, `<Space> a u`, `<Space> a c`, `<Space> a r`, `<Space> a l` | agents: menu, and unblock, cancel, re-run or show the output of the selected item's agent |
 | `<Space> w w`, `<Space> w s`, `<Space> w d`, `<Space> w r` | spaces: menu, focus, close, run the agent in its space |
 | `<Space> s e`, `<Space> s r` | edit a skill, run a skill |
 | `<Space> h a`, `<Space> h k` | credential wizard, help |
@@ -85,8 +95,8 @@ configuration Vetinari starts with the Doom keymap, work and home profiles, a
 Herdr and a tmux target, and no sources. YAML is accepted too.
 
 Credentials are scoped by the active profile's `account`, and everything
-agrees on which one that is: `vetinari auth`, `vetinari doctor`, the header,
-and the sources themselves. `--account` overrides it to set up a profile that
+agrees on which one that is: `vetinari auth`, `vetinari doctor`, the
+credential wizard, and the sources themselves. `--account` overrides it to set up a profile that
 is not the active one.
 
 Problems are reported all at once, with the path of each: a typo in a key
@@ -129,10 +139,10 @@ Stated plainly, since the configuration mentions some of it:
 - **Converting a message into a ticket** (`<Space> c t`) is refused with a
   message rather than half-done - creating an issue needs a write API Vetinari
   does not have yet.
-- **Herdr's events.** Vetinari speaks Herdr's documented socket API
-  (`workspace.*`, `pane.*`, `agent.list`) but polls it on the refresh
-  interval rather than subscribing with `events.subscribe`, so a workspace
-  that opens between refreshes appears late.
+- **Herdr's workspace events.** Vetinari subscribes to Herdr's agent events
+  (status changes, agents appearing, panes closing) and re-polls its agents
+  as soon as one arrives, but workspaces are still polled on the refresh
+  interval, so a workspace that opens between refreshes appears late.
 - **Herdr's agents can be seen but not driven.** They are listed and ranked;
   `agent.prompt` and `agent.wait` are not wired up, so `<Space> a u` and
   `<Space> a c` still only act on agents Vetinari started.

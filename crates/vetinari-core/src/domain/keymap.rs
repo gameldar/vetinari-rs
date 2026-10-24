@@ -255,12 +255,6 @@ impl Keymap {
             ("k", Action::NavUp),
             ("<Down>", Action::NavDown),
             ("<Up>", Action::NavUp),
-            ("h", Action::PaneLeft),
-            ("l", Action::PaneRight),
-            ("<Left>", Action::PaneLeft),
-            ("<Right>", Action::PaneRight),
-            ("TAB", Action::PaneNext),
-            ("S-TAB", Action::PanePrev),
             ("g g", Action::NavTop),
             ("G", Action::NavBottom),
             ("C-d", Action::NavPageDown),
@@ -270,6 +264,16 @@ impl Keymap {
             ("RET", Action::Select),
             ("r", Action::Refresh),
             ("?", Action::Help),
+            ("SPC n", Action::QueueTakeNext),
+            ("SPC d t", Action::QueueTake),
+            ("SPC d d", Action::QueueFinish),
+            ("SPC d x", Action::QueueSilence),
+            ("SPC d p h", Action::QueueParkHour),
+            ("SPC d p t", Action::QueueParkTomorrow),
+            ("SPC d p c", Action::QueueParkChanged),
+            ("SPC d w a", Action::QueueWaitAgent),
+            ("SPC d w r", Action::QueueWaitReply),
+            ("SPC t f", Action::FocusToggle),
             ("SPC f f", Action::FeedbackOpen),
             ("SPC f r", Action::FeedbackSubmitLast),
             ("SPC p r", Action::PrReviewSpawn),
@@ -302,6 +306,10 @@ impl Keymap {
             ("SPC q", Action::Quit),
         ];
         const GROUPS: &[(&str, &str)] = &[
+            ("SPC d", "+decide"),
+            ("SPC d p", "+park"),
+            ("SPC d w", "+wait"),
+            ("SPC t", "+toggle"),
             ("SPC f", "+feedback"),
             ("SPC p", "+project/profile"),
             ("SPC i", "+issues"),
@@ -347,6 +355,37 @@ mod tests {
 
     fn chord(raw: &str) -> KeyChord {
         KeyChord::parse(raw).expect("chord")
+    }
+
+    #[test]
+    fn the_queue_is_driven_from_the_leader() {
+        let keymap = Keymap::doom_defaults();
+        for (spelling, action) in [
+            ("SPC n", Action::QueueTakeNext),
+            ("SPC d t", Action::QueueTake),
+            ("SPC d d", Action::QueueFinish),
+            ("SPC d x", Action::QueueSilence),
+            ("SPC d p h", Action::QueueParkHour),
+            ("SPC d p t", Action::QueueParkTomorrow),
+            ("SPC d p c", Action::QueueParkChanged),
+            ("SPC d w a", Action::QueueWaitAgent),
+            ("SPC d w r", Action::QueueWaitReply),
+            ("SPC t f", Action::FocusToggle),
+        ] {
+            assert_eq!(
+                keymap.lookup(Mode::Normal, seq(spelling).chords()),
+                Lookup::Action(action),
+                "{spelling}"
+            );
+        }
+        let Lookup::Prefix(candidates) = keymap.lookup(Mode::Normal, seq("SPC").chords()) else {
+            panic!("expected a prefix");
+        };
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.chord.to_string() == "d" && candidate.label == "+decide")
+        );
     }
 
     #[test]
@@ -519,8 +558,6 @@ mod tests {
         for (sequence, action) in [
             ("j", Action::NavDown),
             ("k", Action::NavUp),
-            ("h", Action::PaneLeft),
-            ("l", Action::PaneRight),
             ("g g", Action::NavTop),
             ("G", Action::NavBottom),
             ("/", Action::FilterStart),

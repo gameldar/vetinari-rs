@@ -394,6 +394,8 @@ pub enum Overlay {
     Form(Form),
     /// A block of text.
     Text(TextView),
+    /// The details of the selected row, drawn from the queue as it stands.
+    Details,
     /// A device-code challenge.
     DeviceCode(DeviceCodeView),
 }

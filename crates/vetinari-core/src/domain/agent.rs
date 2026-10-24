@@ -475,6 +475,7 @@ pub struct ObservedAgent {
     state: ObservedAgentState,
     target: TargetKind,
     source: Option<String>,
+    title: Option<NonEmptyText>,
 }
 
 impl ObservedAgent {
@@ -495,7 +496,21 @@ impl ObservedAgent {
             state,
             target,
             source,
+            title: None,
         }
+    }
+
+    /// What the target says it is working on.
+    #[must_use]
+    pub fn with_title(mut self, title: NonEmptyText) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    /// What the target says it is working on, when it says.
+    #[must_use]
+    pub const fn title(&self) -> Option<&NonEmptyText> {
+        self.title.as_ref()
     }
 
     /// The terminal it occupies, which is how the target addresses it.
@@ -753,11 +768,11 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_observed_agent_is_not_actionable() {
-        assert!(ObservedAgentState::Blocked.as_item_state().is_actionable());
-        assert!(ObservedAgentState::Working.as_item_state().is_actionable());
-        assert!(!ObservedAgentState::Done.as_item_state().is_actionable());
-        assert!(!ObservedAgentState::Idle.as_item_state().is_actionable());
+    fn an_observed_agent_needs_you_once_it_is_blocked_or_done() {
+        assert!(ObservedAgentState::Blocked.as_item_state().needs_you());
+        assert!(!ObservedAgentState::Working.as_item_state().needs_you());
+        assert!(ObservedAgentState::Done.as_item_state().needs_you());
+        assert!(!ObservedAgentState::Idle.as_item_state().needs_you());
     }
 
     #[test]

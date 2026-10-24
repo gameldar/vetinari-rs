@@ -5,17 +5,16 @@
 //! the controller performs, and nothing in between holds a terminal.
 
 use vetinari_adapters::Runtime;
+use vetinari_core::application::attention::Polled;
 use vetinari_core::application::observed::ObservedAgents;
 use vetinari_core::application::ports::{DeviceCodeChallenge, DeviceCodePoll, PortResult};
 use vetinari_core::application::workflows::WorkflowOutcome;
 use vetinari_core::domain::credentials::Provider;
-use vetinari_core::domain::ids::SourceId;
+use vetinari_core::domain::ids::{ItemId, SourceId};
 use vetinari_core::domain::profile::Profile;
 use vetinari_core::domain::skill::SkillLibrary;
 
-use crate::app::{
-    ObservedAgentRow, SessionRow, SpaceRow, StatusMessage, Task, Update, describe_failure,
-};
+use crate::app::{SessionRow, SpaceRow, StatusMessage, Task, Update, describe_failure};
 
 /// Performs work against the adapters.
 pub struct Controller {
@@ -65,37 +64,15 @@ impl Controller {
             .agents
             .prune_finished(Self::FINISHED_SESSIONS_KEPT);
 
-        // The agents a target is running on its own: Vetinari cannot control
-        // them, but a blocked one is still the most expensive thing in the
-        // inbox, so it is ranked alongside the rest.
-        let observation = self.runtime.observed.poll().await;
-        for (kind, error) in &observation.problems {
-            updates.push(Update::Log(format!(
-                "WARN target {kind} could not list its agents: {error}"
-            )));
-        }
+        let observed = self.poll_observed(&mut updates).await;
 
-        let mut feed = self.runtime.attention.refresh(profile).await;
-        let mut agent_items = self.runtime.agents.attention_items();
-        agent_items.extend(ObservedAgents::attention_items(&observation.agents));
-        if !agent_items.is_empty() {
-            let mut items = feed.items().to_vec();
-            items.extend(agent_items);
-            feed = vetinari_core::application::attention::Feed::new(
-                items,
-                feed.problems().to_vec(),
-                feed.refreshed_at(),
-            );
-        }
-        updates.push(Update::Feed(feed));
-
-        updates.push(Update::ObservedAgents(
-            observation
-                .agents
-                .iter()
-                .map(ObservedAgentRow::from_observed)
-                .collect(),
-        ));
+        let mut polled = self.runtime.attention.poll(profile).await;
+        polled.push(Polled {
+            source: self.runtime.agents.source_id().clone(),
+            outcome: Ok(self.runtime.agents.attention_items()),
+        });
+        polled.extend(observed);
+        updates.push(Update::Polled(polled));
 
         updates.push(Update::Sessions(
             self.runtime
@@ -121,6 +98,41 @@ impl Controller {
         updates
     }
 
+    /// Poll only the agents the targets are running, for when one of them
+    /// announces a change between regular refreshes.
+    pub async fn refresh_agents(&mut self) -> Vec<Update> {
+        let mut updates = Vec::new();
+        if let Some(polled) = self.poll_observed(&mut updates).await {
+            updates.push(Update::Polled(vec![polled]));
+        }
+        updates
+    }
+
+    /// The targets that report their own agents, to wait on for changes
+    /// without holding the controller.
+    #[must_use]
+    pub fn agent_watch(&self) -> ObservedAgents {
+        self.runtime.observed.clone()
+    }
+
+    // The agents a target is running on its own: Vetinari cannot control
+    // them, but a blocked one is still the most expensive thing in the
+    // inbox, so it is ranked alongside the rest.
+    async fn poll_observed(&self, updates: &mut Vec<Update>) -> Option<Polled> {
+        let observation = self.runtime.observed.poll().await;
+        for (kind, error) in &observation.problems {
+            updates.push(Update::Log(format!(
+                "WARN target {kind} could not list its agents: {error}"
+            )));
+        }
+        // A target that could not list its agents has been logged, and
+        // leaving the source out keeps its agents rather than closing them.
+        observation.problems.is_empty().then(|| Polled {
+            source: ObservedAgents::source_id(),
+            outcome: Ok(ObservedAgents::attention_items(&observation.agents)),
+        })
+    }
+
     /// Run one task.
     pub async fn run(&mut self, task: Task, profile: &Profile) -> Vec<Update> {
         match task {
@@ -132,20 +144,21 @@ impl Controller {
                     .workflows
                     .start_feedback(&request, &self.library, profile, &mut self.runtime.agents)
                     .await;
-                self.after_workflow("feedback", outcome, profile).await
+                self.after_workflow("feedback", outcome, None).await
             }
 
-            Task::StartPrReview(pr) => {
+            Task::StartPrReview { pr, item } => {
                 let outcome = self
                     .runtime
                     .workflows
                     .start_pr_review(&pr, &self.library, profile, &mut self.runtime.agents)
                     .await;
-                self.after_workflow(&format!("review of #{}", pr.number), outcome, profile)
+                self.after_workflow(&format!("review of #{}", pr.number), outcome, Some(item))
                     .await
             }
 
             Task::MeetingPrep {
+                item,
                 title,
                 event,
                 starts_at,
@@ -162,7 +175,7 @@ impl Controller {
                         &mut self.runtime.agents,
                     )
                     .await;
-                self.after_workflow(&format!("preparation for {title}"), outcome, profile)
+                self.after_workflow(&format!("preparation for {title}"), outcome, Some(item))
                     .await
             }
 
@@ -178,7 +191,7 @@ impl Controller {
                         &mut self.runtime.agents,
                     )
                     .await;
-                self.after_workflow(&format!("skill {id}"), outcome, profile)
+                self.after_workflow(&format!("skill {id}"), outcome, None)
                     .await
             }
 
@@ -436,7 +449,7 @@ impl Controller {
         &mut self,
         what: &str,
         outcome: PortResult<WorkflowOutcome>,
-        profile: &Profile,
+        for_item: Option<ItemId>,
     ) -> Vec<Update> {
         match outcome {
             Ok(outcome) => {
@@ -467,9 +480,14 @@ impl Controller {
                     ))
                 };
                 updates.push(Update::Status(message));
+                if let Some(item) = for_item {
+                    updates.push(Update::AgentStarted {
+                        item,
+                        session: outcome.session.clone(),
+                    });
+                }
                 updates.push(self.session_list());
                 updates.extend(self.space_list().await);
-                let _ = profile;
                 updates
             }
             Err(error) => vec![Update::Status(describe_failure(what, &error))],
@@ -524,12 +542,15 @@ mod tests {
     use time::macros::datetime;
     use vetinari_adapters::git::GitWorktreeManager;
     use vetinari_adapters::{HttpClient, Paths};
+    use vetinari_core::application::agents::AgentRegistry;
     use vetinari_core::application::config::{Config, ParseContext, RawConfig};
+    use vetinari_core::application::queue::QueueService;
     use vetinari_core::domain::attention::{IssueRef, MessageRef, PullRequestRef};
     use vetinari_core::domain::credentials::Secret;
     use vetinari_core::domain::feedback::{CapturedContext, FeedbackRequest, FeedbackTarget};
     use vetinari_core::domain::ids::{ProfileId, SessionId, SkillId};
     use vetinari_core::domain::keymap::Mode;
+    use vetinari_core::domain::queue::rules::QueueRules;
     use vetinari_core::domain::skill::Bindings;
     use vetinari_core::domain::text::NonEmptyText;
     use vetinari_core::testing::{
@@ -699,7 +720,7 @@ mod tests {
                             .to_owned(),
                             "agent.list" => concat!(
                                 r#"{"agents":[{"pane_id":"w1:p1","workspace_id":"w1","#,
-                                r#""agent":"claude","status":"blocked"}]}"#
+                                r#""agent":"claude","agent_status":"blocked"}]}"#
                             )
                             .to_owned(),
                             _ => "{}".to_owned(),
@@ -724,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refresh_lists_the_agents_herdr_is_running_and_ranks_a_blocked_one_first() {
+    async fn a_refresh_queues_the_agents_herdr_is_running_and_ranks_a_blocked_one_first() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("herdr.sock");
         fake_herdr(socket.clone());
@@ -735,26 +756,10 @@ mod tests {
 
         let updates = h.controller.refresh(&h.profile).await;
 
-        let observed = updates
-            .iter()
-            .find_map(|update| match update {
-                Update::ObservedAgents(agents) => Some(agents.clone()),
-                _ => None,
-            })
-            .expect("the agents herdr is running");
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].label, "herdr claude [w1] (blocked)");
-        assert!(observed[0].blocked);
-
-        let feed = updates
-            .iter()
-            .find_map(|update| match update {
-                Update::Feed(feed) => Some(feed.clone()),
-                _ => None,
-            })
-            .expect("a feed");
-        // A feed is built in priority order, so the head of it is the ranking.
-        let first = feed.items().first().expect("at least one item");
+        let mut queue = QueueService::new(QueueRules::default());
+        queue.absorb(NOW, polled_of(&updates));
+        let view = queue.view(NOW);
+        let first = view.next.first().expect("at least one item").entry.item();
         assert_eq!(
             first.state(),
             vetinari_core::domain::attention::ItemState::AgentWaiting,
@@ -776,12 +781,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_refresh_polls_only_the_agents_herdr_is_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("herdr.sock");
+        fake_herdr(socket.clone());
+        let mut h = harness(&format!(
+            "\n[targets.herdr]\nsocket = \"{}\"\n",
+            socket.display()
+        ));
+
+        let updates = h.controller.refresh_agents().await;
+
+        let polled = polled_of(&updates);
+        assert_eq!(polled.len(), 1, "{polled:?}");
+        assert_eq!(polled[0].source, ObservedAgents::source_id());
+        let items = polled[0].outcome.as_ref().expect("agents");
+        assert!(items[0].title().as_str().contains("claude in w1"));
+        assert!(
+            !updates.iter().any(|u| matches!(u, Update::Spaces(_))),
+            "an agent refresh leaves the other sources to the regular poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_refresh_that_cannot_reach_herdr_keeps_its_agents_and_logs_why() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut h = harness(&format!(
+            "\n[targets.herdr]\nsocket = \"{}\"\n",
+            dir.path().join("absent.sock").display()
+        ));
+
+        let updates = h.controller.refresh_agents().await;
+
+        assert!(!updates.iter().any(|u| matches!(u, Update::Polled(_))));
+        assert!(
+            updates.iter().any(
+                |u| matches!(u, Update::Log(line) if line.contains("could not list its agents"))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agent_watch_is_over_the_targets_that_report_agents() {
+        let h = harness("\n[targets.herdr]\nsocket = \"/nowhere/herdr.sock\"\n");
+
+        assert_eq!(
+            h.controller.agent_watch().targets(),
+            vec![vetinari_core::domain::workspace::TargetKind::Herdr]
+        );
+    }
+
+    #[tokio::test]
     async fn a_refresh_reports_the_feed_the_sessions_the_spaces_and_the_keychain() {
         let mut h = harness("");
 
         let updates = h.controller.refresh(&h.profile).await;
 
-        assert!(updates.iter().any(|u| matches!(u, Update::Feed(_))));
+        assert!(updates.iter().any(|u| matches!(u, Update::Polled(_))));
         assert!(updates.iter().any(|u| matches!(u, Update::Sessions(_))));
         assert!(updates.iter().any(|u| matches!(u, Update::Spaces(_))));
         assert!(updates.iter().any(|u| matches!(u, Update::Keychain(_))));
@@ -848,7 +904,36 @@ mod tests {
             clone_url: "https://github.test/acme/web.git".to_owned(),
         };
 
-        let updates = h.controller.run(Task::StartPrReview(pr), &h.profile).await;
+        let item = ItemId::from_parts(&SourceId::parse("github").expect("id"), "acme/web#142");
+
+        let updates = h
+            .controller
+            .run(
+                Task::StartPrReview {
+                    pr,
+                    item: item.clone(),
+                },
+                &h.profile,
+            )
+            .await;
+
+        let session = h
+            .controller
+            .runtime()
+            .agents
+            .sessions()
+            .first()
+            .expect("a session")
+            .id()
+            .clone();
+        assert!(
+            updates.iter().any(|update| matches!(
+                update,
+                Update::AgentStarted { item: for_item, session: started }
+                    if *for_item == item && *started == session
+            )),
+            "the item is handed to the agent reviewing it"
+        );
 
         let session_dir = h
             .controller
@@ -1218,17 +1303,25 @@ mod tests {
 
         let updates = h.controller.refresh(&h.profile).await;
 
-        let Some(Update::Feed(feed)) = updates
-            .iter()
-            .find(|u| matches!(u, Update::Feed(_)))
-            .cloned()
-        else {
-            panic!("expected a feed");
-        };
-        assert_eq!(feed.len(), 1, "the running agent is a feed row of its own");
+        let agents = polled_of(&updates)
+            .into_iter()
+            .find(|polled| polled.source.as_str() == AgentRegistry::SOURCE_NAME)
+            .expect("the agents answer every poll");
+        let items = agents.outcome.expect("agents always answer");
+        assert_eq!(items.len(), 1, "the running agent is an item of its own");
         assert_eq!(
-            feed.items()[0].category(),
+            items[0].category(),
             vetinari_core::domain::attention::SourceCategory::AgentState
         );
+    }
+
+    fn polled_of(updates: &[Update]) -> Vec<Polled> {
+        updates
+            .iter()
+            .find_map(|update| match update {
+                Update::Polled(polled) => Some(polled.clone()),
+                _ => None,
+            })
+            .expect("a poll")
     }
 }

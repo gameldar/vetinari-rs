@@ -1,0 +1,20 @@
+# Vetinari pointed at fakegh.py only: no herdr, no real credentials, a fast refresh.
+
+[general]
+profile = "drive"
+refresh_secs = 2
+
+[[profiles]]
+id = "drive"
+name = "Drive"
+target = "tmux"
+sources = ["github"]
+account = "drive"
+
+[targets.tmux]
+session = "vetinari-drive"
+
+[sources.github]
+kind = "github"
+query = "is:open is:pr review-requested:@me"
+base_url = "http://127.0.0.1:8765"

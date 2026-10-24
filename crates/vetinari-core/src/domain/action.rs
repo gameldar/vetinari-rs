@@ -74,13 +74,20 @@ actions! {
     NavBottom => "nav-bottom", "Jump to last entry";
     NavPageDown => "nav-page-down", "Scroll down a page";
     NavPageUp => "nav-page-up", "Scroll up a page";
-    PaneLeft => "pane-left", "Focus pane to the left";
-    PaneRight => "pane-right", "Focus pane to the right";
-    PaneNext => "pane-next", "Focus next pane";
-    PanePrev => "pane-prev", "Focus previous pane";
-    FilterStart => "filter-start", "Filter the feed";
+    FilterStart => "filter-start", "Filter the queue";
     FilterClear => "filter-clear", "Clear the filter";
     Select => "select", "Open the selected entry";
+
+    QueueTakeNext => "queue-take-next", "Take what needs you next";
+    QueueTake => "queue-take", "Work on this";
+    QueueFinish => "queue-finish", "Finish";
+    QueueSilence => "queue-silence", "Silence";
+    QueueParkHour => "queue-park-hour", "Park for an hour";
+    QueueParkTomorrow => "queue-park-tomorrow", "Park until tomorrow";
+    QueueParkChanged => "queue-park-changed", "Park until it changes";
+    QueueWaitAgent => "queue-wait-agent", "Wait on its agent";
+    QueueWaitReply => "queue-wait-reply", "Wait on a reply";
+    FocusToggle => "focus-toggle", "Toggle focus time";
 
     FeedbackOpen => "feedback-open", "Feedback / enhancement";
     FeedbackSubmitLast => "feedback-submit-last", "Re-run last feedback task";
