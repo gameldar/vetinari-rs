@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 use vetinari_adapters::config::{LoadedConfig, load_or_default};
 use vetinari_adapters::{Paths, Runtime};
 use vetinari_core::application::config::ParseContext;
+use vetinari_core::application::observed::ObservedAgents;
 use vetinari_core::application::ports::{Clock, DeviceCodeChallenge, DeviceCodePoll};
 use vetinari_core::domain::credentials::{Provider, Secret};
 use vetinari_core::domain::feedback::FeedbackTarget;
@@ -332,6 +333,7 @@ async fn event_loop(
     tick: Duration,
     refresh_every: Duration,
 ) -> Fallible<()> {
+    let mut agent_changes = watch_agents(controller.agent_watch());
     let controller = Arc::new(Mutex::new(controller));
     let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<Vec<Update>>();
     let mut keys = EventStream::new();
@@ -354,6 +356,7 @@ async fn event_loop(
             }
             _ = ticker.tick() => app.apply(Update::Tick(clock.now())),
             _ = refresher.tick() => spawn_refresh(&controller, app, &updates_tx),
+            Some(()) = agent_changes.recv() => spawn_agent_refresh(&controller, &updates_tx),
             _ = device_poll.tick() => {
                 if let Some((provider, challenge)) = pending_device_code(app) {
                     spawn_device_poll(&controller, app, &updates_tx, provider, challenge);
@@ -401,6 +404,40 @@ fn spawn_refresh(
     let sender = updates.clone();
     tokio::spawn(async move {
         let batch = controller.lock().await.refresh(&profile).await;
+        let _ = sender.send(batch);
+    });
+}
+
+/// Announce each change a target reports to its agents, so they are
+/// re-polled straight away rather than on the next refresh.
+fn watch_agents(watch: ObservedAgents) -> mpsc::UnboundedReceiver<()> {
+    // A target that is not there fails at once; the regular refresh reports
+    // why, so the watch just tries again later.
+    const RETRY: Duration = Duration::from_secs(5);
+
+    let (changes_tx, changes_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            if watch.changed().await.is_err() {
+                tokio::time::sleep(RETRY).await;
+                continue;
+            }
+            if changes_tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    changes_rx
+}
+
+fn spawn_agent_refresh(
+    controller: &Arc<Mutex<Controller>>,
+    updates: &mpsc::UnboundedSender<Vec<Update>>,
+) {
+    let controller = controller.clone();
+    let sender = updates.clone();
+    tokio::spawn(async move {
+        let batch = controller.lock().await.refresh_agents().await;
         let _ = sender.send(batch);
     });
 }

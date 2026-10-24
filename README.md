@@ -139,10 +139,10 @@ Stated plainly, since the configuration mentions some of it:
 - **Converting a message into a ticket** (`<Space> c t`) is refused with a
   message rather than half-done - creating an issue needs a write API Vetinari
   does not have yet.
-- **Herdr's events.** Vetinari speaks Herdr's documented socket API
-  (`workspace.*`, `pane.*`, `agent.list`) but polls it on the refresh
-  interval rather than subscribing with `events.subscribe`, so a workspace
-  that opens between refreshes appears late.
+- **Herdr's workspace events.** Vetinari subscribes to Herdr's agent events
+  (status changes, agents appearing, panes closing) and re-polls its agents
+  as soon as one arrives, but workspaces are still polled on the refresh
+  interval, so a workspace that opens between refreshes appears late.
 - **Herdr's agents can be seen but not driven.** They are listed and ranked;
   `agent.prompt` and `agent.wait` are not wired up, so `<Space> a u` and
   `<Space> a c` still only act on agents Vetinari started.

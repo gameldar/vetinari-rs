@@ -374,6 +374,7 @@ pub struct FakeExternalAgentSource {
     target: TargetKind,
     agents: Mutex<Vec<ObservedAgent>>,
     failure: Mutex<Option<PortError>>,
+    announces: bool,
 }
 
 impl FakeExternalAgentSource {
@@ -384,6 +385,7 @@ impl FakeExternalAgentSource {
             target,
             agents: Mutex::new(agents),
             failure: Mutex::new(None),
+            announces: false,
         }
     }
 
@@ -394,12 +396,20 @@ impl FakeExternalAgentSource {
             target,
             agents: Mutex::new(Vec::new()),
             failure: Mutex::new(Some(error)),
+            announces: false,
         }
     }
 
     /// Change what it can see.
     pub fn set_agents(&self, agents: Vec<ObservedAgent>) {
         *self.agents.lock().expect("agents lock") = agents;
+    }
+
+    /// Report a change whenever asked to wait for one.
+    #[must_use]
+    pub const fn announcing(mut self) -> Self {
+        self.announces = true;
+        self
     }
 }
 
@@ -414,6 +424,14 @@ impl ExternalAgentSource for FakeExternalAgentSource {
             return Err(error);
         }
         Ok(self.agents.lock().expect("agents lock").clone())
+    }
+
+    async fn changed(&self) -> PortResult<()> {
+        if self.announces {
+            Ok(())
+        } else {
+            std::future::pending().await
+        }
     }
 }
 

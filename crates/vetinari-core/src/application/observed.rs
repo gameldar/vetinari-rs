@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use super::ports::{ExternalAgentSource, PortError};
+use futures::future::select_all;
+
+use super::ports::{ExternalAgentSource, PortError, PortResult};
 use crate::domain::agent::ObservedAgent;
 use crate::domain::attention::{AttentionItem, SourceCategory};
 use crate::domain::ids::SourceId;
@@ -25,7 +27,7 @@ pub struct Observation {
 }
 
 /// The workspace targets that report their own agents.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ObservedAgents {
     sources: Vec<Arc<dyn ExternalAgentSource>>,
 }
@@ -64,6 +66,18 @@ impl ObservedAgents {
             }
         }
         observation
+    }
+
+    /// Wait until any target announces a change to its agents.
+    ///
+    /// Never returns when no target can announce one.
+    pub async fn changed(&self) -> PortResult<()> {
+        if self.sources.is_empty() {
+            return std::future::pending().await;
+        }
+        select_all(self.sources.iter().map(|source| source.changed()))
+            .await
+            .0
     }
 
     /// The feed source id used for observed agents.
@@ -125,6 +139,7 @@ mod tests {
     use crate::domain::attention::ItemState;
     use crate::domain::ids::SpaceId;
     use crate::testing::FakeExternalAgentSource;
+    use futures::FutureExt;
 
     fn agent(pane: &str, workspace: Option<&str>, state: ObservedAgentState) -> ObservedAgent {
         ObservedAgent::new(
@@ -183,6 +198,34 @@ mod tests {
         assert_eq!(observation.agents.len(), 1);
         assert_eq!(observation.problems.len(), 1);
         assert_eq!(observation.problems[0].0, TargetKind::Herdr);
+    }
+
+    #[test]
+    fn a_change_any_target_announces_ends_the_wait() {
+        let mut observed = ObservedAgents::default();
+        observed.register(Arc::new(FakeExternalAgentSource::new(
+            TargetKind::Tmux,
+            Vec::new(),
+        )));
+        observed.register(Arc::new(
+            FakeExternalAgentSource::new(TargetKind::Herdr, Vec::new()).announcing(),
+        ));
+
+        let heard = observed.clone().changed().now_or_never();
+
+        assert!(matches!(heard, Some(Ok(()))), "{heard:?}");
+    }
+
+    #[test]
+    fn targets_that_cannot_announce_changes_leave_the_wait_to_the_poll() {
+        let mut observed = ObservedAgents::default();
+        assert!(observed.changed().now_or_never().is_none());
+
+        observed.register(Arc::new(FakeExternalAgentSource::new(
+            TargetKind::Tmux,
+            Vec::new(),
+        )));
+        assert!(observed.changed().now_or_never().is_none());
     }
 
     #[test]

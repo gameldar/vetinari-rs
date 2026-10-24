@@ -30,8 +30,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use vetinari_core::application::ports::{
     ExternalAgentSource, PortError, PortResult, WorkspaceTarget,
 };
@@ -122,6 +123,13 @@ pub struct HerdrSocketTarget {
     socket: PathBuf,
     timeout: Duration,
     next_id: Arc<AtomicU64>,
+}
+
+/// A connection whose request has been answered, held open for events.
+struct Connection {
+    lines: Lines<BufReader<OwnedReadHalf>>,
+    // Dropping the write half would tell Herdr this client is done.
+    _write_half: OwnedWriteHalf,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,6 +233,17 @@ impl HerdrSocketTarget {
         method: &'static str,
         params: serde_json::Value,
     ) -> PortResult<serde_json::Value> {
+        let (result, _connection) = self.open(method, params).await?;
+        Ok(result)
+    }
+
+    /// Send one request and read its reply, keeping the connection for
+    /// whatever Herdr sends on it next.
+    async fn open(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> PortResult<(serde_json::Value, Connection)> {
         let id = format!("vetinari-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
 
         let stream = UnixStream::connect(&self.socket).await.map_err(|error| {
@@ -277,7 +296,11 @@ impl HerdrSocketTarget {
             if let Some(error) = reply.error {
                 return Err(map_error(method, &error));
             }
-            return Ok(reply.result.unwrap_or(serde_json::Value::Null));
+            let connection = Connection {
+                lines,
+                _write_half: write_half,
+            };
+            return Ok((reply.result.unwrap_or(serde_json::Value::Null), connection));
         }
     }
 
@@ -470,6 +493,45 @@ impl ExternalAgentSource for HerdrSocketTarget {
         let raw: Vec<RawAgent> = list_of(&result, "agents", "agent list")?;
         Ok(raw.into_iter().filter_map(observed).collect())
     }
+
+    /// Herdr only announces status changes pane by pane, so this subscribes
+    /// to each agent listed now, plus panes gaining an agent or going away,
+    /// and returns on the first event of any kind.
+    async fn changed(&self) -> PortResult<()> {
+        let result = self.call("agent.list", serde_json::json!({})).await?;
+        let raw: Vec<RawAgent> = list_of(&result, "agents", "agent list")?;
+
+        let mut subscriptions: Vec<serde_json::Value> =
+            ["pane.agent_detected", "pane.closed", "pane.exited"]
+                .into_iter()
+                .map(|kind| serde_json::json!({ "type": kind }))
+                .collect();
+        subscriptions.extend(
+            raw.iter()
+                .filter(|agent| !agent.pane_id.is_empty())
+                .map(|agent| {
+                    serde_json::json!({
+                        "type": "pane.agent_status_changed",
+                        "pane_id": agent.pane_id,
+                    })
+                }),
+        );
+
+        let (_, mut connection) = self
+            .open(
+                "events.subscribe",
+                serde_json::json!({ "subscriptions": subscriptions }),
+            )
+            .await?;
+        match connection.lines.next_line().await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(PortError::unavailable(
+                "herdr",
+                "the event subscription closed",
+            )),
+            Err(error) => Err(PortError::unavailable("herdr", error.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -494,6 +556,16 @@ mod tests {
     impl FakeHerdr {
         /// Serve `results` by method name, on a socket, until dropped.
         fn serve(socket: PathBuf, results: HashMap<&'static str, serde_json::Value>) -> Self {
+            Self::serve_events(socket, results, Vec::new(), Afterwards::Hold)
+        }
+
+        /// As [`Self::serve`], sending `events` once a subscription starts.
+        fn serve_events(
+            socket: PathBuf,
+            results: HashMap<&'static str, serde_json::Value>,
+            events: Vec<serde_json::Value>,
+            afterwards: Afterwards,
+        ) -> Self {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let seen = requests.clone();
             let listener = UnixListener::bind(&socket).expect("bind");
@@ -504,6 +576,7 @@ mod tests {
                     };
                     let seen = seen.clone();
                     let results = results.clone();
+                    let events = events.clone();
                     tokio::spawn(async move {
                         let (read_half, mut write_half) = stream.into_split();
                         let mut lines = BufReader::new(read_half).lines();
@@ -528,6 +601,17 @@ mod tests {
                             };
                             let _ = write_half.write_all(format!("{reply}\n").as_bytes()).await;
                             let _ = write_half.flush().await;
+
+                            if method == "events.subscribe" && reply.get("result").is_some() {
+                                for event in &events {
+                                    let _ =
+                                        write_half.write_all(format!("{event}\n").as_bytes()).await;
+                                }
+                                let _ = write_half.flush().await;
+                                if afterwards == Afterwards::Close {
+                                    return;
+                                }
+                            }
                         }
                     });
                 }
@@ -552,6 +636,13 @@ mod tests {
                 .map(|request| request["method"].as_str().expect("method").to_owned())
                 .collect()
         }
+    }
+
+    /// What the fake does once it has sent a subscription's events.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Afterwards {
+        Hold,
+        Close,
     }
 
     fn socket_path() -> (tempfile::TempDir, PathBuf) {
@@ -1127,6 +1218,125 @@ mod tests {
         let target = HerdrSocketTarget::new(socket);
 
         assert!(target.list_spaces().await.expect("list").is_empty());
+    }
+
+    fn two_agents() -> serde_json::Value {
+        serde_json::json!({ "agents": [
+            { "pane_id": "w1:p1", "workspace_id": "w1", "agent": "claude", "agent_status": "working" },
+            { "pane_id": "w2:p1", "workspace_id": "w2", "agent": "codex", "agent_status": "idle" }
+        ]})
+    }
+
+    fn subscribed() -> serde_json::Value {
+        serde_json::json!({ "type": "subscription_started" })
+    }
+
+    fn status_changed(pane: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": pane, "workspace_id": "w1", "agent_status": "idle" }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_change_is_waited_for_on_every_agents_status_and_on_agents_coming_and_going() {
+        let (_dir, socket) = socket_path();
+        let fake = FakeHerdr::serve_events(
+            socket.clone(),
+            results(vec![
+                ("agent.list", two_agents()),
+                ("events.subscribe", subscribed()),
+            ]),
+            vec![status_changed("w1:p1")],
+            Afterwards::Hold,
+        );
+        let target = HerdrSocketTarget::new(socket);
+
+        tokio::time::timeout(Duration::from_secs(2), target.changed())
+            .await
+            .expect("the event ends the wait")
+            .expect("a change");
+
+        let subscriptions = fake.method("events.subscribe")["params"]["subscriptions"].clone();
+        let mut types: Vec<String> = subscriptions
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|subscription| {
+                format!(
+                    "{} {}",
+                    subscription["type"].as_str().expect("type"),
+                    subscription["pane_id"].as_str().unwrap_or("-")
+                )
+            })
+            .collect();
+        types.sort();
+        assert_eq!(
+            types,
+            vec![
+                "pane.agent_detected -",
+                "pane.agent_status_changed w1:p1",
+                "pane.agent_status_changed w2:p1",
+                "pane.closed -",
+                "pane.exited -",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wait_lasts_until_herdr_sends_an_event_not_just_its_acknowledgement() {
+        let (_dir, socket) = socket_path();
+        let _fake = FakeHerdr::serve(
+            socket.clone(),
+            results(vec![
+                ("agent.list", two_agents()),
+                ("events.subscribe", subscribed()),
+            ]),
+        );
+        let target = HerdrSocketTarget::new(socket).with_timeout(Duration::from_millis(50));
+
+        let waited = tokio::time::timeout(Duration::from_millis(300), target.changed()).await;
+
+        assert!(
+            waited.is_err(),
+            "nothing changed, so the wait should still be going: {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscription_herdr_refuses_is_reported() {
+        let (_dir, socket) = socket_path();
+        let _fake = FakeHerdr::serve(socket.clone(), results(vec![("agent.list", two_agents())]));
+        let target = HerdrSocketTarget::new(socket);
+
+        let error = tokio::time::timeout(Duration::from_secs(2), target.changed())
+            .await
+            .expect("a refusal ends the wait")
+            .expect_err("refused");
+
+        assert!(error.to_string().contains("unknown_method"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn herdr_closing_the_subscription_is_reported_rather_than_waited_on() {
+        let (_dir, socket) = socket_path();
+        let _fake = FakeHerdr::serve_events(
+            socket.clone(),
+            results(vec![
+                ("agent.list", two_agents()),
+                ("events.subscribe", subscribed()),
+            ]),
+            Vec::new(),
+            Afterwards::Close,
+        );
+        let target = HerdrSocketTarget::new(socket);
+
+        let error = tokio::time::timeout(Duration::from_secs(2), target.changed())
+            .await
+            .expect("a closed socket ends the wait")
+            .expect_err("closed");
+
+        assert!(matches!(error, PortError::Unavailable { .. }), "{error:?}");
     }
 
     #[test]

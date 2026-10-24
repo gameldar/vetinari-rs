@@ -64,30 +64,14 @@ impl Controller {
             .agents
             .prune_finished(Self::FINISHED_SESSIONS_KEPT);
 
-        // The agents a target is running on its own: Vetinari cannot control
-        // them, but a blocked one is still the most expensive thing in the
-        // inbox, so it is ranked alongside the rest.
-        let observation = self.runtime.observed.poll().await;
-        for (kind, error) in &observation.problems {
-            updates.push(Update::Log(format!(
-                "WARN target {kind} could not list its agents: {error}"
-            )));
-        }
+        let observed = self.poll_observed(&mut updates).await;
 
         let mut polled = self.runtime.attention.poll(profile).await;
         polled.push(Polled {
             source: self.runtime.agents.source_id().clone(),
             outcome: Ok(self.runtime.agents.attention_items()),
         });
-        // A target that could not list its agents has already been logged,
-        // and leaving the source out keeps its agents rather than closing
-        // them.
-        if observation.problems.is_empty() {
-            polled.push(Polled {
-                source: ObservedAgents::source_id(),
-                outcome: Ok(ObservedAgents::attention_items(&observation.agents)),
-            });
-        }
+        polled.extend(observed);
         updates.push(Update::Polled(polled));
 
         updates.push(Update::Sessions(
@@ -112,6 +96,41 @@ impl Controller {
         ));
 
         updates
+    }
+
+    /// Poll only the agents the targets are running, for when one of them
+    /// announces a change between regular refreshes.
+    pub async fn refresh_agents(&mut self) -> Vec<Update> {
+        let mut updates = Vec::new();
+        if let Some(polled) = self.poll_observed(&mut updates).await {
+            updates.push(Update::Polled(vec![polled]));
+        }
+        updates
+    }
+
+    /// The targets that report their own agents, to wait on for changes
+    /// without holding the controller.
+    #[must_use]
+    pub fn agent_watch(&self) -> ObservedAgents {
+        self.runtime.observed.clone()
+    }
+
+    // The agents a target is running on its own: Vetinari cannot control
+    // them, but a blocked one is still the most expensive thing in the
+    // inbox, so it is ranked alongside the rest.
+    async fn poll_observed(&self, updates: &mut Vec<Update>) -> Option<Polled> {
+        let observation = self.runtime.observed.poll().await;
+        for (kind, error) in &observation.problems {
+            updates.push(Update::Log(format!(
+                "WARN target {kind} could not list its agents: {error}"
+            )));
+        }
+        // A target that could not list its agents has been logged, and
+        // leaving the source out keeps its agents rather than closing them.
+        observation.problems.is_empty().then(|| Polled {
+            source: ObservedAgents::source_id(),
+            outcome: Ok(ObservedAgents::attention_items(&observation.agents)),
+        })
     }
 
     /// Run one task.
@@ -758,6 +777,57 @@ mod tests {
         assert!(
             spaces.iter().any(|space| space.id.as_str() == "w1"),
             "herdr's workspaces are its spaces: {spaces:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_refresh_polls_only_the_agents_herdr_is_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("herdr.sock");
+        fake_herdr(socket.clone());
+        let mut h = harness(&format!(
+            "\n[targets.herdr]\nsocket = \"{}\"\n",
+            socket.display()
+        ));
+
+        let updates = h.controller.refresh_agents().await;
+
+        let polled = polled_of(&updates);
+        assert_eq!(polled.len(), 1, "{polled:?}");
+        assert_eq!(polled[0].source, ObservedAgents::source_id());
+        let items = polled[0].outcome.as_ref().expect("agents");
+        assert!(items[0].title().as_str().contains("claude in w1"));
+        assert!(
+            !updates.iter().any(|u| matches!(u, Update::Spaces(_))),
+            "an agent refresh leaves the other sources to the regular poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_refresh_that_cannot_reach_herdr_keeps_its_agents_and_logs_why() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut h = harness(&format!(
+            "\n[targets.herdr]\nsocket = \"{}\"\n",
+            dir.path().join("absent.sock").display()
+        ));
+
+        let updates = h.controller.refresh_agents().await;
+
+        assert!(!updates.iter().any(|u| matches!(u, Update::Polled(_))));
+        assert!(
+            updates.iter().any(
+                |u| matches!(u, Update::Log(line) if line.contains("could not list its agents"))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agent_watch_is_over_the_targets_that_report_agents() {
+        let h = harness("\n[targets.herdr]\nsocket = \"/nowhere/herdr.sock\"\n");
+
+        assert_eq!(
+            h.controller.agent_watch().targets(),
+            vec![vetinari_core::domain::workspace::TargetKind::Herdr]
         );
     }
 

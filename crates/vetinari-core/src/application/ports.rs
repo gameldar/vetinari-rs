@@ -177,6 +177,14 @@ pub trait ExternalAgentSource: Send + Sync {
 
     /// Every agent the target can currently see.
     async fn observed_agents(&self) -> PortResult<Vec<ObservedAgent>>;
+
+    /// Wait until one of its agents changes or a new one appears.
+    ///
+    /// A target that cannot announce changes never returns, leaving its
+    /// agents to the periodic poll.
+    async fn changed(&self) -> PortResult<()> {
+        std::future::pending().await
+    }
 }
 
 /// An execution agent: a CLI, an API caller, or a script.
