@@ -10,6 +10,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+use vetinari_core::application::queue::Lane;
+use vetinari_core::domain::attention::ItemState;
+
 use crate::app::{App, Level, Pane};
 use crate::overlay::{Form, Menu, Overlay, Prompt, TextView};
 
@@ -96,25 +99,21 @@ fn pane_block(app: &App, pane: Pane, extra: &str) -> Block<'static> {
 }
 
 fn render_feed(frame: &mut Frame, app: &App, area: Rect) {
-    let visible = app.feed().visible();
-    let extra = if app.feed().filter().is_empty() {
-        let counts = app.feed().feed().counts_by_category();
-        if counts.is_empty() {
-            "(0)".to_owned()
-        } else {
-            let summary = counts
-                .iter()
-                .map(|(category, count)| format!("{} {count}", category.label()))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("({summary})")
-        }
+    let rows = app.rows();
+    let counts = app
+        .lane_counts()
+        .iter()
+        .map(|(lane, count)| format!("{} {count}", lane.title().to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let extra = if app.filter().is_empty() {
+        format!("({counts})")
     } else {
-        format!("(/{} - {})", app.feed().filter(), visible.len())
+        format!("(/{} - {})", app.filter(), rows.len())
     };
     let block = pane_block(app, Pane::Feed, &extra);
 
-    if visible.is_empty() {
+    if rows.is_empty() {
         frame.render_widget(
             Paragraph::new("Nothing is waiting on you. Press r to refresh.")
                 .block(block)
@@ -124,44 +123,50 @@ fn render_feed(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let rows: Vec<ListItem> = visible
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let selected = index == app.feed().cursor();
-            let marker = if selected { "> " } else { "  " };
-            let relative = item
-                .relative_time(app.now())
-                .map(|when| format!(" [{when}]"))
-                .unwrap_or_default();
-            let style = match item.state() {
-                vetinari_core::domain::attention::ItemState::AgentWaiting
-                | vetinari_core::domain::attention::ItemState::Blocked => {
-                    Style::default().fg(Color::Magenta)
-                }
-                vetinari_core::domain::attention::ItemState::CiFailed
-                | vetinari_core::domain::attention::ItemState::AgentFailed => {
-                    Style::default().fg(Color::Red)
-                }
-                vetinari_core::domain::attention::ItemState::AgentDone
-                | vetinari_core::domain::attention::ItemState::Resolved => {
-                    Style::default().fg(Color::DarkGray)
-                }
-                _ => Style::default(),
-            };
-            let style = if selected {
-                style.add_modifier(Modifier::BOLD)
-            } else {
-                style
-            };
-            ListItem::new(Line::styled(
-                format!("{marker}{}{relative}", item.row_label()),
-                style,
-            ))
-        })
-        .collect();
+    let cursor = app.cursor();
+    let mut lines: Vec<ListItem> = Vec::new();
+    let mut lane = None;
+    for (index, row) in rows.iter().enumerate() {
+        if lane != Some(row.lane) {
+            lane = Some(row.lane);
+            lines.push(ListItem::new(Line::styled(
+                row.lane.title(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        let item = row.entry.item();
+        let selected = index == cursor;
+        let marker = if selected { "> " } else { "  " };
+        let relative = item
+            .relative_time(app.now())
+            .map(|when| format!(" [{when}]"))
+            .unwrap_or_default();
+        let note = app
+            .row_note(row)
+            .map(|note| format!(" - {note}"))
+            .unwrap_or_default();
+        let style = match (row.lane, item.state()) {
+            (Lane::Done | Lane::Quiet, _) => Style::default().fg(Color::DarkGray),
+            (_, ItemState::AgentWaiting | ItemState::Blocked) => {
+                Style::default().fg(Color::Magenta)
+            }
+            (_, ItemState::CiFailed | ItemState::AgentFailed) => Style::default().fg(Color::Red),
+            _ => Style::default(),
+        };
+        let style = if selected {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        };
+        lines.push(ListItem::new(Line::styled(
+            format!("{marker}{}{relative}{note}", item.row_label()),
+            style,
+        )));
+    }
 
-    frame.render_widget(List::new(rows).block(block), area);
+    frame.render_widget(List::new(lines).block(block), area);
 }
 
 fn render_monitor(frame: &mut Frame, app: &App, area: Rect) {
@@ -501,7 +506,6 @@ mod tests {
     use std::path::PathBuf;
     use time::macros::datetime;
     use time::{Duration, OffsetDateTime};
-    use vetinari_core::application::attention::Feed;
     use vetinari_core::domain::attention::{
         AttentionItem, ItemContext, ItemState, PullRequestRef, SourceCategory,
     };
@@ -510,8 +514,10 @@ mod tests {
     use vetinari_core::domain::keymap::Keymap;
     use vetinari_core::domain::keys::{KeyChord, KeyCode};
     use vetinari_core::domain::profile::ProfileSet;
+    use vetinari_core::domain::queue::rules::QueueRules;
     use vetinari_core::domain::skill::SkillLibrary;
     use vetinari_core::domain::text::NonEmptyText;
+    use vetinari_core::testing::polled;
 
     use crate::app::{ObservedAgentRow, SessionRow, SpaceRow, StatusMessage, Update};
 
@@ -577,14 +583,11 @@ mod tests {
                 NonEmptyText::parse("vetinari").expect("name"),
                 PathBuf::from("/repo"),
             ),
+            QueueRules::default(),
             50,
             NOW,
         );
-        app.apply(Update::Feed(Feed::new(
-            vec![pr_item(), event_item()],
-            Vec::new(),
-            NOW,
-        )));
+        app.apply(Update::Polled(polled(vec![pr_item(), event_item()])));
         app.apply(Update::Keychain("Keychain: 2 authenticated".to_owned()));
         app
     }
@@ -606,7 +609,7 @@ mod tests {
     #[test]
     fn the_three_panes_are_all_titled() {
         let rendered = drawn(&app(), 100, 24);
-        assert!(rendered.contains("ATTENTION FEED"));
+        assert!(rendered.contains("ATTENTION QUEUE"));
         assert!(rendered.contains("WORKSPACE & AGENT MONITOR"));
         assert!(rendered.contains("CONTEXT / DETAILS"));
     }
@@ -615,12 +618,12 @@ mod tests {
     fn the_focused_pane_is_marked_so_the_developer_knows_where_keys_go() {
         let mut app = app();
         let rendered = drawn(&app, 100, 24);
-        assert!(rendered.contains("> ATTENTION FEED"));
+        assert!(rendered.contains("> ATTENTION QUEUE"));
 
         press(&mut app, "l");
         let rendered = drawn(&app, 100, 24);
         assert!(rendered.contains("> WORKSPACE"));
-        assert!(!rendered.contains("> ATTENTION FEED"));
+        assert!(!rendered.contains("> ATTENTION QUEUE"));
     }
 
     #[test]
@@ -632,10 +635,37 @@ mod tests {
     }
 
     #[test]
-    fn the_feed_title_counts_what_is_waiting_by_category() {
-        let rendered = drawn(&app(), 100, 24);
-        assert!(rendered.contains("PR 1"), "got {rendered}");
-        assert!(rendered.contains("CAL 1"));
+    fn the_queue_title_counts_each_lane() {
+        let mut app = app();
+        press(&mut app, "SPC n");
+
+        let rendered = drawn(&app, 100, 24);
+
+        assert!(rendered.contains("(now 1, next 1)"), "got {rendered}");
+    }
+
+    #[test]
+    fn the_queue_is_drawn_lane_by_lane() {
+        let mut app = app();
+        press(&mut app, "SPC n");
+
+        let rendered = drawn(&app, 100, 24);
+
+        let now = rendered.find("NOW").expect("a NOW heading");
+        let meeting = rendered.find("Sprint planning").expect("the meeting");
+        let next = rendered.find("NEXT").expect("a NEXT heading");
+        let pr = rendered.find("Fix memory leak").expect("the PR");
+        assert!(now < meeting && meeting < next && next < pr, "{rendered}");
+    }
+
+    #[test]
+    fn a_parked_row_says_when_it_comes_back() {
+        let mut app = app();
+        press(&mut app, "SPC d p h");
+
+        let rendered = drawn(&app, 200, 24);
+
+        assert!(rendered.contains("back in 1h"), "{rendered}");
     }
 
     #[test]
@@ -648,9 +678,19 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_feed_says_what_to_do_rather_than_showing_a_blank_box() {
-        let mut app = app();
-        app.apply(Update::Feed(Feed::empty(NOW)));
+    fn an_empty_queue_says_what_to_do_rather_than_showing_a_blank_box() {
+        let app = App::new(
+            Keymap::doom_defaults(),
+            ProfileSet::defaults(),
+            SkillLibrary::builtin(),
+            FeedbackTarget::new(
+                NonEmptyText::parse("vetinari").expect("name"),
+                PathBuf::from("/repo"),
+            ),
+            QueueRules::default(),
+            50,
+            NOW,
+        );
         let rendered = drawn(&app, 100, 24);
         assert!(rendered.contains("Nothing is waiting on you"));
     }

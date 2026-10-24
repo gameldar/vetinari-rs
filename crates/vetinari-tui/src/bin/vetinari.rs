@@ -254,6 +254,7 @@ async fn run(cli: Cli) -> Fallible<()> {
     let log_lines = loaded.config.general.log_lines;
     let keymap = loaded.config.keymap.clone();
     let profiles = loaded.config.profiles.clone();
+    let rules = loaded.config.queue.clone();
     let config_path = loaded.path.clone();
     let target = feedback_target(&cli)?;
 
@@ -263,7 +264,15 @@ async fn run(cli: Cli) -> Fallible<()> {
     let mut controller = Controller::new(runtime, Default::default());
     let library = controller.load_library().await;
 
-    let mut app = App::new(keymap, profiles, library, target, log_lines, clock.now());
+    let mut app = App::new(
+        keymap,
+        profiles,
+        library,
+        target,
+        rules,
+        log_lines,
+        clock.now(),
+    );
     app.set_config_path(config_path);
     for problem in &problems {
         app.apply(Update::Log(format!("WARN {problem}")));

@@ -82,6 +82,17 @@ actions! {
     FilterClear => "filter-clear", "Clear the filter";
     Select => "select", "Open the selected entry";
 
+    QueueTakeNext => "queue-take-next", "Take what needs you next";
+    QueueTake => "queue-take", "Work on this";
+    QueueFinish => "queue-finish", "Finish";
+    QueueSilence => "queue-silence", "Silence";
+    QueueParkHour => "queue-park-hour", "Park for an hour";
+    QueueParkTomorrow => "queue-park-tomorrow", "Park until tomorrow";
+    QueueParkChanged => "queue-park-changed", "Park until it changes";
+    QueueWaitAgent => "queue-wait-agent", "Wait on its agent";
+    QueueWaitReply => "queue-wait-reply", "Wait on a reply";
+    FocusToggle => "focus-toggle", "Toggle focus time";
+
     FeedbackOpen => "feedback-open", "Feedback / enhancement";
     FeedbackSubmitLast => "feedback-submit-last", "Re-run last feedback task";
 

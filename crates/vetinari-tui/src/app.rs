@@ -9,21 +9,27 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use time::{Duration, OffsetDateTime};
-use vetinari_core::application::attention::{Feed, FeedView, SourceProblem};
+use vetinari_core::application::agents::AgentRegistry;
+use vetinari_core::application::attention::Polled;
 use vetinari_core::application::keymap_engine::{KeymapEngine, Keystroke};
 use vetinari_core::application::ports::{DeviceCodeChallenge, PortError};
+use vetinari_core::application::queue::{Lane, QueueCursor, QueueService, Row, lanes};
 use vetinari_core::application::skills::SkillDraft;
 use vetinari_core::domain::action::Action;
 use vetinari_core::domain::agent::{AgentSession, ObservedAgent, ObservedAgentState};
 use vetinari_core::domain::attention::{
-    AttentionItem, EventRef, IssueRef, ItemContext, ItemState, MessageRef, PullRequestRef,
+    AttentionItem, EventRef, IssueRef, ItemContext, ItemState, MessageRef, PullRequestRef, humanize,
 };
 use vetinari_core::domain::credentials::{AuthMethod, Provider, Secret};
 use vetinari_core::domain::feedback::{CapturedContext, FeedbackRequest, FeedbackTarget};
-use vetinari_core::domain::ids::{SessionId, SkillId, SourceId, SpaceId};
+use vetinari_core::domain::ids::{ItemId, SessionId, SkillId, SourceId, SpaceId};
 use vetinari_core::domain::keymap::{Keymap, Mode};
 use vetinari_core::domain::keys::{KeyChord, KeyCode};
 use vetinari_core::domain::profile::{Profile, ProfileSet};
+use vetinari_core::domain::queue::Position;
+use vetinari_core::domain::queue::lifecycle::{Lifecycle, ParkUntil, Rule, WaitingOn};
+use vetinari_core::domain::queue::rules::QueueRules;
+use vetinari_core::domain::queue::{Decision, Entry, Happened, Note, ParkFor};
 use vetinari_core::domain::skill::{Bindings, Skill, SkillLibrary};
 use vetinari_core::domain::text::NonEmptyText;
 use vetinari_core::domain::workspace::Space;
@@ -59,7 +65,7 @@ impl Pane {
     #[must_use]
     pub const fn title(&self) -> &'static str {
         match self {
-            Pane::Feed => "ATTENTION FEED",
+            Pane::Feed => "ATTENTION QUEUE",
             Pane::Monitor => "WORKSPACE & AGENT MONITOR",
             Pane::Details => "CONTEXT / DETAILS",
         }
@@ -270,9 +276,16 @@ pub enum Task {
     /// small; the cost belongs to the one task that carries it.
     StartFeedback(Box<FeedbackRequest>),
     /// Run the PR review workflow.
-    StartPrReview(PullRequestRef),
+    StartPrReview {
+        /// The pull request.
+        pr: PullRequestRef,
+        /// The item the review is for.
+        item: ItemId,
+    },
     /// Brief an agent on a meeting.
     MeetingPrep {
+        /// The item the briefing is for.
+        item: ItemId,
         /// The event's title.
         title: String,
         /// Its details.
@@ -367,8 +380,15 @@ pub enum Outcome {
 /// Something the event loop learned, for the state to absorb.
 #[derive(Debug, Clone)]
 pub enum Update {
-    /// A fresh feed.
-    Feed(Feed),
+    /// Every source's answer to a poll.
+    Polled(Vec<Polled>),
+    /// A workflow started an agent on an item.
+    AgentStarted {
+        /// The item.
+        item: ItemId,
+        /// The agent's session.
+        session: SessionId,
+    },
     /// The agent sessions as they now stand.
     Sessions(Vec<SessionRow>),
     /// The workspace spaces as they now stand.
@@ -398,7 +418,8 @@ pub enum Update {
 /// The front-end's state.
 pub struct App {
     keys: KeymapEngine,
-    feed: FeedView,
+    queue: QueueService,
+    cursor: QueueCursor,
     profiles: ProfileSet,
     library: SkillLibrary,
     feedback_target: FeedbackTarget,
@@ -424,6 +445,9 @@ impl App {
     /// How many rows a page key moves by.
     pub const PAGE: usize = 10;
 
+    /// How long focus time lasts once started.
+    pub const FOCUS_LENGTH: Duration = Duration::hours(1);
+
     /// Build the state.
     #[must_use]
     pub fn new(
@@ -431,12 +455,14 @@ impl App {
         profiles: ProfileSet,
         library: SkillLibrary,
         feedback_target: FeedbackTarget,
+        rules: QueueRules,
         log_limit: usize,
         now: OffsetDateTime,
     ) -> Self {
         Self {
             keys: KeymapEngine::new(keymap),
-            feed: FeedView::new(Feed::empty(now)),
+            queue: QueueService::new(rules),
+            cursor: QueueCursor::default(),
             profiles,
             library,
             feedback_target,
@@ -470,10 +496,80 @@ impl App {
         self.keys.keymap()
     }
 
-    /// The feed and its selection.
+    /// The attention queue.
     #[must_use]
-    pub const fn feed(&self) -> &FeedView {
-        &self.feed
+    pub const fn queue(&self) -> &QueueService {
+        &self.queue
+    }
+
+    /// The queue's rows, as the filter admits them.
+    #[must_use]
+    pub fn rows(&self) -> Vec<Row<'_>> {
+        self.cursor.rows(&self.queue.view(self.now))
+    }
+
+    /// The selected row.
+    #[must_use]
+    pub fn selected(&self) -> Option<Row<'_>> {
+        self.cursor.selected(&self.queue.view(self.now))
+    }
+
+    /// The selected item.
+    #[must_use]
+    pub fn selected_item(&self) -> Option<&AttentionItem> {
+        self.selected().map(|row| row.entry.item())
+    }
+
+    /// Which row is selected; the top when there are none.
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.cursor.index(&self.queue.view(self.now)).unwrap_or(0)
+    }
+
+    /// The filter in force.
+    #[must_use]
+    pub fn filter(&self) -> &str {
+        self.cursor.filter()
+    }
+
+    /// What a row's lane alone does not say: when it comes back, what it
+    /// waits on, or why it is back.
+    #[must_use]
+    pub fn row_note(&self, row: &Row<'_>) -> Option<String> {
+        let id = row.entry.item().id();
+        let when = |at: OffsetDateTime| humanize(at - self.now);
+        match self.queue.queue().position(id)? {
+            Position::Held(Lifecycle::Parked {
+                until: ParkUntil::Time(at),
+                ..
+            }) => Some(format!("back in {}", when(*at))),
+            Position::Held(Lifecycle::Parked {
+                until: ParkUntil::Changed,
+                ..
+            }) => Some("until it changes".to_owned()),
+            Position::Held(Lifecycle::Waiting(WaitingOn::Agent)) => Some("on its agent".to_owned()),
+            Position::Held(Lifecycle::Waiting(WaitingOn::Reply { follow_up_at })) => {
+                Some(format!("on a reply, follow up in {}", when(*follow_up_at)))
+            }
+            Position::Held(Lifecycle::Inbox) => row
+                .entry
+                .returned()
+                .map(|returned| format!("back: {}", rule_label(returned.rule))),
+            Position::Held(Lifecycle::Done { .. }) | Position::Active { .. } => None,
+        }
+    }
+
+    /// How many rows each lane has, for the queue's title.
+    #[must_use]
+    pub fn lane_counts(&self) -> Vec<(Lane, usize)> {
+        let mut counts: Vec<(Lane, usize)> = Vec::new();
+        for row in self.rows() {
+            match counts.last_mut() {
+                Some((lane, count)) if *lane == row.lane => *count += 1,
+                _ => counts.push((row.lane, 1)),
+            }
+        }
+        counts
     }
 
     /// The active profile.
@@ -605,14 +701,19 @@ impl App {
     /// The details of the selected row.
     #[must_use]
     pub fn details(&self) -> Vec<(String, String)> {
-        let Some(item) = self.feed.selected() else {
+        let Some(row) = self.selected() else {
             return Vec::new();
         };
+        let item = row.entry.item();
         let mut rows = vec![
             ("Title".to_owned(), item.title().single_line()),
             ("Source".to_owned(), item.source().to_string()),
             ("Status".to_owned(), item.state().label().to_owned()),
+            ("Queue".to_owned(), row.lane.title().to_lowercase()),
         ];
+        if let Some(returned) = row.entry.returned() {
+            rows.push(("Came back".to_owned(), rule_label(returned.rule).to_owned()));
+        }
         if let Some(author) = item.author() {
             rows.push(("Author".to_owned(), author.to_owned()));
         }
@@ -631,9 +732,10 @@ impl App {
     /// Absorb something the event loop learned.
     pub fn apply(&mut self, update: Update) {
         match update {
-            Update::Feed(feed) => {
-                let problems: Vec<SourceProblem> = feed.problems().to_vec();
-                self.feed.replace_feed(feed);
+            Update::Polled(polled) => {
+                let notes = self.queue.absorb(self.now, polled);
+                self.note(&notes);
+                let problems = self.queue.problems().to_vec();
                 for problem in &problems {
                     self.push_log(format!(
                         "ERROR source {}: {}",
@@ -687,9 +789,15 @@ impl App {
                     view.message = message;
                 }
             }
+            Update::AgentStarted { item, session } => {
+                let agent = AgentRegistry::item_id(&session);
+                self.decide(Decision::Delegate { item, agent });
+            }
             Update::CloseOverlay => self.close_overlay(),
             Update::Tick(now) => {
                 self.now = now;
+                let notes = self.queue.tick(now);
+                self.note(&notes);
                 if let Some((_, shown_at)) = &self.status
                     && now - *shown_at >= StatusMessage::LIFETIME
                 {
@@ -774,25 +882,77 @@ impl App {
                 self.focus = self.focus.cycled(-1);
                 Outcome::Nothing
             }
+            Action::QueueTakeNext => {
+                let next = self
+                    .queue
+                    .view(self.now)
+                    .next
+                    .first()
+                    .map(|ranked| ranked.entry.item().id().clone());
+                match next {
+                    Some(id) => {
+                        self.decide(Decision::Take(id.clone()));
+                        self.cursor.select_item(&self.queue.view(self.now), &id);
+                        Outcome::Nothing
+                    }
+                    None => self.info("nothing needs you right now"),
+                }
+            }
+            Action::QueueTake => self.decide_selected(Decision::Take, true),
+            Action::QueueFinish => self.decide_selected(Decision::Finish, false),
+            Action::QueueSilence => self.decide_selected(Decision::Silence, false),
+            Action::QueueParkHour => {
+                let until = self.now + Duration::hours(1);
+                self.decide_selected(|id| Decision::Park(id, ParkFor::Until(until)), false)
+            }
+            Action::QueueParkTomorrow => {
+                let until = tomorrow_morning(self.now);
+                self.decide_selected(|id| Decision::Park(id, ParkFor::Until(until)), false)
+            }
+            Action::QueueParkChanged => {
+                self.decide_selected(|id| Decision::Park(id, ParkFor::Changed), false)
+            }
+            Action::QueueWaitAgent => self.decide_selected(Decision::WaitOnAgent, false),
+            Action::QueueWaitReply => self.decide_selected(Decision::WaitOnReply, false),
+            Action::FocusToggle => {
+                if self.queue.queue().focus().is_some() {
+                    if self.decide(Decision::EndFocus) {
+                        self.info("focus time is over")
+                    } else {
+                        Outcome::Nothing
+                    }
+                } else {
+                    let until = self.now + Self::FOCUS_LENGTH;
+                    if self.decide(Decision::StartFocus { until }) {
+                        self.info(format!(
+                            "focus time for {} minutes",
+                            Self::FOCUS_LENGTH.whole_minutes()
+                        ))
+                    } else {
+                        Outcome::Nothing
+                    }
+                }
+            }
+
             Action::FilterStart => {
-                self.filter_backup = Some(self.feed.filter().to_owned());
+                self.filter_backup = Some(self.cursor.filter().to_owned());
                 let mut prompt = Prompt::line(
                     PromptKind::Filter,
                     "Filter",
                     "narrow the feed; RET keeps it, ESC restores it",
                 );
                 prompt.input =
-                    crate::text_input::TextInput::single_line().with_value(self.feed.filter());
+                    crate::text_input::TextInput::single_line().with_value(self.cursor.filter());
                 self.overlay = Some(Overlay::Prompt(prompt));
                 Outcome::Nothing
             }
             Action::FilterClear => {
-                self.feed.clear_filter();
+                self.cursor.clear_filter();
                 Outcome::Nothing
             }
             Action::Select => {
                 self.focus = Pane::Details;
-                match self.feed.selected() {
+                match self.selected_item() {
                     Some(item) => {
                         let label = item.row_label();
                         self.info(label)
@@ -814,9 +974,9 @@ impl App {
                 None => self.warn("no feedback request has been made yet"),
             },
 
-            Action::PrReviewSpawn => match self.selected_pull_request() {
-                Some((_, pr)) => Outcome::Task(Task::StartPrReview(pr)),
-                None => self.warn("select a pull request row first"),
+            Action::PrReviewSpawn => match (self.selected_pull_request(), self.selected_id()) {
+                (Some((_, pr)), Some(item)) => Outcome::Task(Task::StartPrReview { pr, item }),
+                _ => self.warn("select a pull request row first"),
             },
             Action::PrApprove => match self.selected_pull_request() {
                 Some((source, pr)) => Outcome::Task(Task::ApprovePr { source, pr }),
@@ -886,13 +1046,14 @@ impl App {
                 self.open_meeting_menu();
                 Outcome::Nothing
             }
-            Action::MeetingPrep => match self.selected_event() {
-                Some((title, event, starts_at)) => Outcome::Task(Task::MeetingPrep {
+            Action::MeetingPrep => match (self.selected_event(), self.selected_id()) {
+                (Some((title, event, starts_at)), Some(item)) => Outcome::Task(Task::MeetingPrep {
+                    item,
                     title,
                     event,
                     starts_at,
                 }),
-                None => self.warn("select a calendar row first"),
+                _ => self.warn("select a calendar row first"),
             },
             Action::MeetingSchedule => {
                 self.open_schedule();
@@ -976,23 +1137,7 @@ impl App {
     fn navigate(&mut self, by: isize) -> Outcome {
         match self.focus {
             Pane::Feed | Pane::Details => {
-                if by > 0 {
-                    #[allow(clippy::cast_sign_loss)]
-                    let step = by as usize;
-                    if step == 1 {
-                        self.feed.select_next();
-                    } else {
-                        self.feed.page_down(step);
-                    }
-                } else {
-                    #[allow(clippy::cast_sign_loss)]
-                    let step = (-by) as usize;
-                    if step == 1 {
-                        self.feed.select_previous();
-                    } else {
-                        self.feed.page_up(step);
-                    }
-                }
+                self.cursor.move_by(&self.queue.view(self.now), by);
             }
             Pane::Monitor => {
                 let last = self.sessions.len().saturating_sub(1);
@@ -1011,10 +1156,11 @@ impl App {
     fn navigate_to_end(&mut self, bottom: bool) -> Outcome {
         match self.focus {
             Pane::Feed | Pane::Details => {
+                let view = self.queue.view(self.now);
                 if bottom {
-                    self.feed.select_last();
+                    self.cursor.select_last(&view);
                 } else {
-                    self.feed.select_first();
+                    self.cursor.select_first(&view);
                 }
             }
             Pane::Monitor => {
@@ -1051,7 +1197,7 @@ impl App {
                 if prompt.kind == PromptKind::Filter
                     && let Some(previous) = self.filter_backup.take()
                 {
-                    self.feed.set_filter(previous);
+                    self.cursor.set_filter(previous);
                 }
                 Outcome::Nothing
             }
@@ -1070,7 +1216,7 @@ impl App {
             }
             InputOutcome::Changed | InputOutcome::Ignored => {
                 if prompt.kind == PromptKind::Filter {
-                    self.feed.set_filter(prompt.input.value());
+                    self.cursor.set_filter(prompt.input.value());
                 }
                 self.overlay = Some(Overlay::Prompt(prompt));
                 Outcome::Nothing
@@ -1208,14 +1354,20 @@ impl App {
                 }
             }
             (MenuKind::Meetings, MenuTarget::Item(id)) => {
-                let selected = self.feed.feed().get(&id).and_then(event_of);
+                let selected = self
+                    .queue
+                    .queue()
+                    .entry(&id)
+                    .map(Entry::item)
+                    .and_then(event_of);
                 match selected {
                     Some((title, event, starts_at)) => Outcome::Task(Task::MeetingPrep {
+                        item: id,
                         title,
                         event,
                         starts_at,
                     }),
-                    None => self.warn("that meeting is no longer in the feed"),
+                    None => self.warn("that meeting is no longer in the queue"),
                 }
             }
             _ => Outcome::Nothing,
@@ -1312,11 +1464,8 @@ impl App {
 
     fn open_schedule(&mut self) {
         let lines: Vec<String> = self
-            .feed
-            .feed()
-            .items()
-            .iter()
-            .filter(|item| matches!(item.state(), ItemState::Scheduled { .. }))
+            .scheduled()
+            .into_iter()
             .map(|item| {
                 format!(
                     "{:<10} {}",
@@ -1429,11 +1578,8 @@ impl App {
 
     fn open_meeting_menu(&mut self) {
         let items: Vec<MenuItem> = self
-            .feed
-            .feed()
-            .items()
-            .iter()
-            .filter(|item| matches!(item.state(), ItemState::Scheduled { .. }))
+            .scheduled()
+            .into_iter()
             .map(|item| MenuItem {
                 label: item.title().single_line(),
                 detail: item.relative_time(self.now).unwrap_or_default(),
@@ -1452,14 +1598,14 @@ impl App {
             && prompt.kind == PromptKind::Filter
             && let Some(previous) = self.filter_backup.take()
         {
-            self.feed.set_filter(previous);
+            self.cursor.set_filter(previous);
         }
         self.overlay = None;
     }
 
     fn capture_context(&self) -> CapturedContext {
         let mut captured = CapturedContext::new(self.profile().id().clone(), self.keys.mode());
-        if let Some(item) = self.feed.selected() {
+        if let Some(item) = self.selected_item() {
             captured = captured.with_selected_item(item.row_label());
         }
         if let Some(pending) = self.keys.pending_display() {
@@ -1485,7 +1631,7 @@ impl App {
     #[must_use]
     pub fn bindings_for_selection(&self) -> Bindings {
         let mut bindings = Bindings::new().with("profile", self.profile().id().as_str());
-        let Some(item) = self.feed.selected() else {
+        let Some(item) = self.selected_item() else {
             return bindings;
         };
         bindings = bindings
@@ -1530,7 +1676,7 @@ impl App {
     }
 
     fn selected_pull_request(&self) -> Option<(SourceId, PullRequestRef)> {
-        let item = self.feed.selected()?;
+        let item = self.selected_item()?;
         match item.context() {
             ItemContext::PullRequest(pr) => Some((item.source().clone(), pr.clone())),
             _ => None,
@@ -1538,7 +1684,7 @@ impl App {
     }
 
     fn selected_issue(&self) -> Option<(SourceId, IssueRef)> {
-        let item = self.feed.selected()?;
+        let item = self.selected_item()?;
         match item.context() {
             ItemContext::Issue(issue) => Some((item.source().clone(), issue.clone())),
             _ => None,
@@ -1546,7 +1692,7 @@ impl App {
     }
 
     fn selected_message(&self) -> Option<(SourceId, MessageRef)> {
-        let item = self.feed.selected()?;
+        let item = self.selected_item()?;
         match item.context() {
             ItemContext::Message(message) => Some((item.source().clone(), message.clone())),
             _ => None,
@@ -1554,11 +1700,11 @@ impl App {
     }
 
     fn selected_event(&self) -> Option<(String, EventRef, OffsetDateTime)> {
-        event_of(self.feed.selected()?)
+        event_of(self.selected_item()?)
     }
 
     fn focusable_space(&self) -> Option<SpaceId> {
-        if let Some(item) = self.feed.selected()
+        if let Some(item) = self.selected_item()
             && let ItemContext::Agent(agent) = item.context()
             && let Some(space) = &agent.space
         {
@@ -1567,6 +1713,70 @@ impl App {
         self.selected_session()
             .and_then(|session| session.space.clone())
             .or_else(|| self.spaces.first().map(|space| space.id.clone()))
+    }
+
+    fn selected_id(&self) -> Option<ItemId> {
+        self.selected_item().map(|item| item.id().clone())
+    }
+
+    /// Open meetings, soonest first.
+    fn scheduled(&self) -> Vec<&AttentionItem> {
+        let mut meetings: Vec<&AttentionItem> = lanes(&self.queue.view(self.now))
+            .into_iter()
+            .filter(|row| row.lane != Lane::Done)
+            .map(|row| row.entry.item())
+            .filter(|item| matches!(item.state(), ItemState::Scheduled { .. }))
+            .collect();
+        meetings.sort_by_key(|item| item.occurred_at());
+        meetings
+    }
+
+    /// Apply a decision, warning when the queue refuses it.
+    fn decide(&mut self, decision: Decision) -> bool {
+        match self.queue.decide(self.now, decision) {
+            Ok(notes) => {
+                self.note(&notes);
+                true
+            }
+            Err(refusal) => {
+                self.set_status(StatusMessage::warn(refusal.to_string()));
+                false
+            }
+        }
+    }
+
+    /// Decide about the selected item. The selection either goes with the
+    /// item or stays where it was, moving on to whatever follows.
+    fn decide_selected(
+        &mut self,
+        decision: impl FnOnce(ItemId) -> Decision,
+        follow: bool,
+    ) -> Outcome {
+        let Some(id) = self.selected_id() else {
+            return self.warn("select an item first");
+        };
+        if !follow {
+            self.cursor.keep_place(&self.queue.view(self.now));
+        }
+        self.decide(decision(id));
+        Outcome::Nothing
+    }
+
+    /// Log what the queue brought back, and say so.
+    fn note(&mut self, notes: &[Note]) {
+        for note in notes {
+            if let Happened::Resurfaced(rule) = note.happened {
+                self.push_log(format!("INFO queue: {} came back ({rule:?})", note.item));
+                let title = self.queue.queue().entry(&note.item).map_or_else(
+                    || note.item.to_string(),
+                    |entry| entry.item().title().single_line(),
+                );
+                self.set_status(StatusMessage::info(format!(
+                    "{title} is back: {}",
+                    rule_label(rule)
+                )));
+            }
+        }
     }
 
     fn skill_id(name: &str) -> SkillId {
@@ -1593,6 +1803,31 @@ impl App {
         }
         self.log.push_back(line);
     }
+}
+
+const fn rule_label(rule: Rule) -> &'static str {
+    match rule {
+        Rule::SwitchedAway => "you switched away from it",
+        Rule::SnoozeEnded => "its park ran out",
+        Rule::Changed => "it changed",
+        Rule::UrgentChange => "it turned urgent",
+        Rule::Reopened => "it needs you again",
+        Rule::ReplyArrived => "the reply arrived",
+        Rule::FollowUpDue => "time to follow up",
+        Rule::ArrivedDuringFocus => "focus time is over",
+        Rule::AgentNeedsYou => "its agent needs you",
+        Rule::AgentClosed => "its agent went away",
+    }
+}
+
+/// Nine the next morning, in the clock's own offset.
+fn tomorrow_morning(now: OffsetDateTime) -> OffsetDateTime {
+    now.date()
+        .next_day()
+        .map_or(now + Duration::days(1), |day| {
+            day.with_time(time::macros::time!(09:00))
+                .assume_offset(now.offset())
+        })
 }
 
 fn event_of(item: &AttentionItem) -> Option<(String, EventRef, OffsetDateTime)> {
@@ -1623,11 +1858,14 @@ mod tests {
     use super::*;
     use crate::overlay::FormKind;
     use time::macros::datetime;
+    use vetinari_core::application::attention::Polled;
     use vetinari_core::domain::attention::{
         AttentionItem, EventRef, IssueRef, ItemContext, ItemState, MessageRef, PullRequestRef,
         SourceCategory,
     };
     use vetinari_core::domain::ids::SourceId;
+    use vetinari_core::domain::queue::lifecycle::{Closure, Lifecycle, ParkUntil, WaitingOn};
+    use vetinari_core::testing::polled;
 
     const NOW: OffsetDateTime = datetime!(2026-10-21 09:00 UTC);
 
@@ -1707,8 +1945,8 @@ mod tests {
         .build()
     }
 
-    fn app() -> App {
-        let mut app = App::new(
+    fn empty_app() -> App {
+        App::new(
             Keymap::doom_defaults(),
             ProfileSet::defaults(),
             SkillLibrary::builtin(),
@@ -1716,14 +1954,20 @@ mod tests {
                 NonEmptyText::parse("vetinari").expect("name"),
                 PathBuf::from("/work/repos/vetinari"),
             ),
+            QueueRules::default(),
             200,
             NOW,
-        );
-        app.apply(Update::Feed(Feed::new(
-            vec![pr_item(), issue_item(), message_item(), event_item()],
-            Vec::new(),
-            NOW,
-        )));
+        )
+    }
+
+    fn app() -> App {
+        let mut app = empty_app();
+        app.apply(Update::Polled(polled(vec![
+            pr_item(),
+            issue_item(),
+            message_item(),
+            event_item(),
+        ])));
         app
     }
 
@@ -1742,10 +1986,10 @@ mod tests {
     }
 
     fn select_row(app: &mut App, title: &str) {
+        press(app, "g g");
         for _ in 0..10 {
             if app
-                .feed()
-                .selected()
+                .selected_item()
                 .is_some_and(|item| item.title().as_str() == title)
             {
                 return;
@@ -1761,22 +2005,232 @@ mod tests {
         assert_eq!(app.focus(), Pane::Feed);
         assert!(app.overlay().is_none());
         assert_eq!(
-            app.feed().selected().expect("a row").title().as_str(),
+            app.selected_item().expect("a row").title().as_str(),
             "Sprint planning",
             "a meeting in fifteen minutes outranks a failing build"
         );
         assert_eq!(app.profile().id().as_str(), "work");
     }
 
+    fn position_of(app: &App, title: &str) -> String {
+        let row = app
+            .queue()
+            .view(app.now())
+            .now
+            .into_iter()
+            .chain(lanes_of(app))
+            .find(|entry| entry.item().title().as_str() == title)
+            .map(|entry| entry.item().id().clone())
+            .unwrap_or_else(|| panic!("no item titled {title:?}"));
+        format!("{:?}", app.queue().queue().position(&row))
+    }
+
+    fn lanes_of(app: &App) -> Vec<&vetinari_core::domain::queue::Entry> {
+        app.rows().into_iter().map(|row| row.entry).collect()
+    }
+
+    fn lane_of(app: &App, title: &str) -> Lane {
+        app.rows()
+            .into_iter()
+            .find(|row| row.entry.item().title().as_str() == title)
+            .map(|row| row.lane)
+            .unwrap_or_else(|| panic!("no row titled {title:?}"))
+    }
+
+    #[test]
+    fn spc_n_takes_what_needs_you_next() {
+        let mut app = app();
+
+        press(&mut app, "SPC n");
+
+        assert_eq!(lane_of(&app, "Sprint planning"), Lane::Now);
+        assert_eq!(
+            app.selected_item().expect("a row").title().as_str(),
+            "Sprint planning",
+            "the selection goes with what you took"
+        );
+    }
+
+    #[test]
+    fn taking_something_else_parks_what_you_were_on() {
+        let mut app = app();
+        press(&mut app, "SPC n");
+        select_row(&mut app, "Review spec");
+
+        press(&mut app, "SPC d t");
+
+        assert_eq!(lane_of(&app, "Review spec"), Lane::Now);
+        assert_eq!(lane_of(&app, "Sprint planning"), Lane::Parked);
+    }
+
+    #[test]
+    fn finishing_moves_on_to_the_row_that_followed() {
+        let mut app = app();
+        let second = app.rows()[1].entry.item().title().as_str().to_owned();
+
+        press(&mut app, "SPC d d");
+
+        assert_eq!(lane_of(&app, "Sprint planning"), Lane::Done);
+        assert_eq!(app.selected_item().expect("a row").title().as_str(), second);
+    }
+
+    #[test]
+    fn silencing_closes_an_item_for_good() {
+        let mut app = app();
+        select_row(&mut app, "Message from sarah");
+
+        press(&mut app, "SPC d x");
+
+        assert!(
+            position_of(&app, "Message from sarah").contains(&format!("{:?}", Closure::Silenced))
+        );
+    }
+
+    #[test]
+    fn parking_for_an_hour_brings_it_back_when_the_hour_is_up() {
+        let mut app = app();
+        select_row(&mut app, "Review spec");
+
+        press(&mut app, "SPC d p h");
+        assert_eq!(lane_of(&app, "Review spec"), Lane::Parked);
+        app.apply(Update::Tick(NOW + Duration::hours(1)));
+
+        assert_eq!(lane_of(&app, "Review spec"), Lane::Next);
+        assert!(
+            app.log()
+                .iter()
+                .any(|line| line.contains("jira:DEV-891") && line.contains("SnoozeEnded")),
+            "a return is logged with the rule that caused it: {:?}",
+            app.log()
+        );
+    }
+
+    #[test]
+    fn an_item_that_came_back_says_why_until_it_is_acted_on() {
+        let mut app = app();
+        select_row(&mut app, "Review spec");
+        press(&mut app, "SPC d p h");
+        app.apply(Update::Tick(NOW + Duration::hours(1)));
+        select_row(&mut app, "Review spec");
+
+        let row = app.selected().expect("a row");
+
+        assert_eq!(
+            app.row_note(&row).as_deref(),
+            Some("back: its park ran out")
+        );
+        assert!(
+            app.details()
+                .iter()
+                .any(|(key, value)| key == "Came back" && value == "its park ran out")
+        );
+    }
+
+    #[test]
+    fn parking_until_tomorrow_brings_it_back_at_nine() {
+        let mut app = app();
+        select_row(&mut app, "Review spec");
+
+        press(&mut app, "SPC d p t");
+
+        assert!(position_of(&app, "Review spec").contains(&format!(
+            "{:?}",
+            ParkUntil::Time(datetime!(2026-10-22 09:00 UTC))
+        )));
+    }
+
+    #[test]
+    fn parking_until_it_changes_waits_on_its_source() {
+        let mut app = app();
+        select_row(&mut app, "Review spec");
+
+        press(&mut app, "SPC d p c");
+
+        assert!(position_of(&app, "Review spec").contains(&format!("{:?}", ParkUntil::Changed)));
+    }
+
+    #[test]
+    fn waiting_on_a_reply_follows_up_later() {
+        let mut app = app();
+        select_row(&mut app, "Message from sarah");
+
+        press(&mut app, "SPC d w r");
+
+        assert_eq!(lane_of(&app, "Message from sarah"), Lane::Waiting);
+        assert!(position_of(&app, "Message from sarah").contains(&format!(
+            "{:?}",
+            WaitingOn::Reply {
+                follow_up_at: NOW + Duration::hours(2)
+            }
+        )));
+    }
+
+    #[test]
+    fn a_decision_the_queue_refuses_is_a_warning() {
+        let mut app = app();
+
+        press(&mut app, "SPC d w a");
+
+        let status = app.status().expect("a status");
+        assert_eq!(status.level, Level::Warn);
+        assert!(status.text.contains("no agent"), "{}", status.text);
+    }
+
+    #[test]
+    fn focus_time_holds_messages_back_until_it_is_ended() {
+        let mut app = app();
+
+        press(&mut app, "SPC t f");
+        assert_eq!(lane_of(&app, "Message from sarah"), Lane::HeldForFocus);
+        press(&mut app, "SPC t f");
+
+        assert_eq!(lane_of(&app, "Message from sarah"), Lane::Next);
+    }
+
+    #[test]
+    fn a_workflow_started_for_an_item_hands_it_to_the_agent() {
+        let mut app = app();
+        select_row(&mut app, "Fix memory leak in auth parser");
+        let Outcome::Task(Task::StartPrReview { item, .. }) = press(&mut app, "SPC p r") else {
+            panic!("expected a review task");
+        };
+
+        app.apply(Update::AgentStarted {
+            item,
+            session: SessionId::parse("s1").expect("session"),
+        });
+
+        assert_eq!(
+            lane_of(&app, "Fix memory leak in auth parser"),
+            Lane::Waiting
+        );
+        assert!(
+            position_of(&app, "Fix memory leak in auth parser")
+                .contains(&format!("{:?}", Lifecycle::Waiting(WaitingOn::Agent)))
+        );
+    }
+
+    #[test]
+    fn a_source_that_is_down_keeps_its_rows() {
+        let mut app = app();
+
+        app.apply(Update::Polled(vec![Polled {
+            source: source("jira"),
+            outcome: Err(PortError::unavailable("jira", "503")),
+        }]));
+
+        assert_eq!(lane_of(&app, "Review spec"), Lane::Next);
+    }
+
     #[test]
     fn vim_keys_move_the_feed_selection() {
         let mut app = app();
         press(&mut app, "j");
-        assert_eq!(app.feed().cursor(), 1);
+        assert_eq!(app.cursor(), 1);
         press(&mut app, "G");
-        assert_eq!(app.feed().cursor(), 3);
+        assert_eq!(app.cursor(), 3);
         press(&mut app, "g g");
-        assert_eq!(app.feed().cursor(), 0);
+        assert_eq!(app.cursor(), 0);
     }
 
     #[test]
@@ -1806,7 +2260,7 @@ mod tests {
             app.selected_session().map(|row| row.id.as_str().to_owned()),
             Some("s2".to_owned())
         );
-        assert_eq!(app.feed().cursor(), 0, "the feed selection is left alone");
+        assert_eq!(app.cursor(), 0, "the feed selection is left alone");
     }
 
     #[test]
@@ -1843,9 +2297,9 @@ mod tests {
 
         type_text(&mut app, "memory");
 
-        assert_eq!(app.feed().visible().len(), 1);
+        assert_eq!(app.rows().len(), 1);
         assert_eq!(
-            app.feed().selected().expect("a row").title().as_str(),
+            app.selected_item().expect("a row").title().as_str(),
             "Fix memory leak in auth parser"
         );
     }
@@ -1857,13 +2311,13 @@ mod tests {
         type_text(&mut app, "memory");
         press(&mut app, "RET");
         assert!(app.overlay().is_none());
-        assert_eq!(app.feed().filter(), "memory");
+        assert_eq!(app.filter(), "memory");
 
         press(&mut app, "/");
         type_text(&mut app, "zzz");
         press(&mut app, "<Esc>");
         assert!(app.overlay().is_none());
-        assert_eq!(app.feed().filter(), "memory", "the kept filter survives");
+        assert_eq!(app.filter(), "memory", "the kept filter survives");
     }
 
     #[test]
@@ -1873,8 +2327,8 @@ mod tests {
         type_text(&mut app, "memory");
         press(&mut app, "RET");
         press(&mut app, "<Esc>");
-        assert_eq!(app.feed().filter(), "");
-        assert_eq!(app.feed().visible().len(), 4);
+        assert_eq!(app.filter(), "");
+        assert_eq!(app.rows().len(), 4);
     }
 
     #[test]
@@ -1930,7 +2384,7 @@ mod tests {
 
         let outcome = press(&mut app, "SPC p r");
 
-        let Outcome::Task(Task::StartPrReview(pr)) = outcome else {
+        let Outcome::Task(Task::StartPrReview { pr, .. }) = outcome else {
             panic!("expected a review task, got {outcome:?}");
         };
         assert_eq!(pr.number, 142);
@@ -2403,6 +2857,7 @@ mod tests {
                 NonEmptyText::parse("vetinari").expect("name"),
                 PathBuf::from("/repo"),
             ),
+            QueueRules::default(),
             3,
             NOW,
         );
@@ -2416,14 +2871,10 @@ mod tests {
     #[test]
     fn problems_reported_by_a_refresh_reach_the_status_line_and_the_log() {
         let mut app = app();
-        app.apply(Update::Feed(Feed::new(
-            Vec::new(),
-            vec![SourceProblem {
-                source: source("jira"),
-                error: PortError::unavailable("jira", "503"),
-            }],
-            NOW,
-        )));
+        app.apply(Update::Polled(vec![Polled {
+            source: source("jira"),
+            outcome: Err(PortError::unavailable("jira", "503")),
+        }]));
 
         let status = app.status().expect("status");
         assert_eq!(status.level, Level::Error);
@@ -2460,7 +2911,7 @@ mod tests {
             }
             // Anything else is acceptable, so long as it did not panic and
             // the app is still usable.
-            assert!(app.feed().visible().len() <= 4);
+            assert!(app.rows().len() <= 4);
         }
     }
 
@@ -2470,8 +2921,7 @@ mod tests {
         app.apply(Update::Tick(NOW + Duration::minutes(10)));
         assert_eq!(app.now(), NOW + Duration::minutes(10));
         assert_eq!(
-            app.feed()
-                .selected()
+            app.selected_item()
                 .expect("a row")
                 .relative_time(app.now())
                 .as_deref(),
@@ -2514,10 +2964,8 @@ mod tests {
     }
 
     #[test]
-    fn the_details_pane_is_empty_when_the_feed_is() {
-        let mut app = app();
-        app.apply(Update::Feed(Feed::empty(NOW)));
-        assert!(app.details().is_empty());
+    fn the_details_pane_is_empty_when_the_queue_is() {
+        assert!(empty_app().details().is_empty());
     }
 
     #[test]

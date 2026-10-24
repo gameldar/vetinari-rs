@@ -813,3 +813,24 @@ impl DeviceCodeFlow for FakeDeviceCodeFlow {
         ))
     }
 }
+
+/// Items as every source that reported them would answer a poll.
+#[must_use]
+pub fn polled(
+    items: Vec<crate::domain::attention::AttentionItem>,
+) -> Vec<crate::application::attention::Polled> {
+    let mut by_source: BTreeMap<SourceId, Vec<_>> = BTreeMap::new();
+    for item in items {
+        by_source
+            .entry(item.source().clone())
+            .or_default()
+            .push(item);
+    }
+    by_source
+        .into_iter()
+        .map(|(source, items)| crate::application::attention::Polled {
+            source,
+            outcome: Ok(items),
+        })
+        .collect()
+}

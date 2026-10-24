@@ -500,7 +500,9 @@ impl AttentionItem {
     }
 }
 
-fn humanize(delta: Duration) -> String {
+/// A span of time, as short as a feed row wants it: `3d 2h`, `1h 5m`, `4m`.
+#[must_use]
+pub fn humanize(delta: Duration) -> String {
     let total_minutes = delta.whole_minutes();
     let days = total_minutes / (60 * 24);
     let hours = (total_minutes % (60 * 24)) / 60;

@@ -14,7 +14,7 @@ use time::OffsetDateTime;
 use super::ports::{AgentEngine, Clock, PortError, PortResult};
 use crate::domain::agent::{AgentSession, AgentStatus, TaskSpec};
 use crate::domain::attention::{AgentRef, AttentionItem, ItemContext, SourceCategory};
-use crate::domain::ids::{AgentId, SessionId, SourceId, SpaceId};
+use crate::domain::ids::{AgentId, ItemId, SessionId, SourceId, SpaceId};
 use crate::domain::routing::RoutingTable;
 use crate::domain::text::NonEmptyText;
 
@@ -214,6 +214,15 @@ impl AgentRegistry {
             .iter()
             .map(|tracked| self.as_item(tracked, now))
             .collect()
+    }
+
+    /// The item a session reports as.
+    #[must_use]
+    pub fn item_id(session: &SessionId) -> ItemId {
+        ItemId::from_parts(
+            &SourceId::parse(Self::SOURCE_NAME).expect("built-in source name is valid"),
+            session.as_str(),
+        )
     }
 
     /// The feed source id used for agent items.
@@ -653,6 +662,11 @@ mod tests {
         let items = registry.attention_items();
         assert_eq!(items.len(), 1);
         let item = &items[0];
+        assert_eq!(
+            item.id(),
+            &AgentRegistry::item_id(&id),
+            "a workflow can name the item before the agent first reports"
+        );
         assert_eq!(item.state(), ItemState::AgentWaiting);
         assert!(item.title().as_str().contains("do the thing"));
         match item.context() {

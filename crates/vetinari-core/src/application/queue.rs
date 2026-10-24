@@ -4,9 +4,10 @@
 use time::OffsetDateTime;
 
 use super::attention::{Polled, SourceProblem};
+use crate::domain::ids::ItemId;
 use crate::domain::queue::rules::QueueRules;
 use crate::domain::queue::view::QueueView;
-use crate::domain::queue::{Decision, Note, Queue, Refusal};
+use crate::domain::queue::{Decision, Entry, Note, Queue, Refusal};
 
 /// Owns the queue and what the last poll could not reach.
 #[derive(Debug, Clone)]
@@ -73,14 +74,198 @@ impl QueueService {
     }
 }
 
+/// Which lane of the queue a row sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Lane {
+    /// What the developer is working on.
+    Now,
+    /// What needs them, most urgent first.
+    Next,
+    /// Handed to someone or something else.
+    Waiting,
+    /// Set aside until something brings it back.
+    Parked,
+    /// Held back by focus time.
+    HeldForFocus,
+    /// Needs nothing yet.
+    Quiet,
+    /// Closed.
+    Done,
+}
+
+impl Lane {
+    /// The lane's heading.
+    #[must_use]
+    pub const fn title(&self) -> &'static str {
+        match self {
+            Lane::Now => "NOW",
+            Lane::Next => "NEXT",
+            Lane::Waiting => "WAITING",
+            Lane::Parked => "PARKED",
+            Lane::HeldForFocus => "HELD FOR FOCUS",
+            Lane::Quiet => "QUIET",
+            Lane::Done => "DONE",
+        }
+    }
+}
+
+/// One item, in its lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Row<'a> {
+    /// The lane.
+    pub lane: Lane,
+    /// The item and the queue's bookkeeping for it.
+    pub entry: &'a Entry,
+}
+
+/// Every item in the view, lane by lane, with nothing left out.
+#[must_use]
+pub fn lanes<'a>(view: &QueueView<'a>) -> Vec<Row<'a>> {
+    let row = |lane| move |entry| Row { lane, entry };
+    view.now
+        .into_iter()
+        .map(row(Lane::Now))
+        .chain(
+            view.next
+                .iter()
+                .map(|ranked| ranked.entry)
+                .map(row(Lane::Next)),
+        )
+        .chain(view.waiting.iter().copied().map(row(Lane::Waiting)))
+        .chain(view.parked.iter().copied().map(row(Lane::Parked)))
+        .chain(
+            view.held_for_focus
+                .iter()
+                .copied()
+                .map(row(Lane::HeldForFocus)),
+        )
+        .chain(view.quiet.iter().copied().map(row(Lane::Quiet)))
+        .chain(view.done.iter().copied().map(row(Lane::Done)))
+        .collect()
+}
+
+/// A filter and a selection over the queue's rows. The selection is held
+/// by item, so it follows the item from lane to lane as the queue moves.
+#[derive(Debug, Clone, Default)]
+pub struct QueueCursor {
+    filter: String,
+    selected: Option<ItemId>,
+    place: usize,
+}
+
+impl QueueCursor {
+    /// How many closed items are shown.
+    pub const DONE_SHOWN: usize = 5;
+
+    /// The rows the filter admits, with only the latest closed items.
+    #[must_use]
+    pub fn rows<'a>(&self, view: &QueueView<'a>) -> Vec<Row<'a>> {
+        let mut done = 0;
+        lanes(view)
+            .into_iter()
+            .filter(|row| row.entry.item().matches(&self.filter))
+            .filter(|row| {
+                if row.lane != Lane::Done {
+                    return true;
+                }
+                done += 1;
+                done <= Self::DONE_SHOWN
+            })
+            .collect()
+    }
+
+    /// Which row is selected.
+    #[must_use]
+    pub fn index(&self, view: &QueueView<'_>) -> Option<usize> {
+        self.index_in(&self.rows(view))
+    }
+
+    /// The selected row.
+    #[must_use]
+    pub fn selected<'a>(&self, view: &QueueView<'a>) -> Option<Row<'a>> {
+        let rows = self.rows(view);
+        self.index_in(&rows).map(|index| rows[index])
+    }
+
+    /// Move the selection by some rows, stopping at either end.
+    pub fn move_by(&mut self, view: &QueueView<'_>, by: isize) {
+        let rows = self.rows(view);
+        let Some(index) = self.index_in(&rows) else {
+            return;
+        };
+        self.select_in(&rows, index.saturating_add_signed(by));
+    }
+
+    /// Select the first row.
+    pub fn select_first(&mut self, view: &QueueView<'_>) {
+        self.select_in(&self.rows(view), 0);
+    }
+
+    /// Select the last row.
+    pub fn select_last(&mut self, view: &QueueView<'_>) {
+        self.select_in(&self.rows(view), usize::MAX);
+    }
+
+    /// Select an item, if it is among the rows.
+    pub fn select_item(&mut self, view: &QueueView<'_>, id: &ItemId) {
+        let rows = self.rows(view);
+        if let Some(index) = rows.iter().position(|row| row.entry.item().id() == id) {
+            self.select_in(&rows, index);
+        }
+    }
+
+    /// Stop following the selected item and stay on its row instead, so
+    /// that acting on an item moves on to the one after it.
+    pub fn keep_place(&mut self, view: &QueueView<'_>) {
+        if let Some(index) = self.index(view) {
+            self.place = index;
+        }
+        self.selected = None;
+    }
+
+    /// The filter in force.
+    #[must_use]
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Replace the filter.
+    pub fn set_filter(&mut self, filter: impl Into<String>) {
+        self.filter = filter.into();
+    }
+
+    /// Drop the filter.
+    pub fn clear_filter(&mut self) {
+        self.filter.clear();
+    }
+
+    fn index_in(&self, rows: &[Row<'_>]) -> Option<usize> {
+        if rows.is_empty() {
+            return None;
+        }
+        self.selected
+            .as_ref()
+            .and_then(|id| rows.iter().position(|row| row.entry.item().id() == id))
+            .or(Some(self.place.min(rows.len() - 1)))
+    }
+
+    fn select_in(&mut self, rows: &[Row<'_>], index: usize) {
+        let Some(last) = rows.len().checked_sub(1) else {
+            return;
+        };
+        self.place = index.min(last);
+        self.selected = Some(rows[self.place].entry.item().id().clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::application::ports::PortError;
     use crate::domain::attention::{AttentionItem, ItemState, SourceCategory};
     use crate::domain::ids::{ItemId, SourceId};
-    use crate::domain::queue::Position;
     use crate::domain::queue::lifecycle::{Closure, Lifecycle};
+    use crate::domain::queue::{ParkFor, Position};
     use crate::domain::text::NonEmptyText;
     use time::Duration;
     use time::macros::datetime;
@@ -119,6 +304,158 @@ mod tests {
 
     fn github(native: &str) -> ItemId {
         ItemId::from_parts(&source("github"), native)
+    }
+
+    fn parked_for(service: &mut QueueService, native: &str, minutes: i64) {
+        service
+            .decide(
+                NOW,
+                Decision::Park(
+                    github(native),
+                    ParkFor::Until(NOW + Duration::minutes(minutes)),
+                ),
+            )
+            .expect("parked");
+    }
+
+    fn row_ids(rows: &[Row<'_>]) -> Vec<(Lane, String)> {
+        rows.iter()
+            .map(|row| (row.lane, row.entry.item().id().as_str().to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn the_rows_run_lane_by_lane_from_what_you_are_on() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(
+            NOW,
+            vec![answered("github", vec![pr("1"), pr("2"), pr("3")])],
+        );
+        service
+            .decide(NOW, Decision::Take(github("2")))
+            .expect("taken");
+        parked_for(&mut service, "3", 60);
+
+        let rows = QueueCursor::default().rows(&service.view(NOW));
+
+        assert_eq!(
+            row_ids(&rows),
+            vec![
+                (Lane::Now, "github:2".to_owned()),
+                (Lane::Next, "github:1".to_owned()),
+                (Lane::Parked, "github:3".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_latest_closed_items_are_rows() {
+        let natives: Vec<String> = (0..QueueCursor::DONE_SHOWN + 2)
+            .map(|n| n.to_string())
+            .collect();
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(
+            NOW,
+            vec![answered(
+                "github",
+                natives.iter().map(|native| pr(native)).collect(),
+            )],
+        );
+        for native in &natives {
+            service
+                .decide(NOW, Decision::Finish(github(native)))
+                .expect("finished");
+        }
+
+        let rows = QueueCursor::default().rows(&service.view(NOW));
+
+        assert_eq!(rows.len(), QueueCursor::DONE_SHOWN);
+    }
+
+    #[test]
+    fn the_selection_follows_its_item_as_the_queue_moves() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(NOW, vec![answered("github", vec![pr("1"), pr("2")])]);
+        let mut cursor = QueueCursor::default();
+        cursor.move_by(&service.view(NOW), 1);
+
+        service
+            .decide(NOW, Decision::Take(github("2")))
+            .expect("taken");
+
+        let view = service.view(NOW);
+        let selected = cursor.selected(&view).expect("a selection");
+        assert_eq!(selected.entry.item().id(), &github("2"));
+        assert_eq!(selected.lane, Lane::Now);
+    }
+
+    #[test]
+    fn letting_go_of_the_item_keeps_the_place_instead() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(
+            NOW,
+            vec![answered("github", vec![pr("1"), pr("2"), pr("3")])],
+        );
+        let mut cursor = QueueCursor::default();
+        cursor.move_by(&service.view(NOW), 1);
+
+        cursor.keep_place(&service.view(NOW));
+        service
+            .decide(NOW, Decision::Finish(github("2")))
+            .expect("finished");
+
+        let view = service.view(NOW);
+        let selected = cursor.selected(&view).expect("a selection");
+        assert_eq!(selected.entry.item().id(), &github("3"));
+    }
+
+    #[test]
+    fn moving_stops_at_either_end() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(NOW, vec![answered("github", vec![pr("1"), pr("2")])]);
+        let view = service.view(NOW);
+        let mut cursor = QueueCursor::default();
+
+        cursor.move_by(&view, 10);
+        assert_eq!(cursor.index(&view), Some(1));
+        cursor.move_by(&view, -10);
+        assert_eq!(cursor.index(&view), Some(0));
+        cursor.select_last(&view);
+        assert_eq!(cursor.index(&view), Some(1));
+    }
+
+    #[test]
+    fn a_filter_narrows_the_rows_and_keeps_the_selection_when_it_can() {
+        let mut service = QueueService::new(QueueRules::default());
+        service.absorb(NOW, vec![answered("github", vec![pr("1"), pr("22")])]);
+        let mut cursor = QueueCursor::default();
+        cursor.select_last(&service.view(NOW));
+
+        cursor.set_filter("PR 22");
+
+        let view = service.view(NOW);
+        assert_eq!(cursor.rows(&view).len(), 1);
+        assert_eq!(
+            cursor
+                .selected(&view)
+                .expect("a selection")
+                .entry
+                .item()
+                .id(),
+            &github("22")
+        );
+        assert_eq!(cursor.filter(), "PR 22");
+    }
+
+    #[test]
+    fn an_empty_queue_has_no_selection() {
+        let service = QueueService::new(QueueRules::default());
+
+        assert!(
+            QueueCursor::default()
+                .selected(&service.view(NOW))
+                .is_none()
+        );
     }
 
     #[test]
