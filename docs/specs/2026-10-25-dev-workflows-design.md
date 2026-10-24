@@ -97,7 +97,7 @@ Parsed once at the boundary, then trusted.
 ```rust
 /// `[a-z0-9][a-z0-9-]{0,63}`, the engine's rule (engine spec 4.1).
 pub struct TaskQueue(String);
-/// The engine's `"<run>/<instance>/<attempt>"`, kept whole and split on demand.
+/// The engine's `"<run>~<instance>~<attempt>"` (13), parsed into its parts.
 pub struct TaskId { run: RunId, instance: NodeInstance, attempt: NonZeroU32 }
 /// A ULID the engine minted at claim time. Opaque to vetinari.
 pub struct LeaseToken(String);
@@ -108,14 +108,17 @@ pub struct NodeId(String);
 pub struct NodeInstance { node: NodeId, iterations: Vec<NonZeroU32> }
 /// A branch label: non-empty, `[a-z0-9-]+`.
 pub struct BranchLabel(String);
-/// What this daemon calls itself in a claim. Display only.
-pub struct WorkerName(Slug);
+/// What this daemon calls itself in a claim, and the middle of its queue names.
+/// `[a-z0-9][a-z0-9-]{0,48}`, so `vetinari-<worker>-human` is always a valid queue.
+pub struct WorkerName(String);
 /// `vetinari-<template>-<ulid>`. Section 4.4.
 pub struct DefinitionId(String);
 ```
 
 `NodeInstance` round-trips through its string form exactly as the engine spec defines it,
-including the rule that a suffix counts only if it is digits and dots. `TaskId` is parsed from
+including the rule that a suffix counts only if it is digits and dots. A legacy id such as `a@b`
+therefore reads as a top-level node and is then refused, because a vetinari `NodeId` never holds
+`@` and vetinari never registers one. `TaskId` is parsed from
 the claim reply, never assembled by vetinari, so a change in the engine's format is one parser.
 
 ### 4.2 Templates
@@ -205,8 +208,8 @@ questions are not planned.
 
 **Two inbound edges into `open-pr`.** `open-pr` has edges from `rework` (`done`) and from
 `review-stuck` (`open-anyway`). They are mutually exclusive, and the engine queues a successor
-per matched edge (parent engine spec 5.2), so it runs once. This relies on the engine
-accepting a non-join node with two inbound edges, which section 13 lists for confirmation.
+per matched edge (parent engine spec 5.2), so it runs once. The engine accepts a non-join node
+with several inbound edges and queues it once per matched edge (13).
 
 ### 4.4 Compiling
 
@@ -770,8 +773,9 @@ answer time is not possible: `ClaimTask` takes the oldest task on a queue, not a
 `loop.iteration` and for terminal run events, because `Skipped` is derived by the engine
 (engine spec 6) and the mirror must not try to derive it a second way.
 
-Refetches are coalesced to at most one in flight per run, with a 250 ms debounce. Section 13
-explains why gaps will be routine rather than rare, and the debounce is what keeps that cheap.
+Refetches are coalesced to at most one in flight per run, with a 250 ms debounce. `seq` counts
+only observable transitions (13), so a gap genuinely means a missed event; the debounce keeps a
+burst of them cheap.
 
 A run started by the launcher is added to the mirror from the `201` and its graph fetched at
 once. Runs of other workflows on the same gateway are ignored.
@@ -950,7 +954,7 @@ paused time.
 | Worker | claim then start then complete; capacity limits claiming; heartbeat cadence; heartbeat `Unavailable` retried and not fatal; `Stale` and `Gone` per 7.6; result missing, invalid, agent failed, agent cancelled; completion buffered while unavailable; restart re-adoption for every `HeldState`; earlier attempt's result adopted only when `HEAD` matches; unparseable config failed permanently; gate answered, gate answered after `Gone` | `FakeTaskGateway` (scripted replies, records calls), `MemoryLeaseJournal`, existing `FakeAgentEngine`, `FakeWorktreeManager`, `FakeWorkspaceTarget`, `FixedClock` |
 | Launcher | compiles, registers, starts; second live run for a ticket is `conflict`; register succeeded but start failed deletes the definition | `FakeRunGateway` |
 | Mirror | subscribe before fetch; buffered events applied above the graph's `seq`; gap and `resync` refetch; coalescing | `FakeRunEvents`, `FakeRunGateway` |
-| Gateway adapter | every row of 7.1's status table; bearer header; percent-encoded task ids; 401 then refresh then retry once; wire JSON of every compiled template equals its golden file; SSE parsing including `resync` and a dropped connection | existing `vetinari-adapters::testing::MockServer`, extended to stream a chunked body for SSE |
+| Gateway adapter | every row of 7.1's status table; bearer header; task ids in paths unencoded; 401 then refresh then retry once; wire JSON of every compiled template equals its golden file; SSE parsing including `resync` and a dropped connection | existing `vetinari-adapters::testing::MockServer`, extended to stream a chunked body for SSE |
 | OIDC | discovery, device code start and poll, refresh writing back to the store | `MockServer`, `MemoryCredentialStore` |
 | Socket | frame round trip for every method; oversized frame rejected; stream close; two clients watching at once | an in-process `UnixListener` in a temp dir |
 | TUI | strip glyphs and truncation at 60 columns; both popups; gate keys send the right answer | ratatui `TestBackend`, as `ui.rs` already uses |
@@ -1033,19 +1037,19 @@ Keyring access from a daemon needs the user's Secret Service session. Under a sy
 in a desktop session it has one. A headless machine has none, and the credential adapter has
 no file fallback today; that is gap 7.
 
-## 13. Engine spec points to confirm
+## 13. Engine spec points, resolved
 
-Found while designing against the engine spec. Each changes vetinari's code if the engine
-resolves it differently, so each is worth settling before the gateway endpoints are built.
+Found while designing against the engine spec, and settled with the engine side before the
+gateway endpoints are built.
 
-| Point | Engine spec says | Effect on vetinari | Suggested resolution |
-|---|---|---|---|
-| `seq` gaps | `seq` increments on every save; a claim saves twice and a heartbeat saves twice with no event | Every heartbeat makes a gap, so the gap rule refetches on nearly every event | A separate event sequence incremented only by event-emitting transitions, or document that gaps are routine. Vetinari's debounce copes either way |
-| Task id in a path | `TaskId` is `<run>/<instance>/<attempt>`, used as `/v1/tasks/{task}/...` | A `/` inside one path segment must be percent-encoded and decoded by axum | A separator that needs no encoding, or a documented encoding. The adapter percent-encodes meanwhile |
-| Public node tagging | 8.4 shows `{ "external": { ... } }`, "tagged as the existing three are"; `PublicNode` is internally tagged by `kind` | The wire shape vetinari writes | `{ "kind": "external", ... }`, matching `PublicNode`. Fixtures assume this |
-| Retry field | 8.4 shows `"retry": { "max_attempts": 1 }`; `RetrySpec` has `attempts` | Same | `attempts`, matching `RetrySpec` |
-| Two inbound edges into a non-join | Not stated; the parent spec queues a successor per matched edge | `open-pr` (4.3) | Confirm it registers and runs once when the edges are exclusive |
-| Run input on `GET /v1/runs/{id}` | Outputs keyed by instance | The recheck note (4.3) is read from `ask-info@n`'s output | Confirm outputs of loop body instances are returned under their `@` keys |
+| Point | Resolution | Effect on vetinari |
+|---|---|---|
+| `seq` gaps | `seq` increments exactly when the engine emits a run or node event. Heartbeats and other saves without an event do not bump it | A gap genuinely means a missed event (9.1) |
+| Task id in a path | `TaskId` is `<run>~<instance>~<attempt>`. `~` is URL-unreserved, so `/v1/tasks/{task}/...` needs no encoding | `TaskId::parse` splits on the first and last `~`; the adapter puts the id in the path as is |
+| Public node tagging | Internally tagged by `kind`, matching `PublicNode`: `{ "kind": "external", "id", "queue", "config", "lease_seconds", "deadline_seconds", "retry": { "attempts": N } }` and `{ "kind": "loop", "id", "body", "exit": { "node", "when" }, "max_iterations" }` | The wire shape vetinari writes, and its fixtures |
+| Retry field | `attempts`, matching `RetrySpec` | Same |
+| Inbound edges into a non-join | A non-join node may have several inbound edges; each matched edge queues it, so exclusive edges run it once | `open-pr` (4.3) |
+| Outputs on `GET /v1/runs/{id}` | Keyed by instance string form, e.g. `ask-info@2` | The recheck note (4.3) is read from `ask-info@n`'s key |
 
 ## 14. Build order
 
@@ -1091,8 +1095,8 @@ clean.
     laptop cannot receive. The gateway spec plans an `SseDeliverer` beside the webhook; when it
     exists, vetinarid subscribes and each fired event becomes a queue item through `runs.watch`
     (renamed `items.watch` then). Until it does, the same effect is available from what this
-    document builds: a workflow with a schedule trigger and one gate on the human queue. Which of
-    the two is preferred is open question 3 (16).
+    document builds: a workflow with a schedule trigger and one gate on the human queue. That route
+    is the one taken (16).
 
 ## 15. Known gaps and out of scope
 
@@ -1126,9 +1130,10 @@ clean.
 1. **The issuer.** Which OIDC provider fronts the gateway, and does it meet the three assumptions
    of section 12? Slice 13 can be built against `MockServer` either way, but the first live run
    cannot happen until this is known.
-2. **Worktree removal.** Section 7.6 never removes a worktree automatically. The alternative is to
-   remove it on dismissal when its branch is pushed, which needs a "pushed?" query on
-   `WorktreeManager`. Is the explicit action enough?
-3. **Reminders.** Ask autognomus for the gateway's planned `SseDeliverer` so scheduled events reach
-   vetinarid directly, or model reminders as schedule-triggered workflows with one gate, which needs
-   nothing new from autognomus but makes each reminder a workflow definition?
+
+Decided, with the defaults recorded here:
+
+| Question | Decision |
+|---|---|
+| Worktree removal | Stays an explicit action on the finished run item (7.6). No "pushed?" query is needed |
+| Reminders | A schedule-triggered workflow with one gate on the human queue. Nothing new is needed from autognomus |
