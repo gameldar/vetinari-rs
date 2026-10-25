@@ -202,7 +202,8 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
         if nodes.is_empty() {
             continue;
         }
-        let mut mark = Seen::Unreached;
+        let mut mark = Seen::Pending;
+        let mut pending = false;
         for (node, step) in &nodes {
             let seen = match current(graph, node) {
                 Current::Instance(state) => {
@@ -215,6 +216,7 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
                 Current::Pending => Seen::Pending,
                 Current::Unreached => Seen::Unreached,
             };
+            pending |= seen == Seen::Pending;
             mark = mark.max(seen);
         }
         let mark = match mark {
@@ -224,6 +226,7 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
             Seen::Elsewhere => Mark::Elsewhere,
             Seen::Pending => Mark::Next,
             Seen::Done => Mark::Done,
+            Seen::Unreached if pending => Mark::Next,
             Seen::Unreached if before_done && !graph.status.is_finished() => Mark::Next,
             Seen::Unreached => Mark::NotReached,
         };
@@ -241,12 +244,15 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
 }
 
 /// What one node contributes to its phase, weakest first, so a phase shows
-/// the strongest thing any of its nodes is doing.
+/// the strongest thing any of its nodes is doing. `Pending`, a node its
+/// loop's round has not reached, is weakest: the round may never reach it
+/// (a gate on a branch not taken), so it marks the phase next only when no
+/// node of the phase has anything else to show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Seen {
+    Pending,
     Unreached,
     Done,
-    Pending,
     Elsewhere,
     RunningHere,
     Failed,
@@ -507,6 +513,18 @@ mod tests {
         );
         let summary = summary(instances, &LocalSteps::default());
         assert_eq!(strip(&summary), "pre✓ impl✗2/3 rev○ pr·");
+    }
+
+    #[test]
+    fn a_node_its_round_may_never_reach_does_not_hold_the_phase_open() {
+        let summary = summary(
+            vec![
+                state("intake", InstanceStatus::Looping { iteration: nz(1) }),
+                state("preflight@1", done(Some("ready"))),
+            ],
+            &LocalSteps::default(),
+        );
+        assert_eq!(strip(&summary), "pre✓ impl○ rev· pr·");
     }
 
     #[test]
