@@ -485,6 +485,7 @@ impl GraphNodeReply {
                     .map(|node| parsed("loop body", NodeId::parse(node)))
                     .collect::<Result<_, _>>()?,
                 exit: parsed("loop exit", NodeId::parse(&exit.node))?,
+                exit_when: parsed("loop exit label", BranchLabel::parse(&exit.when))?,
                 max_iterations: NonZeroU32::new(max_iterations)
                     .ok_or_else(|| PortError::protocol(WHAT, "a loop with no iterations"))?,
             },
@@ -928,6 +929,7 @@ mod tests {
                         NodeId::parse("review").expect("id"),
                     ],
                     exit: NodeId::parse("review").expect("id"),
+                    exit_when: BranchLabel::parse("approved").expect("label"),
                     max_iterations: NonZeroU32::new(3).expect("bound"),
                 },
                 scope: None,

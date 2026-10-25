@@ -229,7 +229,11 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
                     if needs_you.is_none() {
                         needs_you = asks;
                     }
-                    seen
+                    if seen == Seen::Done && going_round(graph, node) {
+                        Seen::Elsewhere
+                    } else {
+                        seen
+                    }
                 }
                 Current::Pending => Seen::Pending,
                 Current::Unreached => Seen::Unreached,
@@ -329,6 +333,43 @@ fn current<'a>(graph: &'a RunGraph, node: &RunNode) -> Current<'a> {
         .filter(|state| state.instance.node() == &node.id)
         .max_by(|left, right| left.instance.iterations().cmp(right.instance.iterations()))
         .map_or(Current::Unreached, Current::Instance)
+}
+
+/// Whether `node`'s loop is running and its current round ended with the
+/// exit unmet, so the loop is about to go round again. The node's own event
+/// arrives before the next round's, and its phase must not read as finished
+/// in between.
+fn going_round(graph: &RunGraph, node: &RunNode) -> bool {
+    let Some(scope) = &node.scope else {
+        return false;
+    };
+    let Some(iteration) = graph.instances.iter().find_map(|state| match state.status {
+        InstanceStatus::Looping { iteration }
+            if state.instance.node() == scope && state.instance.iterations().is_empty() =>
+        {
+            Some(iteration)
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+    let Some((exit, when)) = graph
+        .nodes
+        .iter()
+        .find_map(|candidate| match &candidate.kind {
+            RunNodeKind::Loop {
+                exit, exit_when, ..
+            } if candidate.id == *scope => Some((exit, exit_when)),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let wanted = NodeInstance::within(exit.clone(), vec![iteration]);
+    graph.instances.iter().any(|state| {
+        state.instance == wanted
+            && matches!(&state.status, InstanceStatus::Done { branch } if branch.as_ref() != Some(when))
+    })
 }
 
 fn seen(state: &InstanceState, step: StepKind, local: &LocalSteps) -> (Seen, Option<NeedsYou>) {
@@ -549,6 +590,24 @@ mod tests {
             &LocalSteps::default(),
         );
         assert_eq!(strip(&summary), "pre✓ impl○ rev· pr·");
+    }
+
+    #[test]
+    fn a_round_whose_exit_was_not_met_keeps_its_phases_open_until_the_next_begins() {
+        // The review's event arrives before the loop's next iteration does,
+        // and the review asked for changes, so the work is not heading to
+        // the pull request.
+        let summary = summary(
+            vec![
+                state("intake", done(Some("done"))),
+                state("preflight@1", done(Some("ready"))),
+                state("rework", InstanceStatus::Looping { iteration: nz(1) }),
+                state("implement@1", done(Some("implemented"))),
+                state("review@1", done(Some("changes-requested"))),
+            ],
+            &LocalSteps::default(),
+        );
+        assert_eq!(strip(&summary), "pre✓ impl◐ rev◐ pr·");
     }
 
     #[test]

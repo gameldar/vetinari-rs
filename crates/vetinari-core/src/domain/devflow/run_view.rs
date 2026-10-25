@@ -61,6 +61,8 @@ pub enum RunNodeKind {
         body: Vec<NodeId>,
         /// The body node whose label can end the loop.
         exit: NodeId,
+        /// The label of `exit` that ends it.
+        exit_when: BranchLabel,
         /// The most iterations.
         max_iterations: NonZeroU32,
     },
@@ -422,12 +424,13 @@ pub(crate) mod tests {
         }
     }
 
-    fn looping(node: &str, body: [&str; 2], exit: &str) -> RunNode {
+    fn looping(node: &str, body: [&str; 2], exit: &str, when: &str) -> RunNode {
         RunNode {
             id: id(node),
             kind: RunNodeKind::Loop {
                 body: body.into_iter().map(id).collect(),
                 exit: id(exit),
+                exit_when: BranchLabel::parse(when).expect("label"),
                 max_iterations: nz(3),
             },
             scope: None,
@@ -449,10 +452,10 @@ pub(crate) mod tests {
             status: RunStatus::Active,
             seq,
             nodes: vec![
-                looping("intake", ["preflight", "ask-info"], "preflight"),
+                looping("intake", ["preflight", "ask-info"], "preflight", "ready"),
                 external("preflight", Some("intake"), false),
                 external("ask-info", Some("intake"), true),
-                looping("rework", ["implement", "review"], "review"),
+                looping("rework", ["implement", "review"], "review", "approved"),
                 external("implement", Some("rework"), false),
                 external("review", Some("rework"), false),
                 external("review-stuck", None, true),
