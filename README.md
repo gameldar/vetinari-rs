@@ -43,6 +43,17 @@ cargo install --path crates/vetinari-tui     # or: cargo build --release
 Needs Rust 1.88 or newer, `git`, and whichever agents and workspace backends
 you point it at (`claude`, `agy`, `tmux`, Herdr, an editor).
 
+Dev workflow runs need `vetinarid` running beside the interface, which never
+starts it. [`docs/systemd/`](docs/systemd/) has a user unit for it, and one for
+the local autognomus dev stack to run it against:
+
+```sh
+cargo install --path crates/vetinari-daemon
+cp docs/systemd/*.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now autognomus-dev-stack vetinarid
+```
+
 ## Using it
 
 ```sh

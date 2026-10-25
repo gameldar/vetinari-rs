@@ -1,0 +1,32 @@
+# vetinarid as a systemd user service.
+#
+#   cargo install --path crates/vetinari-daemon
+#   cp docs/systemd/vetinarid.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vetinarid
+#   journalctl --user -u vetinarid -f
+#
+# Steps run your coding agent, git and gh, so vetinarid needs the PATH your
+# shell has. Either edit PATH below or import it once per session with
+# `systemctl --user import-environment PATH` before starting the service.
+
+[Unit]
+Description=vetinari dev workflow worker
+Documentation=https://github.com/gameldar/vetinari/blob/main/docs/specs/2026-10-25-dev-workflows-design.md
+# Signing in through the issuer stores the token in the Secret Service
+# keyring, which a desktop session provides.
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/vetinarid --foreground
+# With a configuration other than ~/.config/vetinari/config.toml:
+# ExecStart=%h/.cargo/bin/vetinarid --foreground --config %h/.config/vetinari/workflows.toml
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=RUST_LOG=info
+# vetinarid shuts down on SIGINT and removes its socket.
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
