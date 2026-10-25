@@ -34,6 +34,7 @@ use vetinari_core::domain::devflow::compile::WorkflowGraph;
 use vetinari_core::domain::devflow::ids::{DefinitionId, NodeInstance, RunId};
 use vetinari_core::domain::devflow::outcome::GateAnswer;
 use vetinari_core::domain::devflow::run_view::{RunEvent, RunGraph, RunHeader, RunStatus};
+use vetinari_core::domain::devflow::step::StepConfig;
 use vetinari_core::domain::devflow::summary::{LocalStep, LocalSteps};
 use vetinari_core::domain::text::NonEmptyText;
 
@@ -359,6 +360,10 @@ impl RunGateway for ScriptedGateway {
 
     async fn definitions(&self) -> PortResult<Vec<DefinitionId>> {
         Ok(Vec::new())
+    }
+
+    async fn step_config(&self, _definition: &DefinitionId) -> PortResult<StepConfig> {
+        Err(PortError::unsupported(WHAT, "step_config"))
     }
 
     async fn runs(&self, _definition: &DefinitionId) -> PortResult<Vec<RunHeader>> {

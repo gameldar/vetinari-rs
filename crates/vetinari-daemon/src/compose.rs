@@ -551,6 +551,9 @@ mod tests {
                 DefinitionId::parse("vetinari-feature-01B").expect("id"),
             ])
         }
+        async fn step_config(&self, _definition: &DefinitionId) -> PortResult<StepConfig> {
+            Err(PortError::unsupported("listing", "step_config"))
+        }
         async fn runs(&self, definition: &DefinitionId) -> PortResult<Vec<RunHeader>> {
             Ok(vec![RunHeader {
                 id: RunId::parse(&format!("run-of-{definition}")).expect("run"),

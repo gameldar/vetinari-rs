@@ -43,6 +43,12 @@ workflows.json
     `callback` left out when unset) and autognomus-gateway/src/http/
     workflows.rs (`GET /v1/workflows`). Only `id` is read.
 
+workflow-view.json
+    autognomus-gateway/src/http/workflows.rs (`GET /v1/workflows/{id}`
+    answering one `WorkflowView`): feature-from-ticket.workflow.json with
+    the `version` the gateway adds. Only each node's `kind` and `config`
+    are read.
+
 run-events.sse
     autognomus-gateway/src/http/run_events.rs (`event:` is the subject
     without `ag.run.`, the data is the event's payload, and `resync` ends

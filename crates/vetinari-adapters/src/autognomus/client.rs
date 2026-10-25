@@ -23,12 +23,13 @@ use vetinari_core::domain::devflow::ids::{
     DefinitionId, LeaseToken, RunId, TaskId, TaskQueue, WorkerName,
 };
 use vetinari_core::domain::devflow::run_view::{RunEvent, RunGraph, RunHeader};
+use vetinari_core::domain::devflow::step::StepConfig;
 use vetinari_core::domain::devflow::task::{RawTask, StepFailure, StepOutput};
 
 use super::sse::SseDecoder;
 use super::wire::{
     ClaimReply, RunGraphReply, RunViewReply, StartedReply, WorkflowBody, WorkflowSummaryReply,
-    run_event,
+    WorkflowViewReply, run_event,
 };
 use crate::HttpClient;
 use vetinari_core::application::auth::AuthService;
@@ -424,6 +425,23 @@ impl RunGateway for HttpGateway {
             .into_iter()
             .filter_map(|summary| DefinitionId::parse(&summary.id).ok())
             .collect())
+    }
+
+    async fn step_config(&self, definition: &DefinitionId) -> PortResult<StepConfig> {
+        let answer = self
+            .send(
+                Method::GET,
+                &format!("/v1/workflows/{definition}"),
+                None,
+                None,
+            )
+            .await?;
+        if answer.status != StatusCode::OK {
+            return Err(answer.refusal("workflow", definition.as_str()));
+        }
+        answer
+            .json::<WorkflowViewReply>("workflow")?
+            .into_step_config()
     }
 
     async fn runs(&self, definition: &DefinitionId) -> PortResult<Vec<RunHeader>> {
@@ -1023,6 +1041,61 @@ mod tests {
             PortError::Refused { detail, .. } => assert!(detail.contains("exit not in body")),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_definition_is_read_for_the_config_its_steps_carry() {
+        let server = MockServer::start(vec![(200, fixture("workflow-view.json"))]).await;
+        let config = gateway(&server)
+            .step_config(&definition())
+            .await
+            .expect("config");
+
+        assert_eq!(
+            server.request().target,
+            format!("/v1/workflows/{DEFINITION}")
+        );
+        let written = compiled()
+            .nodes
+            .into_iter()
+            .find_map(|node| match node {
+                vetinari_core::domain::devflow::compile::GraphNode::External { config, .. } => {
+                    Some(config)
+                }
+                vetinari_core::domain::devflow::compile::GraphNode::Loop { .. } => None,
+            })
+            .expect("an external node");
+        assert_eq!(config, *written);
+    }
+
+    #[tokio::test]
+    async fn a_definition_with_no_step_vetinari_reads_is_a_protocol_error() {
+        let server = MockServer::start(vec![(
+            200,
+            json!({ "id": DEFINITION, "version": 1, "triggers": [], "edges": [],
+                "nodes": [{ "kind": "external", "id": "x", "queue": "q", "config": { "schema": 9 } }] })
+            .to_string(),
+        )])
+        .await;
+        let error = gateway(&server)
+            .step_config(&definition())
+            .await
+            .expect_err("unreadable");
+        assert!(matches!(error, PortError::Protocol { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn reading_a_missing_definition_is_not_found() {
+        let server = MockServer::start(vec![(
+            404,
+            json!({ "error": { "code": "not_found", "message": DEFINITION } }).to_string(),
+        )])
+        .await;
+        let error = gateway(&server)
+            .step_config(&definition())
+            .await
+            .expect_err("missing");
+        assert!(matches!(error, PortError::NotFound { .. }), "{error:?}");
     }
 
     #[tokio::test]

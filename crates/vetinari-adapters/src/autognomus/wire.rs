@@ -20,6 +20,7 @@ use vetinari_core::domain::devflow::run_view::{
     InstanceState, InstanceStatus, NodeChange, RunEvent, RunGraph, RunHeader, RunNode, RunNodeKind,
     RunStatus,
 };
+use vetinari_core::domain::devflow::step::StepConfig;
 use vetinari_core::domain::devflow::task::RawTask;
 
 /// How errors from this backend name it.
@@ -249,6 +250,38 @@ pub enum RunStateReply {
 pub struct WorkflowSummaryReply {
     /// The definition id.
     pub id: String,
+}
+
+/// `GET /v1/workflows/{id}`. Only the nodes' kinds and configs are read.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WorkflowViewReply {
+    /// The definition's nodes.
+    pub nodes: Vec<WorkflowNodeReply>,
+}
+
+/// A node of a definition, as far as vetinari reads one.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WorkflowNodeReply {
+    /// `external`, `loop`, or a kind vetinari never registers.
+    pub kind: String,
+    /// What an external node's worker reads.
+    #[serde(default)]
+    pub config: Option<Value>,
+}
+
+impl WorkflowViewReply {
+    /// The config of the definition's first external node, which carries
+    /// what every step of a vetinari run does.
+    pub fn into_step_config(self) -> Result<StepConfig, PortError> {
+        let config = self
+            .nodes
+            .into_iter()
+            .find(|node| node.kind == "external")
+            .and_then(|node| node.config)
+            .ok_or_else(|| PortError::protocol(WHAT, "a definition with no external node"))?;
+        StepConfig::parse(&config)
+            .map_err(|error| PortError::protocol(WHAT, format!("step config: {error}")))
+    }
 }
 
 /// `201` from `POST /v1/workflows/{id}/runs`.

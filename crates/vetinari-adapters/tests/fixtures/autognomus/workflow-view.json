@@ -1,0 +1,238 @@
+{
+  "id": "vetinari-feature-01JB7ZQ3XK",
+  "version": 1,
+  "triggers": [
+    {
+      "type": "manual"
+    }
+  ],
+  "nodes": [
+    {
+      "kind": "loop",
+      "id": "intake",
+      "body": [
+        "preflight",
+        "ask-info"
+      ],
+      "exit": {
+        "node": "preflight",
+        "when": "ready"
+      },
+      "max_iterations": 3
+    },
+    {
+      "kind": "external",
+      "id": "preflight",
+      "queue": "vetinari-hex-agent",
+      "config": {
+        "schema": 1,
+        "step": "preflight",
+        "template": "feature-from-ticket",
+        "ticket": {
+          "source": "jira",
+          "key": "ENG-412",
+          "title": "Rate-limit webhook retries",
+          "url": "https://acme.atlassian.net/browse/ENG-412"
+        },
+        "repo": {
+          "path": "/work/repos/web",
+          "remote": "acme/web"
+        },
+        "profile": "work",
+        "branch": "vetinari/eng-412-rate-limit-webhook-retries",
+        "base": "main",
+        "skill": "ticket-preflight"
+      },
+      "lease_seconds": 300,
+      "deadline_seconds": 1800,
+      "retry": {
+        "attempts": 3
+      }
+    },
+    {
+      "kind": "external",
+      "id": "ask-info",
+      "queue": "vetinari-hex-human",
+      "config": {
+        "schema": 1,
+        "step": "info-needed",
+        "template": "feature-from-ticket",
+        "ticket": {
+          "source": "jira",
+          "key": "ENG-412",
+          "title": "Rate-limit webhook retries",
+          "url": "https://acme.atlassian.net/browse/ENG-412"
+        },
+        "repo": {
+          "path": "/work/repos/web",
+          "remote": "acme/web"
+        },
+        "profile": "work",
+        "branch": "vetinari/eng-412-rate-limit-webhook-retries",
+        "base": "main"
+      },
+      "lease_seconds": 900,
+      "retry": {
+        "attempts": 10
+      }
+    },
+    {
+      "kind": "loop",
+      "id": "rework",
+      "body": [
+        "implement",
+        "review"
+      ],
+      "exit": {
+        "node": "review",
+        "when": "approved"
+      },
+      "max_iterations": 3
+    },
+    {
+      "kind": "external",
+      "id": "implement",
+      "queue": "vetinari-hex-agent",
+      "config": {
+        "schema": 1,
+        "step": "implement",
+        "template": "feature-from-ticket",
+        "ticket": {
+          "source": "jira",
+          "key": "ENG-412",
+          "title": "Rate-limit webhook retries",
+          "url": "https://acme.atlassian.net/browse/ENG-412"
+        },
+        "repo": {
+          "path": "/work/repos/web",
+          "remote": "acme/web"
+        },
+        "profile": "work",
+        "branch": "vetinari/eng-412-rate-limit-webhook-retries",
+        "base": "main",
+        "skill": "implement-tdd"
+      },
+      "lease_seconds": 300,
+      "deadline_seconds": 14400,
+      "retry": {
+        "attempts": 3
+      }
+    },
+    {
+      "kind": "external",
+      "id": "review",
+      "queue": "vetinari-hex-agent",
+      "config": {
+        "schema": 1,
+        "step": "review",
+        "template": "feature-from-ticket",
+        "ticket": {
+          "source": "jira",
+          "key": "ENG-412",
+          "title": "Rate-limit webhook retries",
+          "url": "https://acme.atlassian.net/browse/ENG-412"
+        },
+        "repo": {
+          "path": "/work/repos/web",
+          "remote": "acme/web"
+        },
+        "profile": "work",
+        "branch": "vetinari/eng-412-rate-limit-webhook-retries",
+        "base": "main",
+        "skill": "self-review"
+      },
+      "lease_seconds": 300,
+      "deadline_seconds": 3600,
+      "retry": {
+        "attempts": 3
+      }
+    },
+    {
+      "kind": "external",
+      "id": "review-stuck",
+      "queue": "vetinari-hex-human",
+      "config": {
+        "schema": 1,
+        "step": "review-stuck",
+        "template": "feature-from-ticket",
+        "ticket": {
+          "source": "jira",
+          "key": "ENG-412",
+          "title": "Rate-limit webhook retries",
+          "url": "https://acme.atlassian.net/browse/ENG-412"
+        },
+        "repo": {
+          "path": "/work/repos/web",
+          "remote": "acme/web"
+        },
+        "profile": "work",
+        "branch": "vetinari/eng-412-rate-limit-webhook-retries",
+        "base": "main"
+      },
+      "lease_seconds": 900,
+      "retry": {
+        "attempts": 10
+      }
+    },
+    {
+      "kind": "external",
+      "id": "open-pr",
+      "queue": "vetinari-hex-agent",
+      "config": {
+        "schema": 1,
+        "step": "open-pr",
+        "template": "feature-from-ticket",
+        "ticket": {
+          "source": "jira",
+          "key": "ENG-412",
+          "title": "Rate-limit webhook retries",
+          "url": "https://acme.atlassian.net/browse/ENG-412"
+        },
+        "repo": {
+          "path": "/work/repos/web",
+          "remote": "acme/web"
+        },
+        "profile": "work",
+        "branch": "vetinari/eng-412-rate-limit-webhook-retries",
+        "base": "main"
+      },
+      "lease_seconds": 120,
+      "deadline_seconds": 600,
+      "retry": {
+        "attempts": 5
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "preflight",
+      "to": "ask-info",
+      "when": "needs-info"
+    },
+    {
+      "from": "intake",
+      "to": "rework",
+      "when": "done"
+    },
+    {
+      "from": "implement",
+      "to": "review",
+      "when": "implemented"
+    },
+    {
+      "from": "rework",
+      "to": "open-pr",
+      "when": "done"
+    },
+    {
+      "from": "rework",
+      "to": "review-stuck",
+      "when": "exhausted"
+    },
+    {
+      "from": "review-stuck",
+      "to": "open-pr",
+      "when": "open-anyway"
+    }
+  ]
+}

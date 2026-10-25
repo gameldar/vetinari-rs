@@ -1115,6 +1115,41 @@ impl crate::application::devflow::ports::LeaseJournal for MemoryLeaseJournal {
     }
 }
 
+/// Run worktrees that record which branches' worktrees were removed, and
+/// can be told to refuse.
+#[derive(Debug, Default)]
+pub struct RecordingRunWorktrees {
+    removed: Mutex<Vec<String>>,
+    refuse: Mutex<Option<PortError>>,
+}
+
+impl RecordingRunWorktrees {
+    /// The branches whose worktrees were removed, in order.
+    #[must_use]
+    pub fn removed(&self) -> Vec<String> {
+        self.removed.lock().expect("removed lock").clone()
+    }
+
+    /// Refuse the next removal with `error`.
+    pub fn refuse(&self, error: PortError) {
+        *self.refuse.lock().expect("refuse lock") = Some(error);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::RunWorktrees for RecordingRunWorktrees {
+    async fn remove(&self, config: &crate::domain::devflow::step::StepConfig) -> PortResult<()> {
+        if let Some(error) = self.refuse.lock().expect("refuse lock").take() {
+            return Err(error);
+        }
+        self.removed
+            .lock()
+            .expect("removed lock")
+            .push(config.branch.to_string());
+        Ok(())
+    }
+}
+
 /// Run ids that count up from one millisecond, so a test knows each.
 #[derive(Debug, Default)]
 pub struct CountingRunIds(Mutex<u64>);
@@ -1254,6 +1289,13 @@ impl crate::application::devflow::ports::RunGateway for FakeRunGateway {
 
     async fn definitions(&self) -> PortResult<Vec<crate::domain::devflow::ids::DefinitionId>> {
         Err(PortError::unsupported("fake run gateway", "definitions"))
+    }
+
+    async fn step_config(
+        &self,
+        _definition: &crate::domain::devflow::ids::DefinitionId,
+    ) -> PortResult<crate::domain::devflow::step::StepConfig> {
+        Err(PortError::unsupported("fake run gateway", "step_config"))
     }
 
     async fn runs(

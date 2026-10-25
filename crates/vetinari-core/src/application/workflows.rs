@@ -367,6 +367,22 @@ impl WorkflowEngine {
         )
     }
 
+    /// Remove a run's worktree, the one its steps were started in.
+    pub async fn remove_run_worktree(
+        &self,
+        config: &StepConfig,
+        profile: &Profile,
+    ) -> PortResult<()> {
+        let spec = self.run_worktree(config, profile);
+        self.worktrees
+            .remove(&Worktree::new(
+                spec.path().to_path_buf(),
+                spec.branch().clone(),
+                spec.repo().to_path_buf(),
+            ))
+            .await
+    }
+
     /// The run's space: the one already open for its worktree, or a new one.
     async fn space_for_run(
         &self,
@@ -1066,6 +1082,17 @@ mod tests {
                 result.display().to_string()
             )));
             assert!(env.contains(&("VETINARI_RUN".to_owned(), "01JB7Z".to_owned())));
+        }
+
+        #[tokio::test]
+        async fn a_runs_worktree_is_removed_where_its_steps_ran() {
+            let h = harness();
+            let config = config(StepKind::Implement, Some("implement-tdd"));
+            h.workflows
+                .remove_run_worktree(&config, &h.profile)
+                .await
+                .expect("removed");
+            assert_eq!(h.worktrees.removed(), [PathBuf::from(TREE)]);
         }
 
         #[tokio::test]

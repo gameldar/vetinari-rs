@@ -108,6 +108,12 @@ pub trait RunGateway: Send + Sync {
     /// Every live definition vetinari registered: those whose id says so.
     async fn definitions(&self) -> PortResult<Vec<DefinitionId>>;
 
+    /// What a definition's steps are configured with: the ticket, the
+    /// repository, the profile and the branch, which `compile` writes into
+    /// every step alike. A definition with no step vetinari can read is a
+    /// protocol error.
+    async fn step_config(&self, definition: &DefinitionId) -> PortResult<StepConfig>;
+
     /// The runs of a definition.
     async fn runs(&self, definition: &DefinitionId) -> PortResult<Vec<RunHeader>>;
 
@@ -119,6 +125,13 @@ pub trait RunGateway: Send + Sync {
 
     /// Every output a run has recorded, keyed by instance string form.
     async fn outputs(&self, run: &RunId) -> PortResult<BTreeMap<String, serde_json::Value>>;
+}
+
+/// The worktree a run's steps share, as far as dismissing the run needs.
+#[async_trait]
+pub trait RunWorktrees: Send + Sync {
+    /// Remove the worktree of the run whose steps carry `config`.
+    async fn remove(&self, config: &StepConfig) -> PortResult<()>;
 }
 
 /// Where a run's definition gets the ULID in its id.
