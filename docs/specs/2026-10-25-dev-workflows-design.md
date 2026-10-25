@@ -878,6 +878,15 @@ Refetches are coalesced to at most one in flight per run, with a 250 ms debounce
 only observable transitions (13), so a gap genuinely means a missed event; the debounce keeps a
 burst of them cheap.
 
+As built (`application/devflow/mirror.rs`), the mirror owns no task: `watch` makes a run's graph
+due at once, `observe` takes each stream event, `refetches_due` and `next_due` tell the runtime
+what to fetch and when, and `refetch` does one fetch. Coalescing falls out of that: a run has one
+due time, a later reason never pushes it back, and `refetch` takes `&mut self`, so one owner
+cannot have two in flight. A failed fetch is due again after a second. `observe` also reports a
+run that a cancelled node or a finished run event says may be over, which the runtime passes to
+`StepWorker::hint_cancelled`; a finished run's leases go `Gone` as a cancelled one's do, so the
+hint covers both.
+
 A run started by the launcher is added to the mirror from the `201` and its graph fetched at
 once. Runs of other workflows on the same gateway are ignored.
 

@@ -3,5 +3,6 @@
 //! decides when to ask.
 
 pub mod lease;
+pub mod mirror;
 pub mod ports;
 pub mod worker;
