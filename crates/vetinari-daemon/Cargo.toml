@@ -1,0 +1,35 @@
+[package]
+name = "vetinari-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "vetinarid: runs dev workflow steps for the autognomus engine and serves their progress"
+default-run = "vetinarid"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "vetinarid"
+path = "src/bin/vetinarid.rs"
+
+[dependencies]
+vetinari-core.workspace = true
+vetinari-adapters.workspace = true
+
+async-trait.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+vetinari-core = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["test-util", "signal"] }

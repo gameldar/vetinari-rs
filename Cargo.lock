@@ -3558,6 +3558,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "vetinari-daemon"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vetinari-adapters",
+ "vetinari-core",
+]
+
+[[package]]
 name = "vetinari-tui"
 version = "0.1.0"
 dependencies = [
