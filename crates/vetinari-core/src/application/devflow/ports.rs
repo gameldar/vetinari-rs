@@ -11,7 +11,7 @@ use crate::domain::devflow::compile::WorkflowGraph;
 use crate::domain::devflow::held::HeldLease;
 use crate::domain::devflow::ids::{DefinitionId, LeaseToken, RunId, TaskId, TaskQueue, WorkerName};
 use crate::domain::devflow::outcome::OpenPrOutcome;
-use crate::domain::devflow::run_view::{RunGraph, RunHeader};
+use crate::domain::devflow::run_view::{RunEvent, RunGraph, RunHeader};
 use crate::domain::devflow::step::StepConfig;
 use crate::domain::devflow::task::{RawTask, StepFailure, StepOutput};
 use crate::domain::profile::Profile;
@@ -117,6 +117,22 @@ pub trait RunGateway: Send + Sync {
 
     /// Every output a run has recorded, keyed by instance string form.
     async fn outputs(&self, run: &RunId) -> PortResult<BTreeMap<String, serde_json::Value>>;
+}
+
+/// The engine's stream of every run's events.
+#[async_trait]
+pub trait RunEvents: Send + Sync {
+    /// Open the stream. Subscribe before fetching a graph, so no event
+    /// falls between the two (engine spec 7.3).
+    async fn subscribe(&self) -> PortResult<Box<dyn RunEventStream>>;
+}
+
+/// An open run event stream.
+#[async_trait]
+pub trait RunEventStream: Send {
+    /// The next event, or `None` once the stream has closed. A closed stream
+    /// may have dropped events, so whoever reopens it refetches every graph.
+    async fn next(&mut self) -> PortResult<Option<RunEvent>>;
 }
 
 /// Opens the pull request at the end of a run.

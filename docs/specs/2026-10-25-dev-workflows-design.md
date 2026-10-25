@@ -875,6 +875,18 @@ burst of them cheap.
 A run started by the launcher is added to the mirror from the `201` and its graph fetched at
 once. Runs of other workflows on the same gateway are ignored.
 
+**The stream, as built.** `RunEvents::subscribe` opens the stream and `RunEventStream::next`
+yields domain `RunEvent`s until it returns `None`; a dropped connection reads as a closed one,
+since either may have lost events and the reopen refetches. `HttpGateway` implements it, beside
+the task and run endpoints, so the token refresh is shared; `sse.rs` holds only the framing.
+The engine spec names the messages `event: <transition>` without saying how run, node and loop
+events are told apart, so the adapter reads the bus subject without `ag.run.` (`node.ready`,
+`loop.iteration`, `completed`) and the fixture says so (13). A message it cannot name, but whose
+`run` and `seq` it can read, is `RunEvent::Changed`, which `apply` answers with a refetch; one it
+cannot read at all is skipped and logged, and the `seq` gap it leaves does the same. A `resync`
+counts even with empty data. One connection lasts at most six hours, because the client's 20
+second timeout would end a quiet stream.
+
 ### 9.2 The phase strip
 
 The queue pane is about 60 by 12. A run item is one row, like every other item, with the strip

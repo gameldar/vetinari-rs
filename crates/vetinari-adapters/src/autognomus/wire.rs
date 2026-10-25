@@ -17,7 +17,8 @@ use vetinari_core::domain::devflow::ids::{
     BranchLabel, DefinitionId, LeaseToken, NodeId, NodeInstance, RunId, TaskId, TaskQueue,
 };
 use vetinari_core::domain::devflow::run_view::{
-    InstanceState, InstanceStatus, RunGraph, RunHeader, RunNode, RunNodeKind, RunStatus,
+    InstanceState, InstanceStatus, NodeChange, RunEvent, RunGraph, RunHeader, RunNode, RunNodeKind,
+    RunStatus,
 };
 use vetinari_core::domain::devflow::task::RawTask;
 
@@ -525,6 +526,157 @@ fn parsed<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> Result<T
     result.map_err(|error| PortError::protocol(WHAT, format!("{what}: {error}")))
 }
 
+/// The data of one run stream message. Every field but `run` and `seq`
+/// belongs to some events only; which ones is the event name's business.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EventData {
+    /// The run.
+    pub run: String,
+    /// The run's sequence number for this event.
+    pub seq: u64,
+    /// The node instance, on node and loop events.
+    #[serde(default)]
+    pub instance: Option<String>,
+    /// The attempt, on node events once there is one.
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    /// When, on node events.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub at: Option<OffsetDateTime>,
+    /// `suspended`: until when.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub resume_at: Option<OffsetDateTime>,
+    /// `offered`, `claimed`: the queue.
+    #[serde(default)]
+    pub queue: Option<String>,
+    /// `claimed`: the worker's label.
+    #[serde(default)]
+    pub worker: Option<String>,
+    /// `claimed`: when the lease runs out.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    /// `completed`: the label taken.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// `failed`: why.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// `failed`: whether another attempt follows.
+    #[serde(default)]
+    pub will_retry: Option<bool>,
+    /// `loop.iteration`: which.
+    #[serde(default)]
+    pub iteration: Option<u32>,
+}
+
+/// One message of the run stream as the domain's event. A message this
+/// copy cannot name is `Changed`, so it still counts in `seq` and its run
+/// is refetched rather than drawn wrong.
+pub fn run_event(name: &str, data: &str) -> Result<RunEvent, PortError> {
+    if name == "resync" {
+        return Ok(RunEvent::Resync);
+    }
+    let data: EventData = serde_json::from_str(data)
+        .map_err(|error| PortError::protocol(WHAT, format!("{name} event: {error}")))?;
+    let run = parsed("run id", RunId::parse(&data.run))?;
+    let seq = data.seq;
+    let status = match name {
+        "started" => Some(RunStatus::Active),
+        "completed" => Some(RunStatus::Completed),
+        "failed" => Some(RunStatus::Failed),
+        "cancelled" => Some(RunStatus::Cancelled),
+        _ => None,
+    };
+    if let Some(status) = status {
+        return Ok(RunEvent::Run { run, seq, status });
+    }
+    if name == "loop.iteration" {
+        return Ok(RunEvent::Iteration {
+            run,
+            instance: data.instance()?,
+            iteration: data
+                .iteration
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| data.missing(name, "iteration"))?,
+            seq,
+        });
+    }
+    let Some(change) = name
+        .strip_prefix("node.")
+        .map(|transition| data.change(transition))
+        .transpose()?
+        .flatten()
+    else {
+        tracing::warn!(event = name, %run, "autognomus sent an event this version cannot read");
+        return Ok(RunEvent::Changed { run, seq });
+    };
+    Ok(RunEvent::Node {
+        run,
+        instance: data.instance()?,
+        attempt: data.attempt.and_then(NonZeroU32::new),
+        at: data.at.ok_or_else(|| data.missing(name, "at"))?,
+        seq,
+        change,
+    })
+}
+
+impl EventData {
+    fn missing(&self, name: &str, field: &str) -> PortError {
+        PortError::protocol(
+            WHAT,
+            format!("{name} event for {} has no {field}", self.run),
+        )
+    }
+
+    fn instance(&self) -> Result<NodeInstance, PortError> {
+        let raw = self
+            .instance
+            .as_deref()
+            .ok_or_else(|| self.missing("node", "instance"))?;
+        parsed("instance", NodeInstance::parse(raw))
+    }
+
+    /// A node transition, or `None` for one this copy does not know.
+    fn change(&self, transition: &str) -> Result<Option<NodeChange>, PortError> {
+        let required = |value: Option<OffsetDateTime>, field| {
+            value.ok_or_else(|| self.missing(transition, field))
+        };
+        Ok(Some(match transition {
+            "ready" => NodeChange::Ready,
+            "dispatched" => NodeChange::Dispatched,
+            "suspended" => NodeChange::Suspended {
+                resume_at: required(self.resume_at, "resume_at")?,
+            },
+            "offered" => NodeChange::Offered {
+                queue: parsed(
+                    "queue",
+                    TaskQueue::parse(self.queue.as_deref().unwrap_or_default()),
+                )?,
+            },
+            "claimed" => NodeChange::Claimed {
+                worker: self
+                    .worker
+                    .clone()
+                    .ok_or_else(|| self.missing(transition, "worker"))?,
+                expires_at: required(self.expires_at, "expires_at")?,
+            },
+            "completed" => NodeChange::Completed {
+                branch: self
+                    .branch
+                    .as_deref()
+                    .map(|label| parsed("branch", BranchLabel::parse(label)))
+                    .transpose()?,
+            },
+            "failed" => NodeChange::Failed {
+                error: self.error.clone().unwrap_or_default(),
+                will_retry: self.will_retry.unwrap_or(false),
+            },
+            "cancelled" => NodeChange::Cancelled,
+            _ => return Ok(None),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -908,5 +1060,191 @@ mod tests {
             reply.into_header(),
             Err(PortError::Protocol { .. })
         ));
+    }
+
+    // Run events
+
+    fn events() -> Vec<RunEvent> {
+        let mut decoder = crate::autognomus::sse::SseDecoder::default();
+        decoder
+            .feed(include_bytes!(
+                "../../tests/fixtures/autognomus/run-events.sse"
+            ))
+            .into_iter()
+            .map(|message| run_event(&message.event, &message.data).expect("event"))
+            .collect()
+    }
+
+    fn run_id() -> RunId {
+        RunId::parse("01JB7ZR2M4Q9V8C6T3N5HKD0WX").expect("run")
+    }
+
+    fn preflight() -> NodeInstance {
+        NodeInstance::parse("preflight@1").expect("instance")
+    }
+
+    fn node(seq: u64, attempt: Option<u32>, at: OffsetDateTime, change: NodeChange) -> RunEvent {
+        node_of(preflight(), seq, attempt, at, change)
+    }
+
+    fn node_of(
+        instance: NodeInstance,
+        seq: u64,
+        attempt: Option<u32>,
+        at: OffsetDateTime,
+        change: NodeChange,
+    ) -> RunEvent {
+        RunEvent::Node {
+            run: run_id(),
+            instance,
+            attempt: attempt.and_then(NonZeroU32::new),
+            at,
+            seq,
+            change,
+        }
+    }
+
+    #[test]
+    fn every_event_of_the_stream_reads() {
+        let implement = NodeInstance::parse("implement@2").expect("instance");
+        assert_eq!(
+            events(),
+            [
+                RunEvent::Run {
+                    run: run_id(),
+                    seq: 1,
+                    status: RunStatus::Active
+                },
+                node(2, None, datetime!(2026-10-25 09:00 UTC), NodeChange::Ready),
+                node(
+                    3,
+                    Some(1),
+                    datetime!(2026-10-25 09:00:01 UTC),
+                    NodeChange::Dispatched
+                ),
+                node(
+                    4,
+                    Some(1),
+                    datetime!(2026-10-25 09:00:02 UTC),
+                    NodeChange::Suspended {
+                        resume_at: datetime!(2026-10-25 09:00:30 UTC)
+                    }
+                ),
+                node(
+                    5,
+                    Some(1),
+                    datetime!(2026-10-25 09:00:30 UTC),
+                    NodeChange::Offered {
+                        queue: TaskQueue::parse("vetinari-hex-agent").expect("queue")
+                    }
+                ),
+                node(
+                    6,
+                    Some(1),
+                    datetime!(2026-10-25 09:00:31 UTC),
+                    NodeChange::Claimed {
+                        worker: "hex".to_owned(),
+                        expires_at: datetime!(2026-10-25 09:05:31 UTC)
+                    }
+                ),
+                node(
+                    7,
+                    Some(1),
+                    datetime!(2026-10-25 09:04 UTC),
+                    NodeChange::Completed {
+                        branch: Some(BranchLabel::parse("ready").expect("label"))
+                    }
+                ),
+                RunEvent::Iteration {
+                    run: run_id(),
+                    instance: NodeInstance::parse("rework").expect("instance"),
+                    iteration: NonZeroU32::new(2).expect("iteration"),
+                    seq: 8
+                },
+                node_of(
+                    implement.clone(),
+                    9,
+                    Some(1),
+                    datetime!(2026-10-25 10:00 UTC),
+                    NodeChange::Failed {
+                        error: "agent crashed".to_owned(),
+                        will_retry: true
+                    }
+                ),
+                node_of(
+                    implement,
+                    10,
+                    Some(2),
+                    datetime!(2026-10-25 10:01 UTC),
+                    NodeChange::Cancelled
+                ),
+                RunEvent::Run {
+                    run: run_id(),
+                    seq: 11,
+                    status: RunStatus::Cancelled
+                },
+                RunEvent::Resync,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_event_this_copy_cannot_name_is_a_change_to_refetch() {
+        let event = run_event(
+            "node.hibernated",
+            r#"{"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","seq":12,"instance":"implement@2"}"#,
+        )
+        .expect("event");
+        assert_eq!(
+            event,
+            RunEvent::Changed {
+                run: run_id(),
+                seq: 12
+            }
+        );
+    }
+
+    #[test]
+    fn a_node_event_missing_its_instance_is_a_protocol_error() {
+        let error = run_event(
+            "node.ready",
+            r#"{"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","seq":2,"at":"2026-10-25T09:00:00Z"}"#,
+        )
+        .expect_err("no instance");
+        assert!(matches!(error, PortError::Protocol { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn an_event_without_a_run_or_seq_is_a_protocol_error() {
+        assert!(matches!(
+            run_event("node.ready", "{}"),
+            Err(PortError::Protocol { .. })
+        ));
+        assert!(matches!(
+            run_event("node.ready", "not json"),
+            Err(PortError::Protocol { .. })
+        ));
+    }
+
+    #[test]
+    fn the_run_events_name_their_status() {
+        for (name, status) in [
+            ("started", RunStatus::Active),
+            ("completed", RunStatus::Completed),
+            ("failed", RunStatus::Failed),
+            ("cancelled", RunStatus::Cancelled),
+        ] {
+            let event =
+                run_event(name, r#"{"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","seq":3}"#).expect("event");
+            assert_eq!(
+                event,
+                RunEvent::Run {
+                    run: run_id(),
+                    seq: 3,
+                    status
+                },
+                "{name}"
+            );
+        }
     }
 }

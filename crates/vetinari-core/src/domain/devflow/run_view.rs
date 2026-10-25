@@ -156,3 +156,94 @@ pub struct RunGraph {
     /// Every instance reached so far. A node with none has not been reached.
     pub instances: Vec<InstanceState>,
 }
+
+/// What happened to a node instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeChange {
+    /// It became ready.
+    Ready,
+    /// The engine started it.
+    Dispatched,
+    /// It is waiting on a timer.
+    Suspended {
+        /// Until when.
+        resume_at: OffsetDateTime,
+    },
+    /// It was offered on a queue.
+    Offered {
+        /// The queue.
+        queue: TaskQueue,
+    },
+    /// A worker claimed it.
+    Claimed {
+        /// The worker's label.
+        worker: String,
+        /// When the lease runs out.
+        expires_at: OffsetDateTime,
+    },
+    /// It finished.
+    Completed {
+        /// The label it took.
+        branch: Option<BranchLabel>,
+    },
+    /// An attempt failed.
+    Failed {
+        /// Why.
+        error: String,
+        /// Whether another attempt follows.
+        will_retry: bool,
+    },
+    /// A cancel abandoned it.
+    Cancelled,
+}
+
+/// One event from the engine's run stream. Events are hints (engine spec
+/// 7.2): `seq` says whether one was missed, and the graph is the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEvent {
+    /// A node instance moved.
+    Node {
+        /// The run.
+        run: RunId,
+        /// The instance.
+        instance: NodeInstance,
+        /// Its attempt, once it has one.
+        attempt: Option<NonZeroU32>,
+        /// When.
+        at: OffsetDateTime,
+        /// The run's sequence number for this event.
+        seq: u64,
+        /// What happened.
+        change: NodeChange,
+    },
+    /// A loop began an iteration.
+    Iteration {
+        /// The run.
+        run: RunId,
+        /// The loop's instance.
+        instance: NodeInstance,
+        /// Which iteration.
+        iteration: NonZeroU32,
+        /// The run's sequence number for this event.
+        seq: u64,
+    },
+    /// The run as a whole started or finished.
+    Run {
+        /// The run.
+        run: RunId,
+        /// The run's sequence number for this event.
+        seq: u64,
+        /// Where it is now.
+        status: RunStatus,
+    },
+    /// The run changed in a way only its graph shows: an event this version
+    /// cannot read, which still counts in `seq`.
+    Changed {
+        /// The run.
+        run: RunId,
+        /// The run's sequence number for this event.
+        seq: u64,
+    },
+    /// The stream dropped events: every run's graph is to be fetched again.
+    Resync,
+}

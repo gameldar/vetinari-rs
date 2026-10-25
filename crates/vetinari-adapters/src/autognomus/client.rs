@@ -5,7 +5,7 @@
 //! else: the ports speak replies, and only this module knows they were
 //! statuses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -15,18 +15,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime};
 use vetinari_core::application::devflow::ports::{
-    CancelReply, LeaseReply, RunGateway, TaskGateway, TaskReply,
+    CancelReply, LeaseReply, RunEventStream, RunEvents, RunGateway, TaskGateway, TaskReply,
 };
 use vetinari_core::application::ports::{PortError, PortResult};
 use vetinari_core::domain::devflow::compile::WorkflowGraph;
 use vetinari_core::domain::devflow::ids::{
     DefinitionId, LeaseToken, RunId, TaskId, TaskQueue, WorkerName,
 };
-use vetinari_core::domain::devflow::run_view::{RunGraph, RunHeader};
+use vetinari_core::domain::devflow::run_view::{RunEvent, RunGraph, RunHeader};
 use vetinari_core::domain::devflow::task::{RawTask, StepFailure, StepOutput};
 
+use super::sse::SseDecoder;
 use super::wire::{
     ClaimReply, RunGraphReply, RunViewReply, StartedReply, WorkflowBody, WorkflowSummaryReply,
+    run_event,
 };
 use crate::HttpClient;
 
@@ -446,12 +448,95 @@ impl RunGateway for HttpGateway {
     }
 }
 
+/// How long one stream connection may last before it is reopened. The
+/// client's default would end a quiet stream after twenty seconds; this
+/// bounds it without one being noticed, since a reopened stream refetches.
+const STREAM_TIMEOUT: StdDuration = StdDuration::from_secs(6 * 60 * 60);
+
+#[async_trait]
+impl RunEvents for HttpGateway {
+    async fn subscribe(&self) -> PortResult<Box<dyn RunEventStream>> {
+        let mut response = self.open_stream(false).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            response = self.open_stream(true).await?;
+        }
+        let status = response.status();
+        if status == StatusCode::OK {
+            return Ok(Box::new(SseStream {
+                response,
+                decoder: SseDecoder::default(),
+                pending: VecDeque::new(),
+            }));
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(PortError::Refused {
+                what: WHAT.to_owned(),
+                detail: "the gateway refused the token after a refresh".to_owned(),
+            });
+        }
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(PortError::unavailable(WHAT, describe(status, &body)));
+        }
+        Err(PortError::protocol(
+            WHAT,
+            format!("run events: {}", describe(status, &body)),
+        ))
+    }
+}
+
+impl HttpGateway {
+    async fn open_stream(&self, refresh: bool) -> PortResult<reqwest::Response> {
+        let token = self.bearer.token(refresh).await?;
+        self.http
+            .inner()
+            .get(self.url("/v1/runs/events"))
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .timeout(STREAM_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| PortError::unavailable(WHAT, error.to_string()))
+    }
+}
+
+/// An open `GET /v1/runs/events`.
+struct SseStream {
+    response: reqwest::Response,
+    decoder: SseDecoder,
+    pending: VecDeque<RunEvent>,
+}
+
+#[async_trait]
+impl RunEventStream for SseStream {
+    async fn next(&mut self) -> PortResult<Option<RunEvent>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            // A dropped connection ends the stream like a closed one: either
+            // way events may have been missed, and the reopen refetches.
+            let Ok(Some(chunk)) = self.response.chunk().await else {
+                return Ok(None);
+            };
+            for message in self.decoder.feed(&chunk) {
+                match run_event(&message.event, &message.data) {
+                    Ok(event) => self.pending.push_back(event),
+                    Err(error) => {
+                        tracing::warn!(%error, event = message.event, "skipped a run event");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::testing::MockServer;
+    use crate::testing::{MockServer, Reply};
     use time::macros::datetime;
     use vetinari_core::domain::devflow::outcome::{ReviewOutcome, StepOutcome, Summary};
     use vetinari_core::domain::devflow::run_view::RunStatus;
@@ -973,5 +1058,84 @@ mod tests {
         let outputs = gateway(&server).outputs(&run()).await.expect("outputs");
         assert_eq!(outputs["ask-info@1"]["note"], json!("Page size is 50"));
         assert_eq!(server.request().target, format!("/v1/runs/{RUN}"));
+    }
+
+    // The run stream
+
+    const EVENTS: &str = include_str!("../../tests/fixtures/autognomus/run-events.sse");
+
+    async fn drain(stream: &mut Box<dyn RunEventStream>) -> Vec<RunEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await.expect("event") {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn the_stream_of_every_run_is_opened_with_the_bearer_token() {
+        let server = MockServer::replying(vec![Reply::Stream(vec![])]).await;
+        let mut stream = gateway(&server).subscribe().await.expect("subscribe");
+        assert_eq!(stream.next().await.expect("closed"), None);
+
+        let request = server.request();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/v1/runs/events");
+        assert_eq!(request.header("accept"), Some("text/event-stream"));
+        assert_eq!(request.header("authorization"), Some("Bearer tok"));
+    }
+
+    #[tokio::test]
+    async fn events_arrive_however_the_stream_is_cut_and_end_when_it_closes() {
+        let bytes = EVENTS.as_bytes();
+        let chunks: Vec<String> = bytes
+            .chunks(37)
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("ascii fixture"))
+            .collect();
+        let server = MockServer::replying(vec![Reply::Stream(chunks)]).await;
+        let mut stream = gateway(&server).subscribe().await.expect("subscribe");
+        let events = drain(&mut stream).await;
+
+        assert_eq!(events.len(), 12);
+        assert!(matches!(events[0], RunEvent::Run { seq: 1, .. }));
+        assert_eq!(events[11], RunEvent::Resync);
+    }
+
+    #[tokio::test]
+    async fn a_message_that_cannot_be_read_is_skipped() {
+        let server = MockServer::replying(vec![Reply::Stream(vec![
+            "event: node.ready\ndata: not json\n\n".to_owned(),
+            "event: resync\ndata: {}\n\n".to_owned(),
+        ])])
+        .await;
+        let mut stream = gateway(&server).subscribe().await.expect("subscribe");
+        assert_eq!(drain(&mut stream).await, [RunEvent::Resync]);
+    }
+
+    #[tokio::test]
+    async fn a_stream_refused_for_its_token_is_retried_with_a_fresh_one() {
+        let server = MockServer::replying(vec![
+            Reply::Json(401, String::new()),
+            Reply::Stream(vec!["event: resync\ndata: {}\n\n".to_owned()]),
+        ])
+        .await;
+        let bearer = Arc::new(RecordingBearer::default());
+        let mut stream = gateway_with(&server.base_url, bearer.clone())
+            .subscribe()
+            .await
+            .expect("subscribe");
+        assert_eq!(drain(&mut stream).await, [RunEvent::Resync]);
+        assert_eq!(*bearer.asked.lock().expect("lock"), [false, true]);
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_gateway_cannot_serve_is_unavailable() {
+        let server = MockServer::start(vec![(503, String::new())]).await;
+        let error = gateway(&server)
+            .subscribe()
+            .await
+            .err()
+            .expect("unavailable");
+        assert!(error.is_transient(), "{error:?}");
     }
 }

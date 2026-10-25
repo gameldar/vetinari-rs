@@ -43,3 +43,16 @@ workflow-runs.json
 workflows.json
     autognomus 0c95213, autognomus-gateway/src/http/workflows.rs
     (`GET /v1/workflows` returning `[WorkflowView]`). Only `id` is read.
+
+run-events.sse
+    autognomus 0c95213, engine spec sections 7.1 (node transitions and
+    their extra fields; every node event carries run, workflow, instance,
+    attempt, at and seq; `loop.iteration` carries run, instance,
+    iteration and seq), 7.3 (`seq`) and 8.2 (`event: <transition>` with
+    the event's JSON as data, and `event: resync`). The spec does not name
+    the SSE events beyond `<transition>`; the names here are the bus
+    subjects without `ag.run.` (`node.ready`, `loop.iteration`,
+    `completed`), which also tells run events from node events. Run
+    events follow autognomus-gateway/src/outbound/runs.rs (`run`,
+    `workflow`) with `seq` added. Confirm when gateway task 9 serves the
+    stream.
