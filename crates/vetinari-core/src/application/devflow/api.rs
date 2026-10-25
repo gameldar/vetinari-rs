@@ -8,7 +8,13 @@ use time::OffsetDateTime;
 
 use crate::application::ports::PortError;
 use crate::domain::devflow::ids::{RunId, WorkerName};
-use crate::domain::devflow::summary::RunSummary;
+use serde_json::Value;
+
+use crate::domain::devflow::lanes::{IterationSelection, LaneRow, lanes};
+use crate::domain::devflow::notes::{RunNotes, notes};
+use crate::domain::devflow::run_view::RunGraph;
+use crate::domain::devflow::summary::{LocalSteps, Mark, RunSummary, row_mark};
+use crate::domain::devflow::template::TemplateKind;
 use crate::domain::text::NonEmptyText;
 
 /// The protocol this daemon speaks. A client speaking another is told to
@@ -34,6 +40,54 @@ pub struct RunItem {
     pub label: Option<RunLabel>,
     /// When it was started, when known.
     pub started_at: Option<OffsetDateTime>,
+}
+
+/// One row of a run's popup, marked as the strip would mark it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailRow {
+    /// The row.
+    pub row: LaneRow,
+    /// Its mark.
+    pub mark: Mark,
+}
+
+/// A run as its popup shows it (design 9.3): the item, every row, and what
+/// the latest preflight and review said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDetail {
+    /// The run's item.
+    pub item: RunItem,
+    /// The rows, at the selected iterations.
+    pub rows: Vec<DetailRow>,
+    /// The questions and findings.
+    pub notes: RunNotes,
+}
+
+impl RunDetail {
+    /// The detail of a run from its graph, this machine's steps and the
+    /// run's outputs.
+    #[must_use]
+    pub fn of(
+        item: RunItem,
+        graph: &RunGraph,
+        template: TemplateKind,
+        selection: &IterationSelection,
+        local: &LocalSteps,
+        outputs: &BTreeMap<String, Value>,
+    ) -> Self {
+        let rows = lanes(graph, selection)
+            .into_iter()
+            .map(|row| DetailRow {
+                mark: row_mark(row.state.as_ref(), local),
+                row,
+            })
+            .collect();
+        Self {
+            item,
+            rows,
+            notes: notes(template, outputs),
+        }
+    }
 }
 
 /// A change a `runs.watch` stream pushes.
@@ -66,6 +120,12 @@ impl RunBoard {
         }
         self.items.insert(item.summary.run.clone(), item.clone());
         Some(BoardChange::Run(item))
+    }
+
+    /// One run's item.
+    #[must_use]
+    pub fn get(&self, run: &RunId) -> Option<RunItem> {
+        self.items.get(run).cloned()
     }
 
     /// Drop a run; the change to push, unless it was not there.
@@ -180,7 +240,7 @@ mod tests {
     use super::*;
     use crate::domain::credentials::Provider;
     use crate::domain::devflow::run_view::RunStatus;
-    use crate::domain::devflow::summary::{Mark, Phase, PhaseCell};
+    use crate::domain::devflow::summary::{Phase, PhaseCell};
 
     fn run(raw: &str) -> RunId {
         RunId::parse(raw).expect("run")
@@ -240,6 +300,63 @@ mod tests {
         );
         assert_eq!(board.remove(&run("r1")), None);
         assert_eq!(board.snapshot(), [item("r2", Mark::Next)]);
+    }
+
+    #[test]
+    fn a_runs_detail_marks_each_row_and_reads_its_notes() {
+        use crate::domain::devflow::lanes::IterationSelection;
+        use crate::domain::devflow::run_view::InstanceStatus;
+        use crate::domain::devflow::run_view::tests::{feature_graph, instance, nz, state};
+        use crate::domain::devflow::summary::{LocalStep, LocalSteps};
+        use crate::domain::devflow::template::TemplateKind;
+
+        let graph = feature_graph(
+            4,
+            vec![
+                state("intake", InstanceStatus::Looping { iteration: nz(1) }),
+                state(
+                    "preflight@1",
+                    InstanceStatus::Done {
+                        branch: Some(
+                            crate::domain::devflow::ids::BranchLabel::parse("needs-info")
+                                .expect("label"),
+                        ),
+                    },
+                ),
+                state(
+                    "ask-info@1",
+                    InstanceStatus::Claimed {
+                        worker: "hex".to_owned(),
+                        expires_at: time::macros::datetime!(2026-10-25 10:30 UTC),
+                    },
+                ),
+            ],
+        );
+        let local = LocalSteps::default().with(instance("ask-info@1"), LocalStep::AwaitingPerson);
+        let outputs = BTreeMap::from([(
+            "preflight@1".to_owned(),
+            serde_json::json!({ "branch": "needs-info", "step": "preflight",
+                "questions": ["Page size?"], "git_branch": "vetinari/eng-412" }),
+        )]);
+
+        let detail = RunDetail::of(
+            item("r1", Mark::NeedsYou),
+            &graph,
+            TemplateKind::FeatureFromTicket,
+            &IterationSelection::default(),
+            &local,
+            &outputs,
+        );
+
+        let marks: Vec<(String, Mark)> = detail
+            .rows
+            .iter()
+            .map(|row| (row.row.node.as_str().to_owned(), row.mark))
+            .collect();
+        assert_eq!(marks[1], ("preflight".to_owned(), Mark::Done));
+        assert_eq!(marks[2], ("ask-info".to_owned(), Mark::NeedsYou));
+        assert_eq!(detail.notes.questions[0].as_str(), "Page size?");
+        assert_eq!(detail.item, item("r1", Mark::NeedsYou));
     }
 
     #[test]

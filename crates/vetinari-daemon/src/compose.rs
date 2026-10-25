@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use time::OffsetDateTime;
+use tokio::sync::mpsc;
 use vetinari_adapters::autognomus::client::{HttpGateway, StaticBearer};
 use vetinari_adapters::config::{candidate_paths, load_or_default};
 use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles};
@@ -27,16 +28,17 @@ use vetinari_core::application::ports::{Clock, PortError};
 use vetinari_core::application::ports::{PortResult, WorktreeManager};
 use vetinari_core::domain::devflow::compile::StepPolicies;
 use vetinari_core::domain::devflow::compile::WorkerQueues;
-use vetinari_core::domain::devflow::ids::WorkerName;
+use vetinari_core::domain::devflow::ids::{RunId, WorkerName};
 use vetinari_core::domain::devflow::outcome::OpenPrOutcome;
 use vetinari_core::domain::devflow::step::StepConfig;
 use vetinari_core::domain::devflow::template::TemplateKind;
 use vetinari_core::domain::profile::Profile;
 
+use crate::gates::{Gates, NoGates};
 use crate::hub::Hub;
 use crate::runtime::{Feed, OwnedRun, TokioClock, feed_runs};
 use crate::scripted::{Script, ScriptError};
-use crate::socket;
+use crate::socket::{self, Backend};
 use crate::steps::{LocalBoard, StepParts, claim_loop, spawn_steps};
 
 /// Where the daemon's runs come from.
@@ -162,6 +164,10 @@ pub struct Services {
     pub clock: Arc<dyn Clock>,
     /// The worker, when this daemon claims steps; none for a script.
     pub claims: Option<Claims>,
+    /// Who answers gates when there is no worker: a script's, or nobody.
+    pub gates: Arc<dyn Gates>,
+    /// This machine's steps, and the receiver that hears which changed.
+    pub local: (Arc<LocalBoard>, mpsc::UnboundedReceiver<RunId>),
 }
 
 /// How many agent steps run at once until `[daemon] max_agent_steps` is
@@ -275,7 +281,8 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
             })?;
             let script = Script::parse(&text)?;
             let owned = script.runs.clone();
-            let (runs, events) = script.replay();
+            let local = LocalBoard::new();
+            let (runs, events, gates) = script.replay(local.0.clone());
             Services {
                 runs,
                 events,
@@ -283,6 +290,8 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 worker: settings.worker.clone(),
                 clock,
                 claims: None,
+                gates,
+                local,
             }
         }
         Source::Gateway { url, token } => {
@@ -307,6 +316,8 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 worker: settings.worker.clone(),
                 clock,
                 claims: Some(claims),
+                gates: Arc::new(NoGates),
+                local: LocalBoard::new(),
             }
         }
     };
@@ -326,7 +337,7 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
         concat!("vetinarid ", env!("CARGO_PKG_VERSION")),
         services.worker.clone(),
     ));
-    let (local, touched) = LocalBoard::new();
+    let (local, touched) = services.local;
     let mut tasks = Vec::new();
     let steps = services.claims.map(|claims| {
         let (steps, owner) = spawn_steps(claims.parts, local.clone());
@@ -341,6 +352,16 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
         }
         steps
     });
+    let gates: Arc<dyn Gates> = match &steps {
+        Some(steps) => Arc::new(steps.clone()),
+        None => services.gates,
+    };
+    let backend = Arc::new(Backend {
+        runs: services.runs.clone(),
+        gates,
+        local: local.clone(),
+        template: TemplateKind::FeatureFromTicket,
+    });
     let feed = Feed {
         runs: services.runs,
         events: services.events,
@@ -352,7 +373,7 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
     };
     tasks.push(tokio::spawn(feed_runs(feed, services.owned, touched)));
     let served = tokio::select! {
-        served = socket::serve(listener, api, hub) => served.map_err(socket_error),
+        served = socket::serve(listener, api, hub, backend) => served.map_err(socket_error),
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
     for task in tasks {
@@ -374,7 +395,7 @@ mod tests {
     use vetinari_core::application::devflow::ports::CancelReply;
     use vetinari_core::application::ports::PortResult;
     use vetinari_core::domain::devflow::compile::WorkflowGraph;
-    use vetinari_core::domain::devflow::ids::{DefinitionId, RunId};
+    use vetinari_core::domain::devflow::ids::DefinitionId;
     use vetinari_core::domain::devflow::run_view::{RunGraph, RunHeader, RunStatus};
 
     use vetinari_core::application::config::RawConfig;

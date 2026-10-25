@@ -11,6 +11,7 @@ mod engine_rules;
 pub mod held;
 pub mod ids;
 pub mod lanes;
+pub mod notes;
 pub mod outcome;
 pub mod result;
 pub mod run_view;

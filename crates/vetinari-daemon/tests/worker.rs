@@ -31,8 +31,9 @@ use vetinari_core::domain::text::NonEmptyText;
 use vetinari_core::domain::workspace::TargetKind;
 use vetinari_core::testing::{FakePullRequestPublisher, MemorySkillStore};
 use vetinari_daemon::compose::{Claims, Services, serve};
+use vetinari_daemon::gates::NoGates;
 use vetinari_daemon::runtime::TokioClock;
-use vetinari_daemon::steps::StepParts;
+use vetinari_daemon::steps::{LocalBoard, StepParts};
 
 use gateway::Gateway;
 
@@ -183,6 +184,8 @@ async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
             owned: Vec::new(),
             worker: worker_name.clone(),
             clock: clock.clone(),
+            gates: Arc::new(NoGates),
+            local: LocalBoard::new(),
             claims: Some(Claims {
                 tasks: http,
                 queues: WorkerQueues::for_worker(&worker_name),

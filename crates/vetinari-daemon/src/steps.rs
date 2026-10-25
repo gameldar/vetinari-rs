@@ -10,18 +10,23 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
+use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use vetinari_core::application::agents::AgentRegistry;
+use vetinari_core::application::devflow::api::ApiError;
 use vetinari_core::application::devflow::ports::TaskGateway;
-use vetinari_core::application::devflow::worker::{CLAIM_WAIT, StepWorker};
-use vetinari_core::application::ports::Clock;
+use vetinari_core::application::devflow::worker::{CLAIM_WAIT, GateReply, StepWorker};
+use vetinari_core::application::ports::{Clock, PortResult};
 use vetinari_core::domain::agent::AgentStatus;
 use vetinari_core::domain::devflow::held::HeldState;
-use vetinari_core::domain::devflow::ids::{RunId, TaskQueue, WorkerName};
+use vetinari_core::domain::devflow::ids::{NodeInstance, RunId, TaskQueue, WorkerName};
+use vetinari_core::domain::devflow::outcome::GateAnswer;
 use vetinari_core::domain::devflow::summary::{LocalStep, LocalSteps};
 use vetinari_core::domain::devflow::task::RawTask;
 use vetinari_core::domain::ids::SessionId;
+
+use crate::gates::Gates;
 
 /// What the owner of the worker is asked to do.
 pub(crate) enum Command {
@@ -34,6 +39,12 @@ pub(crate) enum Command {
         reply: oneshot::Sender<()>,
     },
     Ending(RunId),
+    AnswerGate {
+        run: RunId,
+        instance: NodeInstance,
+        answer: GateAnswer,
+        reply: oneshot::Sender<PortResult<GateReply>>,
+    },
 }
 
 /// A handle on the task that owns the worker.
@@ -74,6 +85,29 @@ impl Steps {
     /// The run may be over: heartbeat its leases now (design 7.3).
     pub fn ending(&self, run: RunId) {
         let _ = self.0.try_send(Command::Ending(run));
+    }
+}
+
+#[async_trait]
+impl Gates for Steps {
+    async fn answer(
+        &self,
+        run: &RunId,
+        instance: &NodeInstance,
+        answer: GateAnswer,
+    ) -> Result<GateReply, ApiError> {
+        let (reply, answered) = oneshot::channel();
+        let gone = || ApiError::Unavailable("the worker has stopped".to_owned());
+        self.0
+            .send(Command::AnswerGate {
+                run: run.clone(),
+                instance: instance.clone(),
+                answer,
+                reply,
+            })
+            .await
+            .map_err(|_| gone())?;
+        Ok(answered.await.map_err(|_| gone())??)
     }
 }
 
@@ -188,6 +222,9 @@ async fn own(parts: StepParts, mut commands: mpsc::Receiver<Command>, local: Arc
                     let _ = reply.send(());
                 }
                 Some(Command::Ending(run)) => worker.hint_cancelled(&run),
+                Some(Command::AnswerGate { run, instance, answer, reply }) => {
+                    let _ = reply.send(worker.answer_gate(&run, &instance, answer).await);
+                }
             },
             () = sleep_until(due) => {
                 paused_until = None;
@@ -327,7 +364,6 @@ mod tests {
     use vetinari_core::application::workspaces::WorkspaceDirectory;
     use vetinari_core::domain::devflow::compile::{StepPolicies, WorkerQueues};
     use vetinari_core::domain::devflow::held::HeldLease;
-    use vetinari_core::domain::devflow::ids::NodeInstance;
     use vetinari_core::domain::devflow::outcome::{PreflightOutcome, StepOutcome};
     use vetinari_core::domain::devflow::task::ClaimedTask;
     use vetinari_core::domain::ids::{AgentId, ProfileId};
@@ -598,5 +634,49 @@ mod tests {
         assert_eq!(h.claude.spawned().len(), 1, "the step is started again");
         assert_eq!(h.journal.held().len(), 1);
         assert_eq!(claims(&h), 0, "the restarted step fills the machine");
+    }
+
+    fn gate_raw() -> RawTask {
+        let mut claim: serde_json::Value = serde_json::from_str(include_str!(
+            "../../vetinari-adapters/tests/fixtures/autognomus/claim-preflight-first.json"
+        ))
+        .expect("claim");
+        claim["id"] = serde_json::json!(format!("{RUN}~ask-info@1~1"));
+        claim["instance"] = serde_json::json!("ask-info@1");
+        claim["queue"] = serde_json::json!("vetinari-hex-human");
+        claim["config"]["step"] = serde_json::json!("info-needed");
+        claim["config"]
+            .as_object_mut()
+            .expect("config")
+            .remove("skill");
+        serde_json::from_value::<ClaimReply>(claim)
+            .expect("claim")
+            .into_raw()
+            .expect("raw")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_gate_needs_you_and_is_answered_through_the_steps() {
+        let h = harness();
+        h.tasks.on_claim(Ok(Some(gate_raw())));
+        claim_on(&h, queues().human);
+        settle(StdDuration::from_millis(100)).await;
+        let ask_info = NodeInstance::parse("ask-info@1").expect("instance");
+        assert_eq!(
+            h.local.get(&run()).get(&ask_info),
+            Some(&LocalStep::AwaitingPerson)
+        );
+
+        let reply = h
+            .steps
+            .answer(&run(), &ask_info, GateAnswer::Recheck { note: None })
+            .await;
+        assert_eq!(reply, Ok(GateReply::Sent));
+        assert!(h.tasks.calls().iter().any(|call| matches!(
+            call,
+            TaskCall::Complete(task, _) if task == &format!("{RUN}~ask-info@1~1")
+        )));
+        settle(StdDuration::from_millis(10)).await;
+        assert_eq!(h.local.get(&run()), LocalSteps::default());
     }
 }

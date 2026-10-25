@@ -14,12 +14,20 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use vetinari_adapters::daemon::protocol::{
-    MAX_FRAME, Outbound, Request, change_event, hello_result, parse_request, snapshot_event,
-    stream_opened,
+    MAX_FRAME, Outbound, Request, change_event, detail_event, gate_result, hello_result,
+    parse_request, snapshot_event, stream_opened,
 };
-use vetinari_core::application::devflow::api::{ApiError, BoardChange, ClientApi, RunItem};
+use vetinari_core::application::devflow::api::{
+    ApiError, BoardChange, ClientApi, RunDetail, RunItem,
+};
+use vetinari_core::application::devflow::ports::RunGateway;
+use vetinari_core::domain::devflow::ids::RunId;
+use vetinari_core::domain::devflow::lanes::IterationSelection;
+use vetinari_core::domain::devflow::template::TemplateKind;
 
+use crate::gates::Gates;
 use crate::hub::Hub;
+use crate::steps::LocalBoard;
 
 /// Bind the socket at `path`, in a directory only this user can enter. A
 /// socket file left by a daemon that is no longer running is replaced; one
@@ -43,11 +51,33 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
+/// What the socket's methods beyond the board reach.
+pub struct Backend {
+    /// The run endpoints, for outputs and cancelling.
+    pub runs: Arc<dyn RunGateway>,
+    /// Who answers gates.
+    pub gates: Arc<dyn Gates>,
+    /// This machine's steps, for a run's detail.
+    pub local: Arc<LocalBoard>,
+    /// The template every run is of.
+    pub template: TemplateKind,
+}
+
 /// Serve every connection until the listener fails.
-pub async fn serve(listener: UnixListener, api: Arc<ClientApi>, hub: Arc<Hub>) -> io::Result<()> {
+pub async fn serve(
+    listener: UnixListener,
+    api: Arc<ClientApi>,
+    hub: Arc<Hub>,
+    backend: Arc<Backend>,
+) -> io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(connection(stream, api.clone(), hub.clone()));
+        tokio::spawn(connection(
+            stream,
+            api.clone(),
+            hub.clone(),
+            backend.clone(),
+        ));
     }
 }
 
@@ -55,7 +85,7 @@ pub async fn serve(listener: UnixListener, api: Arc<ClientApi>, hub: Arc<Hub>) -
 const OUTBOX: usize = 64;
 
 /// One client, until it hangs up or sends a frame too large to read.
-async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>) {
+async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>, backend: Arc<Backend>) {
     let (reader, mut writer) = stream.into_split();
     let (outbox, mut outgoing) = mpsc::channel::<Outbound>(OUTBOX);
     let writing = tokio::spawn(async move {
@@ -125,6 +155,62 @@ async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>) {
                 streams.insert(stream, tokio::spawn(forwarding));
                 continue;
             }
+            Ok((id, Request::RunWatch { run, selection })) => {
+                if hub.run(&run).is_none() {
+                    Outbound::Error {
+                        id: Some(id),
+                        error: ApiError::NotFound(format!("run {run}")),
+                    }
+                } else {
+                    let stream = next_stream;
+                    next_stream += 1;
+                    let touches = hub.touches();
+                    let opened = Outbound::Reply {
+                        id,
+                        result: stream_opened(stream),
+                    };
+                    if outbox.send(opened).await.is_err() {
+                        break;
+                    }
+                    let watching = Watching {
+                        stream,
+                        run,
+                        selection,
+                        hub: hub.clone(),
+                        backend: backend.clone(),
+                        outbox: outbox.clone(),
+                    };
+                    streams.insert(stream, tokio::spawn(watching.forward(touches)));
+                    continue;
+                }
+            }
+            Ok((
+                id,
+                Request::GateAnswer {
+                    run,
+                    instance,
+                    answer,
+                },
+            )) => match backend.gates.answer(&run, &instance, answer).await {
+                Ok(reply) => Outbound::Reply {
+                    id,
+                    result: gate_result(reply),
+                },
+                Err(error) => Outbound::Error {
+                    id: Some(id),
+                    error,
+                },
+            },
+            Ok((id, Request::RunCancel { run })) => match backend.runs.cancel(&run).await {
+                Ok(_) => Outbound::Reply {
+                    id,
+                    result: serde_json::json!({}),
+                },
+                Err(error) => Outbound::Error {
+                    id: Some(id),
+                    error: error.into(),
+                },
+            },
             Ok((id, Request::StreamClose { stream })) => match streams.remove(&stream) {
                 Some(forwarding) => {
                     forwarding.abort();
@@ -148,6 +234,60 @@ async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>) {
     }
     drop(outbox);
     let _ = writing.await;
+}
+
+/// A `run.watch` stream: the run's detail now, and again whenever its item
+/// or graph changes.
+struct Watching {
+    stream: u64,
+    run: RunId,
+    selection: IterationSelection,
+    hub: Arc<Hub>,
+    backend: Arc<Backend>,
+    outbox: mpsc::Sender<Outbound>,
+}
+
+impl Watching {
+    async fn forward(self, mut touches: broadcast::Receiver<RunId>) {
+        loop {
+            if let Some(detail) = self.detail().await {
+                let event = Outbound::Event {
+                    stream: self.stream,
+                    event: detail_event(&detail),
+                };
+                if self.outbox.send(event).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                match touches.recv().await {
+                    Ok(run) if run == self.run => break,
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    }
+
+    async fn detail(&self) -> Option<RunDetail> {
+        let (item, graph) = self.hub.run(&self.run)?;
+        let outputs = match self.backend.runs.outputs(&self.run).await {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                tracing::warn!(%error, run = %self.run, "cannot read a run's outputs");
+                BTreeMap::new()
+            }
+        };
+        Some(RunDetail::of(
+            item,
+            &graph,
+            self.backend.template,
+            &self.selection,
+            &self.backend.local.get(&self.run),
+            &outputs,
+        ))
+    }
 }
 
 /// A `runs.watch` stream: the snapshot, then each change. A watcher too slow
@@ -185,13 +325,21 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::{Value, json};
+    use std::sync::Mutex;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+    use async_trait::async_trait;
     use vetinari_core::application::devflow::api::RunLabel;
-    use vetinari_core::domain::devflow::ids::{RunId, WorkerName};
-    use vetinari_core::domain::devflow::run_view::RunStatus;
+    use vetinari_core::application::devflow::worker::GateReply;
+    use vetinari_core::domain::devflow::ids::{NodeId, NodeInstance, TaskQueue, WorkerName};
+    use vetinari_core::domain::devflow::outcome::GateAnswer;
+    use vetinari_core::domain::devflow::run_view::{
+        InstanceState, InstanceStatus, RunGraph, RunNode, RunNodeKind, RunStatus,
+    };
     use vetinari_core::domain::devflow::summary::RunSummary;
     use vetinari_core::domain::text::NonEmptyText;
+    use vetinari_core::testing::FakeRunGateway;
 
     use super::*;
 
@@ -199,6 +347,27 @@ mod tests {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
         hub: Arc<Hub>,
+        runs: Arc<FakeRunGateway>,
+        gates: Arc<RecordingGates>,
+    }
+
+    #[derive(Default)]
+    struct RecordingGates(Mutex<Vec<(String, String, GateAnswer)>>);
+
+    #[async_trait]
+    impl Gates for RecordingGates {
+        async fn answer(
+            &self,
+            run: &RunId,
+            instance: &NodeInstance,
+            answer: GateAnswer,
+        ) -> Result<GateReply, ApiError> {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((run.to_string(), instance.to_string(), answer));
+            Ok(GateReply::Sent)
+        }
     }
 
     async fn server() -> Server {
@@ -210,12 +379,104 @@ mod tests {
             "vetinarid test",
             WorkerName::parse("hex").expect("worker"),
         ));
-        tokio::spawn(serve(listener, api, hub.clone()));
+        let runs = Arc::new(FakeRunGateway::default());
+        let gates = Arc::new(RecordingGates::default());
+        let backend = Arc::new(Backend {
+            runs: runs.clone(),
+            gates: gates.clone(),
+            local: LocalBoard::new().0,
+            template: TemplateKind::FeatureFromTicket,
+        });
+        tokio::spawn(serve(listener, api, hub.clone(), backend));
         Server {
             _dir: dir,
             path,
             hub,
+            runs,
+            gates,
         }
+    }
+
+    fn graph(run: &str, status: InstanceStatus) -> RunGraph {
+        RunGraph {
+            run: RunId::parse(run).expect("run"),
+            status: RunStatus::Active,
+            seq: 3,
+            nodes: vec![RunNode {
+                id: NodeId::parse("open-pr").expect("id"),
+                kind: RunNodeKind::External {
+                    queue: TaskQueue::parse("vetinari-hex-agent").expect("queue"),
+                },
+                scope: None,
+            }],
+            edges: Vec::new(),
+            instances: vec![InstanceState {
+                instance: NodeInstance::parse("open-pr").expect("instance"),
+                status,
+                attempt: None,
+                first_ready_at: None,
+                finished_at: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watched_run_streams_its_detail_on_every_change() {
+        let server = server().await;
+        server.hub.put(item("r1"));
+        server.hub.put_graph(graph("r1", InstanceStatus::Running));
+        let mut client = Client::connect(&server).await;
+        client
+            .send(r#"{"id":1,"method":"run.watch","params":{"run":"r1"}}"#)
+            .await;
+        let stream = client.frame().await["result"]["stream"].clone();
+        let first = client.frame().await;
+        assert_eq!(first["stream"], stream);
+        assert_eq!(first["event"]["type"], json!("graph"));
+        assert_eq!(first["event"]["rows"][0]["status"], json!("running"));
+
+        server
+            .hub
+            .put_graph(graph("r1", InstanceStatus::Done { branch: None }));
+        let second = client.frame().await;
+        assert_eq!(second["event"]["rows"][0]["status"], json!("done"));
+    }
+
+    #[tokio::test]
+    async fn watching_a_run_the_daemon_does_not_have_is_not_found() {
+        let server = server().await;
+        let mut client = Client::connect(&server).await;
+        client
+            .send(r#"{"id":2,"method":"run.watch","params":{"run":"r9"}}"#)
+            .await;
+        assert_eq!(client.frame().await["error"]["code"], json!("not-found"));
+    }
+
+    #[tokio::test]
+    async fn a_gate_answer_goes_to_the_gates_and_a_cancel_to_the_gateway() {
+        let server = server().await;
+        let mut client = Client::connect(&server).await;
+        client
+            .send(r#"{"id":3,"method":"gate.answer","params":{"run":"r1","instance":"ask-info@1","answer":{"kind":"recheck"}}}"#)
+            .await;
+        assert_eq!(
+            client.frame().await,
+            json!({ "id": 3, "result": { "sent": true } })
+        );
+        assert_eq!(
+            server.gates.0.lock().expect("lock").clone(),
+            [(
+                "r1".to_owned(),
+                "ask-info@1".to_owned(),
+                GateAnswer::Recheck { note: None }
+            )]
+        );
+
+        client
+            .send(r#"{"id":4,"method":"run.cancel","params":{"run":"r1"}}"#)
+            .await;
+        assert_eq!(client.frame().await, json!({ "id": 4, "result": {} }));
+        assert_eq!(server.runs.cancelled(), ["r1"]);
     }
 
     struct Client {

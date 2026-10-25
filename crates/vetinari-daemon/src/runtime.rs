@@ -190,6 +190,7 @@ fn publish(feed: &Feed, mirror: &RunMirror, owned: &BTreeMap<RunId, OwnedRun>, r
     let (Some(graph), Some(known)) = (mirror.graph(run), owned.get(run)) else {
         return;
     };
+    feed.hub.put_graph(graph.clone());
     feed.hub.put(RunItem {
         summary: summarise(graph, feed.template, &feed.local.get(run)),
         label: known.label.clone(),

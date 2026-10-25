@@ -5,9 +5,19 @@
 //! the server in `vetinari-daemon` and the TUI's client. Unknown fields are
 //! ignored in both directions.
 
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
-use vetinari_core::application::devflow::api::{ApiError, BoardChange, Hello, RunItem};
+use vetinari_core::application::devflow::api::{
+    ApiError, BoardChange, DetailRow, Hello, RunDetail, RunItem,
+};
+use vetinari_core::application::devflow::worker::GateReply;
+use vetinari_core::domain::devflow::ids::{NodeId, NodeInstance, RunId};
+use vetinari_core::domain::devflow::lanes::{IterationSelection, Lane, RowKind};
+use vetinari_core::domain::devflow::outcome::{GateAnswer, Line};
+use vetinari_core::domain::devflow::run_view::InstanceStatus;
 use vetinari_core::domain::devflow::run_view::RunStatus;
 use vetinari_core::domain::devflow::step::StepKind;
 use vetinari_core::domain::devflow::summary::{Mark, NeedsYou};
@@ -43,6 +53,27 @@ pub enum Request {
     StreamClose {
         /// The stream to close.
         stream: u64,
+    },
+    /// `run.watch`: a stream of one run's detail.
+    RunWatch {
+        /// The run.
+        run: RunId,
+        /// Which iteration of each loop to show; the latest otherwise.
+        selection: IterationSelection,
+    },
+    /// `gate.answer`.
+    GateAnswer {
+        /// The run.
+        run: RunId,
+        /// The gate's instance.
+        instance: NodeInstance,
+        /// The answer.
+        answer: GateAnswer,
+    },
+    /// `run.cancel`.
+    RunCancel {
+        /// The run.
+        run: RunId,
     },
 }
 
@@ -89,9 +120,80 @@ pub fn parse_request(line: &str) -> Result<(u64, Request), BadFrame> {
             let Params { stream } = serde_json::from_value(frame.params.clone()).map_err(params)?;
             Request::StreamClose { stream }
         }
+        "run.watch" => {
+            #[derive(Deserialize)]
+            struct Params {
+                run: String,
+                #[serde(default)]
+                iterations: BTreeMap<String, NonZeroU32>,
+            }
+            let Params { run, iterations } =
+                serde_json::from_value(frame.params.clone()).map_err(params)?;
+            let mut selection = IterationSelection::default();
+            for (node, iteration) in iterations {
+                let node = NodeId::parse(&node).map_err(|error| invalid(error.to_string()))?;
+                selection = selection.with(node, iteration);
+            }
+            Request::RunWatch {
+                run: run_id(&run).map_err(invalid)?,
+                selection,
+            }
+        }
+        "gate.answer" => {
+            #[derive(Deserialize)]
+            struct Params {
+                run: String,
+                instance: String,
+                answer: Answer,
+            }
+            #[derive(Deserialize)]
+            #[serde(tag = "kind", rename_all = "kebab-case")]
+            enum Answer {
+                Recheck {
+                    #[serde(default)]
+                    note: Option<String>,
+                },
+                OpenAnyway,
+            }
+            let Params {
+                run,
+                instance,
+                answer,
+            } = serde_json::from_value(frame.params.clone()).map_err(params)?;
+            let answer = match answer {
+                Answer::Recheck { note } => GateAnswer::Recheck {
+                    note: note
+                        .filter(|note| !note.trim().is_empty())
+                        .map(|note| Line::parse(&note))
+                        .transpose()
+                        .map_err(|error| invalid(format!("note: {error}")))?,
+                },
+                Answer::OpenAnyway => GateAnswer::OpenAnyway,
+            };
+            Request::GateAnswer {
+                run: run_id(&run).map_err(invalid)?,
+                instance: NodeInstance::parse(&instance)
+                    .map_err(|error| invalid(error.to_string()))?,
+                answer,
+            }
+        }
+        "run.cancel" => {
+            #[derive(Deserialize)]
+            struct Params {
+                run: String,
+            }
+            let Params { run } = serde_json::from_value(frame.params.clone()).map_err(params)?;
+            Request::RunCancel {
+                run: run_id(&run).map_err(invalid)?,
+            }
+        }
         other => return Err(invalid(format!("no method {other:?}"))),
     };
     Ok((frame.id, request))
+}
+
+fn run_id(raw: &str) -> Result<RunId, String> {
+    RunId::parse(raw).map_err(|error| format!("run: {error}"))
 }
 
 /// A frame the daemon sends.
@@ -171,6 +273,115 @@ pub fn change_event(change: &BoardChange) -> Value {
         }
         BoardChange::Removed(run) => json!({ "type": "removed", "run": run.as_str() }),
     }
+}
+
+/// `gate.answer`'s result: whether the gateway took it, and if not whether
+/// it is queued to be sent.
+#[must_use]
+pub fn gate_result(reply: GateReply) -> Value {
+    match reply {
+        GateReply::Sent => json!({ "sent": true }),
+        GateReply::Queued => json!({ "sent": false, "queued": true }),
+        GateReply::NotOpen => json!({ "sent": false, "queued": false }),
+    }
+}
+
+/// An event of a `run.watch` stream.
+#[must_use]
+pub fn detail_event(detail: &RunDetail) -> Value {
+    let rows: Vec<Value> = detail.rows.iter().map(detail_row).collect();
+    let mut event = json!({
+        "type": "graph",
+        "run": run_item(&detail.item),
+        "rows": rows,
+        "questions": detail.notes.questions.iter().map(Line::as_str).collect::<Vec<_>>(),
+    });
+    if let Some(findings) = &detail.notes.findings {
+        event["findings"] = json!({
+            "round": findings.round.get(),
+            "items": findings.findings.iter().map(|finding| {
+                let mut item = json!({ "text": finding.text.as_str() });
+                if let Some(file) = &finding.file {
+                    item["file"] = json!(file.as_str());
+                }
+                if let Some(line) = finding.line {
+                    item["line"] = json!(line.get());
+                }
+                item
+            }).collect::<Vec<_>>(),
+        });
+    }
+    event
+}
+
+fn detail_row(row: &DetailRow) -> Value {
+    let mut value = json!({
+        "indent": row.row.indent,
+        "node": row.row.node.as_str(),
+        "lane": match row.row.lane {
+            Lane::Alone => "alone",
+            Lane::First => "first",
+            Lane::Middle => "middle",
+            Lane::Last => "last",
+        },
+        "mark": mark_name(row.mark),
+        "glyph": row.mark.glyph().to_string(),
+    });
+    if let RowKind::Loop {
+        reached,
+        selected,
+        bound,
+    } = row.row.kind
+    {
+        value["loop"] = json!({
+            "reached": reached,
+            "selected": selected.get(),
+            "bound": bound.get(),
+        });
+    }
+    if let Some(state) = &row.row.state {
+        value["instance"] = json!(state.instance.to_string());
+        let (status, extra) = match &state.status {
+            InstanceStatus::Ready => ("ready", None),
+            InstanceStatus::Running => ("running", None),
+            InstanceStatus::Waiting { until } => ("waiting", Some(("until", time_value(*until)))),
+            InstanceStatus::Offered { queue } => {
+                ("offered", Some(("queue", json!(queue.as_str()))))
+            }
+            InstanceStatus::Claimed { worker, .. } => ("claimed", Some(("worker", json!(worker)))),
+            InstanceStatus::Looping { iteration } => {
+                ("looping", Some(("iteration", json!(iteration.get()))))
+            }
+            InstanceStatus::Done { branch } => (
+                "done",
+                branch
+                    .as_ref()
+                    .map(|branch| ("branch", json!(branch.as_str()))),
+            ),
+            InstanceStatus::Failed { error } => ("failed", Some(("error", json!(error)))),
+            InstanceStatus::Skipped => ("skipped", None),
+            InstanceStatus::Cancelled => ("cancelled", None),
+        };
+        value["status"] = json!(status);
+        if let Some((key, extra)) = extra {
+            value[key] = extra;
+        }
+        if let Some(attempt) = state.attempt {
+            value["attempt"] = json!(attempt.get());
+        }
+        if let Some(at) = state.first_ready_at {
+            value["first_ready_at"] = time_value(at);
+        }
+        if let Some(at) = state.finished_at {
+            value["finished_at"] = time_value(at);
+        }
+    }
+    value
+}
+
+fn time_value(at: time::OffsetDateTime) -> Value {
+    at.format(&time::format_description::well_known::Rfc3339)
+        .map_or(Value::Null, Value::String)
 }
 
 /// A run item as JSON: the summary the daemon derived, so the client
@@ -256,10 +467,15 @@ mod tests {
 
     use time::macros::datetime;
     use vetinari_core::application::devflow::api::RunLabel;
-    use vetinari_core::domain::devflow::ids::{NodeInstance, RunId, WorkerName};
+    use vetinari_core::domain::devflow::ids::WorkerName;
     use vetinari_core::domain::devflow::step::GateKind;
     use vetinari_core::domain::devflow::summary::{Phase, PhaseCell, Round, RunSummary};
     use vetinari_core::domain::text::NonEmptyText;
+
+    use vetinari_core::domain::devflow::ids::BranchLabel;
+    use vetinari_core::domain::devflow::lanes::LaneRow;
+    use vetinari_core::domain::devflow::notes::RunNotes;
+    use vetinari_core::domain::devflow::run_view::InstanceState;
 
     use super::*;
 
@@ -325,6 +541,149 @@ mod tests {
             parse_request(r#"{"id":3,"method":"stream.close","params":{"stream":9}}"#),
             Ok((3, Request::StreamClose { stream: 9 }))
         );
+    }
+
+    #[test]
+    fn a_run_is_watched_answered_and_cancelled_by_name() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"method":"run.watch","params":{"run":"r1"}}"#),
+            Ok((
+                1,
+                Request::RunWatch {
+                    run: RunId::parse("r1").expect("run"),
+                    selection: IterationSelection::default(),
+                }
+            ))
+        );
+        assert_eq!(
+            parse_request(
+                r#"{"id":2,"method":"run.watch","params":{"run":"r1","iterations":{"rework":1}}}"#
+            ),
+            Ok((
+                2,
+                Request::RunWatch {
+                    run: RunId::parse("r1").expect("run"),
+                    selection: IterationSelection::default()
+                        .with(NodeId::parse("rework").expect("node"), NonZeroU32::MIN),
+                }
+            ))
+        );
+        assert_eq!(
+            parse_request(
+                r#"{"id":3,"method":"gate.answer","params":{"run":"r1","instance":"ask-info@1","answer":{"kind":"recheck","note":"Page size is 50"}}}"#
+            ),
+            Ok((
+                3,
+                Request::GateAnswer {
+                    run: RunId::parse("r1").expect("run"),
+                    instance: NodeInstance::parse("ask-info@1").expect("instance"),
+                    answer: GateAnswer::Recheck {
+                        note: Some(Line::parse("Page size is 50").expect("note")),
+                    },
+                }
+            ))
+        );
+        assert_eq!(
+            parse_request(
+                r#"{"id":4,"method":"gate.answer","params":{"run":"r1","instance":"review-stuck","answer":{"kind":"open-anyway"}}}"#
+            )
+            .map(|(_, request)| request),
+            Ok(Request::GateAnswer {
+                run: RunId::parse("r1").expect("run"),
+                instance: NodeInstance::parse("review-stuck").expect("instance"),
+                answer: GateAnswer::OpenAnyway,
+            })
+        );
+        assert_eq!(
+            parse_request(r#"{"id":5,"method":"run.cancel","params":{"run":"r1"}}"#),
+            Ok((
+                5,
+                Request::RunCancel {
+                    run: RunId::parse("r1").expect("run")
+                }
+            ))
+        );
+        let bad = parse_request(
+            r#"{"id":6,"method":"gate.answer","params":{"run":"r1","instance":"ask-info@1","answer":{"kind":"maybe"}}}"#,
+        )
+        .expect_err("invalid");
+        assert_eq!((bad.id, bad.error.code()), (Some(6), "invalid"));
+    }
+
+    #[test]
+    fn a_gate_answer_says_whether_it_was_sent() {
+        assert_eq!(gate_result(GateReply::Sent), json!({ "sent": true }));
+        assert_eq!(
+            gate_result(GateReply::Queued),
+            json!({ "sent": false, "queued": true })
+        );
+        assert_eq!(
+            gate_result(GateReply::NotOpen),
+            json!({ "sent": false, "queued": false })
+        );
+    }
+
+    #[test]
+    fn a_detail_event_carries_the_item_its_rows_and_its_notes() {
+        let detail = RunDetail {
+            item: item(),
+            rows: vec![
+                DetailRow {
+                    row: LaneRow {
+                        indent: 0,
+                        node: NodeId::parse("intake").expect("node"),
+                        lane: Lane::Alone,
+                        kind: RowKind::Loop {
+                            reached: 1,
+                            selected: NonZeroU32::MIN,
+                            bound: NonZeroU32::new(3).expect("three"),
+                        },
+                        state: None,
+                    },
+                    mark: Mark::NeedsYou,
+                },
+                DetailRow {
+                    row: LaneRow {
+                        indent: 1,
+                        node: NodeId::parse("preflight").expect("node"),
+                        lane: Lane::Alone,
+                        kind: RowKind::Node,
+                        state: Some(InstanceState {
+                            instance: NodeInstance::parse("preflight@1").expect("instance"),
+                            status: InstanceStatus::Done {
+                                branch: Some(BranchLabel::parse("needs-info").expect("label")),
+                            },
+                            attempt: Some(NonZeroU32::MIN),
+                            first_ready_at: Some(datetime!(2026-10-25 09:00 UTC)),
+                            finished_at: Some(datetime!(2026-10-25 09:04 UTC)),
+                        }),
+                    },
+                    mark: Mark::Done,
+                },
+            ],
+            notes: RunNotes {
+                questions: vec![Line::parse("Page size?").expect("question")],
+                findings: None,
+            },
+        };
+        let event = detail_event(&detail);
+        assert_eq!(event["type"], json!("graph"));
+        assert_eq!(event["run"]["ticket"], json!("ENG-412"));
+        assert_eq!(
+            event["rows"][0],
+            json!({ "indent": 0, "node": "intake", "lane": "alone", "mark": "needs-you",
+                    "glyph": "?", "loop": { "reached": 1, "selected": 1, "bound": 3 } })
+        );
+        assert_eq!(
+            event["rows"][1],
+            json!({ "indent": 1, "node": "preflight", "lane": "alone", "mark": "done",
+                    "glyph": "✓", "instance": "preflight@1", "status": "done",
+                    "branch": "needs-info", "attempt": 1,
+                    "first_ready_at": "2026-10-25T09:00:00Z",
+                    "finished_at": "2026-10-25T09:04:00Z" })
+        );
+        assert_eq!(event["questions"], json!(["Page size?"]));
+        assert_eq!(event.get("findings"), None);
     }
 
     #[test]

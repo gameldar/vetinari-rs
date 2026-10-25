@@ -1131,6 +1131,24 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
 - Deviations: `max_agent_steps` is fixed at 2 until a `[daemon]` section exists, and `OpenPr`
   fails transiently through a placeholder publisher until slice 15.
 
+**The popup's methods, as built (slice 12).**
+
+- `run.watch { run, iterations? }` streams `graph` events: the run item, every `lanes` row with
+  its mark (`row_mark`, the strip's rule for one instance) and instance fields, and the notes:
+  the latest preflight's `questions` and the latest changes-requested review's `findings` with
+  its round (`domain/devflow/notes.rs`, from `RunGateway::outputs`). `iterations` picks a loop's
+  round, so `←`/`→` reopens the stream with another; the latest is shown otherwise. The hub keeps
+  each run's graph beside its item and tells watchers whenever either changes.
+- `gate.answer { run, instance, answer: { kind: recheck, note? } | { kind: open-anyway } }`
+  replies `{ sent }`, plus `queued` when it waits for the gateway. A daemon answers through a
+  `Gates` port: the worker owner (`StepWorker::answer_gate`), a script, or nobody.
+- `run.cancel { run }` is `RunGateway::cancel`; "abandon" in the gate popup is this.
+- A script may give a run its `outputs`, `hold` a gate (it then needs the developer, as one the
+  worker holds would) and `await` it in a later step, which stops the script until the gate is
+  answered over the socket. A scripted cancel marks the run cancelled and drops the rest of its
+  script. `tests/fixtures/gate-run.script.json` has ENG-412 on its way to a pull request and
+  ENG-398 waiting at `ask-info`.
+
 ## 11. Testing
 
 Every test is written red first. No test sleeps: leases and backoffs are pure functions of

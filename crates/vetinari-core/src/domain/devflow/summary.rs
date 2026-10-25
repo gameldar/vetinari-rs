@@ -243,6 +243,23 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
     }
 }
 
+/// How the popup marks one row: as the row's instance alone would mark its
+/// phase. A node with no instance is not reached.
+#[must_use]
+pub fn row_mark(state: Option<&InstanceState>, local: &LocalSteps) -> Mark {
+    let Some(state) = state else {
+        return Mark::NotReached;
+    };
+    match seen(state, StepKind::Preflight, local).0 {
+        Seen::NeedsYou => Mark::NeedsYou,
+        Seen::Failed => Mark::Failed,
+        Seen::RunningHere => Mark::RunningHere,
+        Seen::Elsewhere => Mark::Elsewhere,
+        Seen::Done => Mark::Done,
+        Seen::Pending | Seen::Unreached => Mark::NotReached,
+    }
+}
+
 /// What one node contributes to its phase, weakest first, so a phase shows
 /// the strongest thing any of its nodes is doing. `Pending`, a node its
 /// loop's round has not reached, is weakest: the round may never reach it
@@ -573,5 +590,28 @@ mod tests {
                 Phase::Pr
             ]
         );
+    }
+
+    #[test]
+    fn a_popup_row_is_marked_as_its_phase_would_be() {
+        let here = LocalSteps::default()
+            .with(
+                instance("implement@2"),
+                LocalStep::Running {
+                    session: session(),
+                    question: None,
+                },
+            )
+            .with(instance("ask-info@1"), LocalStep::AwaitingPerson);
+        let mark = |raw: &str, status| row_mark(Some(&state(raw, status)), &here);
+        assert_eq!(mark("implement@2", claimed()), Mark::RunningHere);
+        assert_eq!(mark("ask-info@1", claimed()), Mark::NeedsYou);
+        assert_eq!(mark("review@2", claimed()), Mark::Elsewhere);
+        assert_eq!(mark("review@1", done(None)), Mark::Done);
+        assert_eq!(
+            mark("review-stuck", InstanceStatus::Skipped),
+            Mark::NotReached
+        );
+        assert_eq!(row_mark(None, &here), Mark::NotReached);
     }
 }

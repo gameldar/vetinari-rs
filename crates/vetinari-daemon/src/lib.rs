@@ -6,6 +6,7 @@
 //! composition root.
 
 pub mod compose;
+pub mod gates;
 pub mod hub;
 pub mod runtime;
 pub mod scripted;
