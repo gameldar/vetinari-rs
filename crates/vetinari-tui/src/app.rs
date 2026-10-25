@@ -12,6 +12,7 @@ use time::{Duration, OffsetDateTime};
 use vetinari_core::application::agents::AgentRegistry;
 use vetinari_core::application::attention::Polled;
 use vetinari_core::application::config::General;
+use vetinari_core::application::devflow::api::RunDetail;
 use vetinari_core::application::keymap_engine::{KeymapEngine, Keystroke};
 use vetinari_core::application::ports::{DeviceCodeChallenge, PortError};
 use vetinari_core::application::queue::{Lane, QueueCursor, QueueService, Row, lanes};
@@ -22,6 +23,10 @@ use vetinari_core::domain::attention::{
     AttentionItem, EventRef, IssueRef, ItemContext, ItemState, MessageRef, PullRequestRef, humanize,
 };
 use vetinari_core::domain::credentials::{AuthMethod, Provider, Secret};
+use vetinari_core::domain::devflow::ids::{NodeInstance, RunId};
+use vetinari_core::domain::devflow::lanes::IterationSelection;
+use vetinari_core::domain::devflow::outcome::{GateAnswer, Line};
+use vetinari_core::domain::devflow::step::GateKind;
 use vetinari_core::domain::feedback::{CapturedContext, FeedbackRequest, FeedbackTarget};
 use vetinari_core::domain::ids::{ItemId, SessionId, SkillId, SourceId, SpaceId};
 use vetinari_core::domain::keymap::{Keymap, Mode};
@@ -37,7 +42,7 @@ use vetinari_core::domain::workspace::Space;
 
 use crate::overlay::{
     DeviceCodeView, Form, Menu, MenuItem, MenuKind, MenuTarget, Overlay, Prompt, PromptKind,
-    TextView,
+    RunView, TextView,
 };
 use crate::text_input::InputOutcome;
 
@@ -296,6 +301,20 @@ pub enum Task {
     SaveToken(Provider, Secret),
     /// Begin a device-code flow.
     BeginDeviceFlow(Provider),
+    /// Answer a run's gate.
+    AnswerGate {
+        /// The run.
+        run: RunId,
+        /// The gate.
+        instance: NodeInstance,
+        /// The answer.
+        answer: GateAnswer,
+    },
+    /// Cancel a run.
+    CancelRun {
+        /// The run.
+        run: RunId,
+    },
 }
 
 /// What a keypress led to.
@@ -341,6 +360,9 @@ pub enum Update {
     DeviceCodeMessage(String),
     /// Close whatever has the foreground.
     CloseOverlay,
+    /// The daemon's latest detail of the run whose popup is open. Boxed
+    /// because it is large and every other update is small.
+    RunDetail(Box<RunDetail>),
     /// Time has passed.
     Tick(OffsetDateTime),
 }
@@ -741,6 +763,13 @@ impl App {
                 self.decide(Decision::Delegate { item, agent });
             }
             Update::CloseOverlay => self.close_overlay(),
+            Update::RunDetail(detail) => {
+                if let Some(Overlay::Run(view)) = self.overlay.as_mut()
+                    && view.run == detail.item.summary.run
+                {
+                    view.detail = Some(*detail);
+                }
+            }
             Update::Tick(now) => {
                 self.now = now;
                 let notes = self.queue.tick(now);
@@ -882,6 +911,15 @@ impl App {
                 Outcome::Nothing
             }
             Action::Select => {
+                if let Some(item) = self.selected_item()
+                    && let ItemContext::Run(summary) = item.context()
+                {
+                    self.overlay = Some(Overlay::Run(RunView::new(
+                        summary.run.clone(),
+                        item.title().single_line(),
+                    )));
+                    return Outcome::Nothing;
+                }
                 if self.selected().is_some() {
                     self.overlay = Some(Overlay::Details);
                 }
@@ -1091,6 +1129,7 @@ impl App {
                 }
                 Outcome::Nothing
             }
+            Some(Overlay::Run(view)) => self.run_key(view, chord),
             Some(Overlay::DeviceCode(view)) => {
                 if chord.code() == KeyCode::Esc {
                     return Outcome::Nothing;
@@ -1175,6 +1214,72 @@ impl App {
             PromptKind::ApiToken(provider) => {
                 Outcome::Task(Task::SaveToken(provider, Secret::new(text.trim())))
             }
+            PromptKind::GateNote { run, instance } => match Line::parse(text.trim()) {
+                Ok(note) => Outcome::Task(Task::AnswerGate {
+                    run,
+                    instance,
+                    answer: GateAnswer::Recheck { note: Some(note) },
+                }),
+                Err(error) => self.warn(format!("that note will not do: {error}")),
+            },
+        }
+    }
+
+    /// Keys in a run's popup: the arrows pick a round, and a gate's choices
+    /// answer it (design 8.2).
+    fn run_key(&mut self, mut view: RunView, chord: KeyChord) -> Outcome {
+        let gate = view.gate();
+        let outcome = match (chord.code(), &gate) {
+            (KeyCode::Esc | KeyCode::Char('q'), _) => return Outcome::Nothing,
+            (KeyCode::Left | KeyCode::Char('h'), _) => {
+                view.step_round(false);
+                Outcome::Nothing
+            }
+            (KeyCode::Right | KeyCode::Char('l'), _) => {
+                view.step_round(true);
+                Outcome::Nothing
+            }
+            (KeyCode::Char('x'), _) => Outcome::Task(Task::CancelRun {
+                run: view.run.clone(),
+            }),
+            (KeyCode::Char('r'), Some((instance, GateKind::InfoNeeded))) => {
+                Outcome::Task(Task::AnswerGate {
+                    run: view.run.clone(),
+                    instance: instance.clone(),
+                    answer: GateAnswer::Recheck { note: None },
+                })
+            }
+            (KeyCode::Char('n'), Some((instance, GateKind::InfoNeeded))) => {
+                self.overlay = Some(Overlay::Prompt(Prompt::line(
+                    PromptKind::GateNote {
+                        run: view.run.clone(),
+                        instance: instance.clone(),
+                    },
+                    format!("Recheck - {}", view.title),
+                    "a note for preflight; RET sends it, ESC cancels",
+                )));
+                return Outcome::Nothing;
+            }
+            (KeyCode::Char('o'), Some((instance, GateKind::ReviewStuck))) => {
+                Outcome::Task(Task::AnswerGate {
+                    run: view.run.clone(),
+                    instance: instance.clone(),
+                    answer: GateAnswer::OpenAnyway,
+                })
+            }
+            _ => Outcome::Nothing,
+        };
+        self.overlay = Some(Overlay::Run(view));
+        outcome
+    }
+
+    /// The run whose popup is open, and the rounds it looks at: the event
+    /// loop keeps a `run.watch` open for exactly this.
+    #[must_use]
+    pub fn watched_run(&self) -> Option<(RunId, IterationSelection)> {
+        match &self.overlay {
+            Some(Overlay::Run(view)) => Some((view.run.clone(), view.selection.clone())),
+            _ => None,
         }
     }
 
@@ -3122,5 +3227,121 @@ mod tests {
         assert!(footer.contains("SPC n: Next"), "{footer}");
         assert!(footer.contains("RET: Details"), "{footer}");
         assert!(footer.contains("SPC h k: Help"), "{footer}");
+    }
+
+    mod runs {
+        use std::num::NonZeroU32;
+
+        use vetinari_core::domain::devflow::ids::NodeId;
+        use vetinari_core::domain::devflow::lanes::IterationSelection;
+        use vetinari_core::domain::devflow::outcome::GateAnswer;
+
+        use super::*;
+        use crate::fixtures::{ask_info, detail, item, run};
+
+        fn app_with_a_run() -> App {
+            let mut app = app();
+            let source = SourceId::parse("vetinarid").expect("source");
+            app.apply(Update::Polled(vec![Polled {
+                source: source.clone(),
+                outcome: Ok(vec![item().to_attention(&source, NOW)]),
+            }]));
+            select_row(&mut app, "ENG-398 Paginate audit export");
+            app
+        }
+
+        fn opened() -> App {
+            let mut app = app_with_a_run();
+            press(&mut app, "RET");
+            app.apply(Update::RunDetail(Box::new(detail())));
+            app
+        }
+
+        #[test]
+        fn ret_on_a_run_opens_its_popup_and_watches_it() {
+            let mut app = app_with_a_run();
+            press(&mut app, "RET");
+            assert!(matches!(app.overlay(), Some(Overlay::Run(view)) if view.run == run()));
+            assert_eq!(
+                app.watched_run(),
+                Some((run(), IterationSelection::default()))
+            );
+        }
+
+        #[test]
+        fn the_popup_takes_the_detail_the_daemon_sends() {
+            let app = opened();
+            let Some(Overlay::Run(view)) = app.overlay() else {
+                panic!("the popup is open");
+            };
+            assert_eq!(view.detail.as_ref(), Some(&detail()));
+        }
+
+        #[test]
+        fn r_rechecks_and_n_rechecks_with_a_note() {
+            let mut app = opened();
+            assert!(matches!(
+                press(&mut app, "r"),
+                Outcome::Task(Task::AnswerGate { run: answered, instance, answer: GateAnswer::Recheck { note: None } })
+                    if answered == run() && instance == ask_info()
+            ));
+
+            press(&mut app, "n");
+            assert!(matches!(
+                app.overlay(),
+                Some(Overlay::Prompt(prompt)) if matches!(prompt.kind, PromptKind::GateNote { .. })
+            ));
+            assert_eq!(app.watched_run(), None, "the popup gave way to the prompt");
+            type_text(&mut app, "Page size is 50");
+            let outcome = press(&mut app, "RET");
+            assert!(matches!(
+                outcome,
+                Outcome::Task(Task::AnswerGate { answer: GateAnswer::Recheck { note: Some(note) }, .. })
+                    if note.as_str() == "Page size is 50"
+            ));
+        }
+
+        #[test]
+        fn x_abandons_the_run_and_esc_closes_the_popup() {
+            let mut app = opened();
+            assert!(matches!(
+                press(&mut app, "x"),
+                Outcome::Task(Task::CancelRun { run: cancelled }) if cancelled == run()
+            ));
+            press(&mut app, "ESC");
+            assert!(app.overlay().is_none());
+            assert_eq!(app.watched_run(), None);
+        }
+
+        #[test]
+        fn the_arrows_look_at_another_round_of_the_loop() {
+            let mut app = opened();
+            press(&mut app, "<left>");
+            assert_eq!(
+                app.watched_run(),
+                Some((
+                    run(),
+                    IterationSelection::default()
+                        .with(NodeId::parse("intake").expect("node"), NonZeroU32::MIN)
+                ))
+            );
+            press(&mut app, "<left>");
+            assert_eq!(
+                app.watched_run().map(|(_, selection)| selection),
+                Some(
+                    IterationSelection::default()
+                        .with(NodeId::parse("intake").expect("node"), NonZeroU32::MIN)
+                ),
+                "there is no round before the first"
+            );
+            press(&mut app, "<right>");
+            assert_eq!(
+                app.watched_run().map(|(_, selection)| selection),
+                Some(IterationSelection::default().with(
+                    NodeId::parse("intake").expect("node"),
+                    NonZeroU32::new(2).expect("two")
+                ))
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@
 
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,19 +98,9 @@ pub enum DaemonError {
     Config(String),
 }
 
-/// `$XDG_RUNTIME_DIR/vetinari/vetinarid.sock`, or under the temporary
-/// directory when there is no runtime directory.
-#[must_use]
-pub fn default_socket() -> PathBuf {
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(runtime) if !runtime.is_empty() => Path::new(&runtime).join("vetinari"),
-        _ => {
-            let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-            std::env::temp_dir().join(format!("vetinari-{user}"))
-        }
-    };
-    dir.join("vetinarid.sock")
-}
+/// The socket the daemon listens on and the TUI reads, unless told
+/// otherwise; both sides share one definition so they cannot drift.
+pub use vetinari_adapters::daemon::client::default_socket;
 
 /// The worker label from a hostname: its first label, when that is a valid
 /// worker name, else `vetinari`.

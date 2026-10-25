@@ -6,7 +6,9 @@ description: Build, run, and drive the vetinari TUI. Use when asked to start vet
 Vetinari is a ratatui terminal app. Drive it with
 `.claude/skills/run-vetinari/driver.sh`, which runs it in tmux against
 `fakegh.py`, a local stand-in for GitHub's GraphQL search, so the queue has
-PRs you control. All paths are relative to the repo root.
+PRs you control, and a `vetinarid --scripted` replaying recorded dev
+workflow runs, so the queue has runs with phase strips and a gate to answer.
+All paths are relative to the repo root.
 
 ## Prerequisites
 
@@ -26,7 +28,7 @@ token under its own `drive` account, leaving real accounts alone).
 
 | command | what it does |
 |---|---|
-| `start` | `cargo build`, launches `fakegh.py` on 127.0.0.1:8765 and vetinari (80x24, or `VETINARI_DRIVE_SIZE=60x12` for a zax-panel-sized one) with `drive.toml`, waits for the first PR |
+| `start` | `cargo build`, launches `fakegh.py` on 127.0.0.1:8765, a scripted vetinarid on `$STATE/vetinarid.sock` and vetinari (80x24, or `VETINARI_DRIVE_SIZE=60x12` for a zax-panel-sized one) with `drive.toml` and `--daemon` at that socket, waits for the first PR |
 | `keys "SPC d p c" j ...` | sends keys in vetinari's spelling (`SPC`, `ESC`, `RET`, `TAB`, `C-c`, letters) |
 | `queue` | the pane minus its bottom line, box drawing stripped |
 | `details` | presses `RET`, prints the details popup, presses `ESC` |
@@ -46,6 +48,33 @@ python3 -I -c "import json,sys;json.dump([p for p in json.load(open(sys.argv[1])
 .claude/skills/run-vetinari/driver.sh prs /tmp/no101.json
 .claude/skills/run-vetinari/driver.sh wait "gone from github" 10
 ```
+
+### Dev workflow runs
+
+`start` replays `crates/vetinari-daemon/tests/fixtures/gate-run.script.json`
+by default: ENG-398 waits at its info-needed gate (`[run] ENG-398 Paginate
+audit export  pre? impl· rev· pr·` at the top of NEXT) and ENG-412 works
+through its rounds on its own. Set `VETINARI_DRIVE_RUNS` to another script,
+or to `none` to start with no daemon. The daemon's log is
+`$STATE/vetinarid.log`.
+
+```bash
+.claude/skills/run-vetinari/driver.sh keys "g g" RET   # the run's popup: rows, rounds, questions, gate keys
+.claude/skills/run-vetinari/driver.sh keys r           # recheck: status says "sent", preflight goes to round 2
+.claude/skills/run-vetinari/driver.sh keys Left        # look at round 1 of the intake loop
+.claude/skills/run-vetinari/driver.sh keys x           # abandon the run; the popup closes, the row resolves
+```
+
+To run the daemon by hand against the TUI:
+
+```bash
+cargo run --bin vetinarid -- --scripted crates/vetinari-daemon/tests/fixtures/gate-run.script.json --socket /tmp/v.sock
+cargo run --bin vetinari -- --daemon /tmp/v.sock
+```
+
+Without `--daemon` both sides use `$XDG_RUNTIME_DIR/vetinari/vetinarid.sock`.
+A TUI that never reaches a daemon queues no runs and says nothing; one that
+loses its daemon shows "vetinarid is unavailable" until it comes back.
 
 `prs.json` documents the entry fields in `fakegh.py`'s docstring: bump
 `updated` to make an item count as changed, set `checks` to `FAILURE` for a

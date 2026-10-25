@@ -10,7 +10,13 @@ STATE=${VETINARI_DRIVE_STATE:-${TMPDIR:-/tmp}/vetinari-drive}
 # Neither name may be a prefix of the other: tmux resolves -t by prefix.
 APP=vetdrive-app
 FAKE=vetdrive-fake
+DAEMON=vetdrive-daemon
 BIN=$ROOT/target/debug/vetinari
+DAEMON_BIN=$ROOT/target/debug/vetinarid
+SOCKET=$STATE/vetinarid.sock
+# The recorded runs the scripted vetinarid replays; set VETINARI_DRIVE_RUNS to
+# another script, or to "none" to start without a daemon.
+RUNS=${VETINARI_DRIVE_RUNS:-$ROOT/crates/vetinari-daemon/tests/fixtures/gate-run.script.json}
 CONFIG=$SKILL/drive.toml
 # WIDTHxHEIGHT; 60x12 is about what a zax panel section gives it.
 SIZE=${VETINARI_DRIVE_SIZE:-80x24}
@@ -73,14 +79,20 @@ keys() {
 
 start() {
     mkdir -p "$STATE"
-    cargo build -q --bin vetinari --manifest-path "$ROOT/Cargo.toml"
+    cargo build -q --bin vetinari --bin vetinarid --manifest-path "$ROOT/Cargo.toml"
     cp "$SKILL/prs.json" "$STATE/prs.json"
     tmux kill-session -t "$FAKE" 2>/dev/null || true
     tmux new-session -d -s "$FAKE" "python3 -I '$SKILL/fakegh.py' '$STATE/prs.json' 8765"
     timeout 5 bash -c 'until curl -s -o /dev/null -X POST http://127.0.0.1:8765/graphql -d "{}"; do sleep 0.2; done'
     printf 'drive-fake-token\n' | "$BIN" auth github --config "$CONFIG" --account drive >/dev/null
+    tmux kill-session -t "$DAEMON" 2>/dev/null || true
+    rm -f "$SOCKET"
+    if [ "$RUNS" != none ]; then
+        tmux new-session -d -s "$DAEMON" "'$DAEMON_BIN' --scripted '$RUNS' --socket '$SOCKET' 2>'$STATE/vetinarid.log'"
+        timeout 10 bash -c "until [ -S '$SOCKET' ]; do sleep 0.2; done"
+    fi
     tmux kill-session -t "$APP" 2>/dev/null || true
-    tmux new-session -d -s "$APP" -x "${SIZE%x*}" -y "${SIZE#*x}" "'$BIN' --config '$CONFIG'"
+    tmux new-session -d -s "$APP" -x "${SIZE%x*}" -y "${SIZE#*x}" "'$BIN' --config '$CONFIG' --daemon '$SOCKET'"
     wait_for "Fix login redirect" 20
     queue
 }
@@ -90,6 +102,7 @@ stop() {
     sleep 0.5
     tmux kill-session -t "$APP" 2>/dev/null || true
     tmux kill-session -t "$FAKE" 2>/dev/null || true
+    tmux kill-session -t "$DAEMON" 2>/dev/null || true
 }
 
 cmd=${1:-}

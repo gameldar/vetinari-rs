@@ -4,9 +4,14 @@
 //! the whole of the front-end's behaviour stays testable: the state decides,
 //! the controller performs, and nothing in between holds a terminal.
 
+use std::sync::Arc;
+
 use vetinari_adapters::Runtime;
+use vetinari_adapters::daemon::client::DaemonRuns;
 use vetinari_core::application::attention::Polled;
+use vetinari_core::application::devflow::worker::GateReply;
 use vetinari_core::application::observed::ObservedAgents;
+use vetinari_core::application::ports::AttentionSource;
 use vetinari_core::application::ports::{DeviceCodeChallenge, DeviceCodePoll, PortResult};
 use vetinari_core::application::workflows::WorkflowOutcome;
 use vetinari_core::domain::credentials::Provider;
@@ -35,6 +40,11 @@ impl Controller {
         Self { runtime, library }
     }
 
+    /// Queue the runs vetinarid serves, and act on them through it.
+    pub fn attach_daemon(&mut self, daemon: Arc<DaemonRuns>) {
+        self.runtime.attach_daemon(daemon);
+    }
+
     /// The runtime, for the parts of start-up that need it.
     #[must_use]
     pub const fn runtime(&self) -> &Runtime {
@@ -51,6 +61,18 @@ impl Controller {
     pub async fn load_library(&mut self) -> SkillLibrary {
         self.library = self.runtime.skills.load_or_builtin().await;
         self.library.clone()
+    }
+
+    /// Poll only the daemon's runs, when it says they changed: the other
+    /// sources wait for the next refresh.
+    pub async fn refresh_runs(&self) -> Vec<Update> {
+        let Some(daemon) = &self.runtime.daemon else {
+            return Vec::new();
+        };
+        vec![Update::Polled(vec![Polled {
+            source: daemon.id().clone(),
+            outcome: daemon.fetch(None).await,
+        }])]
     }
 
     /// Poll every source and agent the profile wants.
@@ -392,6 +414,43 @@ impl Controller {
                 }
             }
 
+            Task::AnswerGate {
+                run,
+                instance,
+                answer,
+            } => {
+                let what = format!("answering {instance} of run {run}");
+                let reply = match self.daemon() {
+                    Ok(daemon) => daemon.answer_gate(&run, &instance, &answer).await,
+                    Err(error) => Err(error),
+                };
+                vec![Update::Status(match reply {
+                    Ok(GateReply::Sent) => StatusMessage::info(format!("{what}: sent")),
+                    Ok(GateReply::Queued) => {
+                        StatusMessage::info(format!("{what}: queued until the gateway is back"))
+                    }
+                    Ok(GateReply::NotOpen) => {
+                        StatusMessage::warn(format!("{what}: that gate is no longer open"))
+                    }
+                    Err(error) => describe_failure(&what, &error),
+                })]
+            }
+
+            Task::CancelRun { run } => {
+                let what = format!("cancelling run {run}");
+                let result = match self.daemon() {
+                    Ok(daemon) => daemon.cancel_run(&run).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => vec![
+                        Update::CloseOverlay,
+                        Update::Status(StatusMessage::info(format!("{what}: done"))),
+                    ],
+                    Err(error) => vec![Update::Status(describe_failure(&what, &error))],
+                }
+            }
+
             Task::BeginDeviceFlow(provider) => {
                 match self.runtime.auth.begin_device_flow(provider).await {
                     Ok(challenge) => vec![Update::DeviceCode(provider, challenge)],
@@ -492,6 +551,15 @@ impl Controller {
             }
             Err(error) => vec![Update::Status(describe_failure(what, &error))],
         }
+    }
+
+    fn daemon(&self) -> PortResult<Arc<DaemonRuns>> {
+        self.runtime.daemon.clone().ok_or_else(|| {
+            vetinari_core::application::ports::PortError::not_configured(
+                DaemonRuns::SOURCE_NAME,
+                "vetinarid is not attached",
+            )
+        })
     }
 
     async fn report(
@@ -1323,5 +1391,128 @@ mod tests {
                 _ => None,
             })
             .expect("a poll")
+    }
+
+    /// A stand-in for vetinarid that answers every request at once and
+    /// remembers the methods it was asked for.
+    fn fake_vetinarid(
+        socket: std::path::PathBuf,
+        gate: &'static str,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut lines = BufReader::new(read_half).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let id: String = line
+                            .split_once("\"id\":")
+                            .map(|(_, rest)| {
+                                rest.chars().take_while(char::is_ascii_digit).collect()
+                            })
+                            .unwrap_or_default();
+                        let method = field(&line, "method");
+                        seen.lock().expect("lock").push(method.clone());
+                        let result = if method == "gate.answer" { gate } else { "{}" };
+                        let reply = format!(r#"{{"id":{id},"result":{result}}}"#);
+                        let _ = write_half.write_all(format!("{reply}\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        asked
+    }
+
+    fn a_run() -> vetinari_core::domain::devflow::ids::RunId {
+        vetinari_core::domain::devflow::ids::RunId::parse("01JB80A1B2C3D4E5F6G7H8J9K0")
+            .expect("run")
+    }
+
+    #[tokio::test]
+    async fn a_gate_answer_goes_to_the_daemon_and_says_what_became_of_it() {
+        let mut h = harness("");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("vetinarid.sock");
+        let asked = fake_vetinarid(socket.clone(), r#"{"sent":false,"queued":true}"#);
+        h.controller
+            .attach_daemon(vetinari_adapters::daemon::client::DaemonRuns::new(
+                socket, "test",
+            ));
+
+        let updates = h
+            .controller
+            .run(
+                Task::AnswerGate {
+                    run: a_run(),
+                    instance: vetinari_core::domain::devflow::ids::NodeInstance::parse(
+                        "ask-info@1",
+                    )
+                    .expect("instance"),
+                    answer: vetinari_core::domain::devflow::outcome::GateAnswer::Recheck {
+                        note: None,
+                    },
+                },
+                &h.profile,
+            )
+            .await;
+        assert!(
+            status_of(&updates).text.contains("queued"),
+            "{:?}",
+            status_of(&updates)
+        );
+        assert_eq!(*asked.lock().expect("lock"), ["hello", "gate.answer"]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_asks_the_daemon_and_closes_its_popup() {
+        let mut h = harness("");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("vetinarid.sock");
+        let asked = fake_vetinarid(socket.clone(), "{}");
+        h.controller
+            .attach_daemon(vetinari_adapters::daemon::client::DaemonRuns::new(
+                socket, "test",
+            ));
+
+        let updates = h
+            .controller
+            .run(Task::CancelRun { run: a_run() }, &h.profile)
+            .await;
+        assert!(status_of(&updates).text.contains("cancelling"));
+        assert!(updates.iter().any(|u| matches!(u, Update::CloseOverlay)));
+        assert_eq!(*asked.lock().expect("lock"), ["hello", "run.cancel"]);
+    }
+
+    #[tokio::test]
+    async fn acting_on_a_run_with_no_daemon_says_so() {
+        let mut h = harness("");
+        let updates = h
+            .controller
+            .run(Task::CancelRun { run: a_run() }, &h.profile)
+            .await;
+        assert_eq!(status_of(&updates).level, crate::app::Level::Error);
+        assert!(status_of(&updates).text.contains("vetinarid"));
+    }
+
+    #[tokio::test]
+    async fn a_change_on_the_daemon_polls_only_its_runs() {
+        let mut h = harness("");
+        assert!(h.controller.refresh_runs().await.is_empty());
+        let dir = tempfile::tempdir().expect("tempdir");
+        h.controller
+            .attach_daemon(vetinari_adapters::daemon::client::DaemonRuns::new(
+                dir.path().join("absent.sock"),
+                "test",
+            ));
+        let polled = polled_of(&h.controller.refresh_runs().await);
+        assert_eq!(polled.len(), 1);
+        assert_eq!(polled[0].source.as_str(), "vetinarid");
+        assert!(polled[0].outcome.as_ref().is_ok_and(Vec::is_empty));
     }
 }

@@ -11,16 +11,19 @@ use std::num::NonZeroU32;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vetinari_core::application::devflow::api::{
-    ApiError, BoardChange, DetailRow, Hello, RunDetail, RunItem,
+    ApiError, BoardChange, DetailRow, Hello, RunDetail, RunItem, RunLabel,
 };
 use vetinari_core::application::devflow::worker::GateReply;
-use vetinari_core::domain::devflow::ids::{NodeId, NodeInstance, RunId};
-use vetinari_core::domain::devflow::lanes::{IterationSelection, Lane, RowKind};
-use vetinari_core::domain::devflow::outcome::{GateAnswer, Line};
-use vetinari_core::domain::devflow::run_view::InstanceStatus;
+use vetinari_core::domain::devflow::ids::{BranchLabel, NodeId, NodeInstance, RunId, TaskQueue};
+use vetinari_core::domain::devflow::lanes::{IterationSelection, Lane, LaneRow, RowKind};
+use vetinari_core::domain::devflow::notes::{ReviewFindings, RunNotes};
+use vetinari_core::domain::devflow::outcome::{Finding, GateAnswer, Line};
 use vetinari_core::domain::devflow::run_view::RunStatus;
+use vetinari_core::domain::devflow::run_view::{InstanceState, InstanceStatus};
 use vetinari_core::domain::devflow::step::StepKind;
 use vetinari_core::domain::devflow::summary::{Mark, NeedsYou};
+use vetinari_core::domain::devflow::summary::{Phase, PhaseCell, Round, RunSummary};
+use vetinari_core::domain::text::NonEmptyText;
 
 /// The longest frame either end accepts, newline excluded.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -348,7 +351,10 @@ fn detail_row(row: &DetailRow) -> Value {
             InstanceStatus::Offered { queue } => {
                 ("offered", Some(("queue", json!(queue.as_str()))))
             }
-            InstanceStatus::Claimed { worker, .. } => ("claimed", Some(("worker", json!(worker)))),
+            InstanceStatus::Claimed { worker, expires_at } => {
+                value["expires_at"] = time_value(*expires_at);
+                ("claimed", Some(("worker", json!(worker))))
+            }
             InstanceStatus::Looping { iteration } => {
                 ("looping", Some(("iteration", json!(iteration.get()))))
             }
@@ -461,21 +467,324 @@ const fn status_name(status: RunStatus) -> &'static str {
     }
 }
 
+// The client's side: reading back what the daemon wrote.
+
+#[derive(Deserialize)]
+struct WireItem {
+    run: String,
+    #[serde(default)]
+    ticket: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    status: String,
+    phases: Vec<WirePhase>,
+    #[serde(default)]
+    needs_you: Option<WireNeeds>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    started_at: Option<time::OffsetDateTime>,
+}
+
+#[derive(Deserialize)]
+struct WirePhase {
+    phase: String,
+    mark: String,
+    #[serde(default)]
+    round: Option<WireRound>,
+}
+
+#[derive(Deserialize)]
+struct WireRound {
+    iteration: NonZeroU32,
+    bound: NonZeroU32,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum WireNeeds {
+    Gate { instance: String, gate: String },
+    Question { instance: String, question: String },
+}
+
+#[derive(Deserialize)]
+struct WireDetail {
+    run: Value,
+    rows: Vec<WireRow>,
+    #[serde(default)]
+    questions: Vec<String>,
+    #[serde(default)]
+    findings: Option<WireFindings>,
+}
+
+#[derive(Deserialize)]
+struct WireRow {
+    indent: usize,
+    node: String,
+    lane: String,
+    mark: String,
+    #[serde(default, rename = "loop")]
+    looping: Option<WireLoop>,
+    #[serde(default)]
+    instance: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    worker: Option<String>,
+    #[serde(default)]
+    queue: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    iteration: Option<NonZeroU32>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    until: Option<time::OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    expires_at: Option<time::OffsetDateTime>,
+    #[serde(default)]
+    attempt: Option<NonZeroU32>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    first_ready_at: Option<time::OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    finished_at: Option<time::OffsetDateTime>,
+}
+
+#[derive(Deserialize)]
+struct WireLoop {
+    reached: u32,
+    selected: NonZeroU32,
+    bound: NonZeroU32,
+}
+
+#[derive(Deserialize)]
+struct WireFindings {
+    round: NonZeroU32,
+    items: Vec<WireFinding>,
+}
+
+#[derive(Deserialize)]
+struct WireFinding {
+    text: String,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    line: Option<NonZeroU32>,
+}
+
+/// Read a run item from a `snapshot` entry or a `run` event.
+pub fn read_run_item(value: &Value) -> Result<RunItem, String> {
+    let wire: WireItem =
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    let run = run_id(&wire.run)?;
+    let status = match wire.status.as_str() {
+        "active" => RunStatus::Active,
+        "completed" => RunStatus::Completed,
+        "failed" => RunStatus::Failed,
+        "cancelled" => RunStatus::Cancelled,
+        other => return Err(format!("no run status {other:?}")),
+    };
+    let phases = wire
+        .phases
+        .into_iter()
+        .map(|phase| {
+            Ok(PhaseCell {
+                phase: Phase::ALL
+                    .into_iter()
+                    .find(|known| known.name() == phase.phase)
+                    .ok_or_else(|| format!("no phase {:?}", phase.phase))?,
+                mark: mark_named(&phase.mark)?,
+                round: phase.round.map(|round| Round {
+                    iteration: round.iteration,
+                    bound: round.bound,
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let instance = |raw: &str| NodeInstance::parse(raw).map_err(|error| error.to_string());
+    let needs_you = match wire.needs_you {
+        None => None,
+        Some(WireNeeds::Gate {
+            instance: raw,
+            gate,
+        }) => Some(NeedsYou::Gate {
+            instance: instance(&raw)?,
+            gate: match gate.parse::<StepKind>() {
+                Ok(StepKind::Gate(gate)) => gate,
+                _ => return Err(format!("no gate {gate:?}")),
+            },
+        }),
+        Some(WireNeeds::Question {
+            instance: raw,
+            question,
+        }) => Some(NeedsYou::Question {
+            instance: instance(&raw)?,
+            question,
+        }),
+    };
+    let label = match (wire.ticket, wire.title) {
+        (Some(ticket), Some(title)) => Some(RunLabel {
+            ticket: NonEmptyText::parse(&ticket).map_err(|error| error.to_string())?,
+            title: NonEmptyText::parse(&title).map_err(|error| error.to_string())?,
+        }),
+        _ => None,
+    };
+    Ok(RunItem {
+        summary: RunSummary {
+            run,
+            status,
+            phases,
+            needs_you,
+        },
+        label,
+        started_at: wire.started_at,
+    })
+}
+
+/// Read a `run.watch` stream's `graph` event.
+pub fn read_detail(value: &Value) -> Result<RunDetail, String> {
+    let wire: WireDetail =
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    let item = read_run_item(&wire.run)?;
+    let rows = wire
+        .rows
+        .into_iter()
+        .map(read_row)
+        .collect::<Result<Vec<_>, String>>()?;
+    let line = |raw: &str| Line::parse(raw).map_err(|error| error.to_string());
+    let questions = wire
+        .questions
+        .iter()
+        .map(|question| line(question))
+        .collect::<Result<Vec<_>, String>>()?;
+    let findings = wire
+        .findings
+        .map(|findings| {
+            Ok::<_, String>(ReviewFindings {
+                round: findings.round,
+                findings: findings
+                    .items
+                    .into_iter()
+                    .map(|finding| {
+                        Ok(Finding {
+                            file: finding.file.as_deref().map(line).transpose()?,
+                            line: finding.line,
+                            text: line(&finding.text)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            })
+        })
+        .transpose()?;
+    Ok(RunDetail {
+        item,
+        rows,
+        notes: RunNotes {
+            questions,
+            findings,
+        },
+    })
+}
+
+fn read_row(wire: WireRow) -> Result<DetailRow, String> {
+    let lane = match wire.lane.as_str() {
+        "alone" => Lane::Alone,
+        "first" => Lane::First,
+        "middle" => Lane::Middle,
+        "last" => Lane::Last,
+        other => return Err(format!("no lane {other:?}")),
+    };
+    let kind = match wire.looping {
+        Some(looping) => RowKind::Loop {
+            reached: looping.reached,
+            selected: looping.selected,
+            bound: looping.bound,
+        },
+        None => RowKind::Node,
+    };
+    let missing = |field: &str| {
+        format!(
+            "a {} row has no {field}",
+            wire.status.as_deref().unwrap_or("?")
+        )
+    };
+    let state = match (&wire.instance, &wire.status) {
+        (Some(instance), Some(status)) => {
+            let status = match status.as_str() {
+                "ready" => InstanceStatus::Ready,
+                "running" => InstanceStatus::Running,
+                "waiting" => InstanceStatus::Waiting {
+                    until: wire.until.ok_or_else(|| missing("until"))?,
+                },
+                "offered" => InstanceStatus::Offered {
+                    queue: TaskQueue::parse(wire.queue.as_deref().ok_or_else(|| missing("queue"))?)
+                        .map_err(|error| error.to_string())?,
+                },
+                "claimed" => InstanceStatus::Claimed {
+                    worker: wire.worker.clone().ok_or_else(|| missing("worker"))?,
+                    expires_at: wire.expires_at.ok_or_else(|| missing("expires_at"))?,
+                },
+                "looping" => InstanceStatus::Looping {
+                    iteration: wire.iteration.ok_or_else(|| missing("iteration"))?,
+                },
+                "done" => InstanceStatus::Done {
+                    branch: wire
+                        .branch
+                        .as_deref()
+                        .map(BranchLabel::parse)
+                        .transpose()
+                        .map_err(|error| error.to_string())?,
+                },
+                "failed" => InstanceStatus::Failed {
+                    error: wire.error.clone().unwrap_or_default(),
+                },
+                "skipped" => InstanceStatus::Skipped,
+                "cancelled" => InstanceStatus::Cancelled,
+                other => return Err(format!("no instance status {other:?}")),
+            };
+            Some(InstanceState {
+                instance: NodeInstance::parse(instance).map_err(|error| error.to_string())?,
+                status,
+                attempt: wire.attempt,
+                first_ready_at: wire.first_ready_at,
+                finished_at: wire.finished_at,
+            })
+        }
+        _ => None,
+    };
+    Ok(DetailRow {
+        row: LaneRow {
+            indent: wire.indent,
+            node: NodeId::parse(&wire.node).map_err(|error| error.to_string())?,
+            lane,
+            kind,
+            state,
+        },
+        mark: mark_named(&wire.mark)?,
+    })
+}
+
+fn mark_named(name: &str) -> Result<Mark, String> {
+    [
+        Mark::Done,
+        Mark::RunningHere,
+        Mark::Elsewhere,
+        Mark::NeedsYou,
+        Mark::Failed,
+        Mark::Next,
+        Mark::NotReached,
+    ]
+    .into_iter()
+    .find(|mark| mark_name(*mark) == name)
+    .ok_or_else(|| format!("no mark {name:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
 
     use time::macros::datetime;
-    use vetinari_core::application::devflow::api::RunLabel;
     use vetinari_core::domain::devflow::ids::WorkerName;
     use vetinari_core::domain::devflow::step::GateKind;
-    use vetinari_core::domain::devflow::summary::{Phase, PhaseCell, Round, RunSummary};
-    use vetinari_core::domain::text::NonEmptyText;
-
-    use vetinari_core::domain::devflow::ids::BranchLabel;
-    use vetinari_core::domain::devflow::lanes::LaneRow;
-    use vetinari_core::domain::devflow::notes::RunNotes;
-    use vetinari_core::domain::devflow::run_view::InstanceState;
 
     use super::*;
 
@@ -793,5 +1102,94 @@ mod tests {
             change_event(&BoardChange::Removed(RunId::parse("r1").expect("run"))),
             json!({ "type": "removed", "run": "r1" })
         );
+    }
+
+    #[test]
+    fn a_client_reads_back_the_run_items_the_daemon_writes() {
+        let mut question = item();
+        question.label = None;
+        question.started_at = None;
+        question.summary.needs_you = Some(NeedsYou::Question {
+            instance: NodeInstance::parse("implement@2").expect("instance"),
+            question: "Which client?".to_owned(),
+        });
+        for item in [item(), question] {
+            let event = change_event(&BoardChange::Run(item.clone()));
+            assert_eq!(read_run_item(&event), Ok(item));
+        }
+        assert!(read_run_item(&json!({ "run": "r1" })).is_err());
+    }
+
+    #[test]
+    fn a_client_reads_back_a_runs_detail() {
+        let claimed = |instance: &str| InstanceState {
+            instance: NodeInstance::parse(instance).expect("instance"),
+            status: InstanceStatus::Claimed {
+                worker: "hex".to_owned(),
+                expires_at: datetime!(2026-10-25 10:30 UTC),
+            },
+            attempt: Some(NonZeroU32::MIN),
+            first_ready_at: Some(datetime!(2026-10-25 10:20 UTC)),
+            finished_at: None,
+        };
+        let detail = RunDetail {
+            item: item(),
+            rows: vec![
+                DetailRow {
+                    row: LaneRow {
+                        indent: 0,
+                        node: NodeId::parse("rework").expect("node"),
+                        lane: Lane::Alone,
+                        kind: RowKind::Loop {
+                            reached: 2,
+                            selected: NonZeroU32::new(2).expect("two"),
+                            bound: NonZeroU32::new(3).expect("three"),
+                        },
+                        state: Some(InstanceState {
+                            instance: NodeInstance::parse("rework").expect("instance"),
+                            status: InstanceStatus::Looping {
+                                iteration: NonZeroU32::new(2).expect("two"),
+                            },
+                            attempt: None,
+                            first_ready_at: None,
+                            finished_at: None,
+                        }),
+                    },
+                    mark: Mark::Elsewhere,
+                },
+                DetailRow {
+                    row: LaneRow {
+                        indent: 1,
+                        node: NodeId::parse("review").expect("node"),
+                        lane: Lane::First,
+                        kind: RowKind::Node,
+                        state: Some(claimed("review@2")),
+                    },
+                    mark: Mark::RunningHere,
+                },
+                DetailRow {
+                    row: LaneRow {
+                        indent: 0,
+                        node: NodeId::parse("open-pr").expect("node"),
+                        lane: Lane::Alone,
+                        kind: RowKind::Node,
+                        state: None,
+                    },
+                    mark: Mark::NotReached,
+                },
+            ],
+            notes: RunNotes {
+                questions: Vec::new(),
+                findings: Some(ReviewFindings {
+                    round: NonZeroU32::MIN,
+                    findings: vec![Finding {
+                        file: Some(Line::parse("src/retry.rs").expect("file")),
+                        line: NonZeroU32::new(88),
+                        text: Line::parse("Retry-After ignored on 503").expect("text"),
+                    }],
+                }),
+            },
+        };
+        assert_eq!(read_detail(&detail_event(&detail)), Ok(detail));
     }
 }

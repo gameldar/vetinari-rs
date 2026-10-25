@@ -16,15 +16,19 @@ use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 use vetinari_adapters::config::{LoadedConfig, load_or_default};
+use vetinari_adapters::daemon::client::{DaemonRuns, default_socket};
 use vetinari_adapters::{Paths, Runtime};
 use vetinari_core::application::config::ParseContext;
 use vetinari_core::application::observed::ObservedAgents;
 use vetinari_core::application::ports::{Clock, DeviceCodeChallenge, DeviceCodePoll};
 use vetinari_core::domain::credentials::{Provider, Secret};
+use vetinari_core::domain::devflow::ids::RunId;
+use vetinari_core::domain::devflow::lanes::IterationSelection;
 use vetinari_core::domain::feedback::FeedbackTarget;
 use vetinari_core::domain::text::NonEmptyText;
-use vetinari_tui::app::{App, Outcome, StatusMessage, Update};
+use vetinari_tui::app::{App, Outcome, StatusMessage, Update, describe_failure};
 use vetinari_tui::controller::Controller;
 use vetinari_tui::overlay::Overlay;
 use vetinari_tui::startup::{account_for, account_label, config_candidates, doctor_report};
@@ -52,6 +56,11 @@ struct Cli {
     /// profile's.
     #[arg(long, global = true, value_name = "NAME")]
     account: Option<String>,
+
+    /// The vetinarid socket whose runs are queued; defaults to
+    /// $XDG_RUNTIME_DIR/vetinari/vetinarid.sock.
+    #[arg(long, global = true, value_name = "PATH")]
+    daemon: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -264,6 +273,11 @@ async fn run(cli: Cli) -> Fallible<()> {
     let clock = runtime.clock.clone();
     let problems = runtime.problems.clone();
     let mut controller = Controller::new(runtime, Default::default());
+    let daemon = DaemonRuns::new(
+        cli.daemon.clone().unwrap_or_else(default_socket),
+        "vetinari",
+    );
+    controller.attach_daemon(daemon.clone());
     let library = controller.load_library().await;
 
     let mut app = App::new(
@@ -292,6 +306,7 @@ async fn run(cli: Cli) -> Fallible<()> {
         &mut terminal,
         &mut app,
         controller,
+        daemon,
         clock,
         tick,
         refresh_every,
@@ -329,11 +344,15 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     controller: Controller,
+    daemon: Arc<DaemonRuns>,
     clock: Arc<dyn Clock>,
     tick: Duration,
     refresh_every: Duration,
 ) -> Fallible<()> {
     let mut agent_changes = watch_agents(controller.agent_watch());
+    let _board = daemon.start();
+    let mut runs_changed = daemon.changes();
+    let mut watching: Option<(Watched, JoinHandle<()>)> = None;
     let controller = Arc::new(Mutex::new(controller));
     let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<Vec<Update>>();
     let mut keys = EventStream::new();
@@ -357,6 +376,14 @@ async fn event_loop(
             _ = ticker.tick() => app.apply(Update::Tick(clock.now())),
             _ = refresher.tick() => spawn_refresh(&controller, app, &updates_tx),
             Some(()) = agent_changes.recv() => spawn_agent_refresh(&controller, &updates_tx),
+            Ok(()) = runs_changed.changed() => {
+                let controller = controller.clone();
+                let sender = updates_tx.clone();
+                tokio::spawn(async move {
+                    let batch = controller.lock().await.refresh_runs().await;
+                    let _ = sender.send(batch);
+                });
+            }
             _ = device_poll.tick() => {
                 if let Some((provider, challenge)) = pending_device_code(app) {
                     spawn_device_poll(&controller, app, &updates_tx, provider, challenge);
@@ -390,8 +417,60 @@ async fn event_loop(
         if app.should_quit() {
             break;
         }
+        follow_watched_run(app, &daemon, &updates_tx, &mut watching);
     }
     Ok(())
+}
+
+type Watched = (RunId, IterationSelection);
+
+/// Keep one `run.watch` open for the popup the app shows, and none when
+/// it shows none: a new run or a new round reopens it.
+fn follow_watched_run(
+    app: &App,
+    daemon: &Arc<DaemonRuns>,
+    updates: &mpsc::UnboundedSender<Vec<Update>>,
+    watching: &mut Option<(Watched, JoinHandle<()>)>,
+) {
+    let wanted = app.watched_run();
+    if watching.as_ref().map(|(watched, _)| watched) == wanted.as_ref() {
+        return;
+    }
+    if let Some((_, task)) = watching.take() {
+        task.abort();
+    }
+    let Some((run, selection)) = wanted else {
+        return;
+    };
+    let daemon = daemon.clone();
+    let sender = updates.clone();
+    let key = (run.clone(), selection.clone());
+    let task = tokio::spawn(async move {
+        match daemon.watch_run(&run, &selection).await {
+            Ok(mut watch) => loop {
+                match watch.next().await {
+                    Ok(Some(detail)) => {
+                        let _ = sender.send(vec![Update::RunDetail(Box::new(detail))]);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = sender.send(vec![Update::Status(describe_failure(
+                            &format!("watching run {run}"),
+                            &error,
+                        ))]);
+                        break;
+                    }
+                }
+            },
+            Err(error) => {
+                let _ = sender.send(vec![Update::Status(describe_failure(
+                    &format!("watching run {run}"),
+                    &error,
+                ))]);
+            }
+        }
+    });
+    *watching = Some((key, task));
 }
 
 fn spawn_refresh(

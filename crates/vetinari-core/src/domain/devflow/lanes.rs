@@ -23,6 +23,11 @@ impl IterationSelection {
         self.0.insert(node, iteration);
         self
     }
+
+    /// Each loop's chosen iteration.
+    pub fn iter(&self) -> impl Iterator<Item = (&NodeId, NonZeroU32)> {
+        self.0.iter().map(|(node, iteration)| (node, *iteration))
+    }
 }
 
 /// A row's place in a group of nodes at the same depth.

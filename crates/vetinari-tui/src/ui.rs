@@ -13,9 +13,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use vetinari_core::application::queue::Lane;
 use vetinari_core::domain::attention::ItemState;
+use vetinari_core::domain::devflow::lanes::RowKind;
+use vetinari_core::domain::devflow::step::GateKind;
 
 use crate::app::{App, Level};
-use crate::overlay::{Form, Menu, Overlay, Prompt, TextView};
+use crate::overlay::{Form, Menu, Overlay, Prompt, RunView, TextView};
 
 /// Draw the whole frame.
 pub fn render(frame: &mut Frame, app: &App) {
@@ -218,6 +220,7 @@ fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, area: Rect) {
         Overlay::Menu(menu) => render_menu(frame, menu, area),
         Overlay::Form(form) => render_form(frame, form, area),
         Overlay::Text(view) => render_text(frame, view, area),
+        Overlay::Run(view) => render_run(frame, view, area),
         Overlay::DeviceCode(view) => {
             let popup = centred(area, 70, 9);
             let lines = vec![
@@ -366,6 +369,85 @@ fn render_form(frame: &mut Frame, form: &Form, area: Rect) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Skill editor "),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+/// A run's popup (design 9.3): a row per node, indented under its loop,
+/// the latest questions and findings, and the keys the open gate takes.
+fn render_run(frame: &mut Frame, view: &RunView, area: Rect) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    match &view.detail {
+        None => lines.push(Line::styled("waiting for vetinarid...", dim)),
+        Some(detail) => {
+            lines.push(Line::raw(detail.item.summary.strip()));
+            lines.push(Line::raw(""));
+            for row in &detail.rows {
+                let mut text = format!(
+                    "{}{} {}",
+                    "  ".repeat(row.row.indent),
+                    row.mark.glyph(),
+                    row.row.node
+                );
+                if let RowKind::Loop {
+                    selected, bound, ..
+                } = row.row.kind
+                {
+                    text.push_str(&format!("  < {selected}/{bound} >"));
+                }
+                if let Some(attempt) = row.row.state.as_ref().and_then(|state| state.attempt)
+                    && attempt.get() > 1
+                {
+                    text.push_str(&format!("  attempt {attempt}"));
+                }
+                lines.push(Line::raw(text));
+            }
+            if !detail.notes.questions.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("Preflight asks:", dim));
+                for question in &detail.notes.questions {
+                    lines.push(Line::raw(format!("  - {}", question.as_str())));
+                }
+            }
+            if let Some(review) = &detail.notes.findings {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("Review round {} found:", review.round),
+                    dim,
+                ));
+                for finding in &review.findings {
+                    let place = match (&finding.file, finding.line) {
+                        (Some(file), Some(line)) => format!("{}:{line}  ", file.as_str()),
+                        (Some(file), None) => format!("{}  ", file.as_str()),
+                        _ => String::new(),
+                    };
+                    lines.push(Line::raw(format!("  - {place}{}", finding.text.as_str())));
+                }
+            }
+        }
+    }
+    let gate_keys = match view.gate() {
+        Some((_, GateKind::InfoNeeded)) => "r recheck  n recheck with a note  ",
+        Some((_, GateKind::ReviewStuck)) => "o open the PR anyway  ",
+        None => "",
+    };
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("{gate_keys}x abandon  </> round  ESC close"),
+        dim,
+    ));
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centred(area, 80, height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", view.title)),
             )
             .wrap(Wrap { trim: false }),
         popup,
@@ -763,6 +845,71 @@ mod tests {
         press(&mut app, "SPC f f");
         for size in [(40_u16, 10_u16), (20, 6), (8, 3)] {
             let _ = drawn(&app, size.0, size.1);
+        }
+    }
+
+    mod runs {
+        use super::*;
+        use crate::fixtures::{detail, item};
+
+        fn with_a_run() -> App {
+            let mut app = app();
+            let source = SourceId::parse("vetinarid").expect("source");
+            app.apply(Update::Polled(vec![
+                vetinari_core::application::attention::Polled {
+                    source: source.clone(),
+                    outcome: Ok(vec![item().to_attention(&source, NOW)]),
+                },
+            ]));
+            app
+        }
+
+        #[test]
+        fn a_run_is_queued_with_its_phase_strip() {
+            let rendered = drawn(&with_a_run(), 120, 24);
+            assert!(
+                rendered.contains("[run] ENG-398 Paginate audit export  pre?"),
+                "{rendered}"
+            );
+        }
+
+        #[test]
+        fn the_popup_shows_the_rows_the_questions_and_the_gate_keys() {
+            let mut app = with_a_run();
+            press(&mut app, "g g");
+            while !app
+                .selected_item()
+                .is_some_and(|item| item.title().as_str().starts_with("ENG-398"))
+            {
+                press(&mut app, "j");
+            }
+            press(&mut app, "RET");
+            app.apply(Update::RunDetail(Box::new(detail())));
+            let rendered = drawn(&app, 120, 30);
+            assert!(
+                rendered.contains("ENG-398 Paginate audit export"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("? intake  < 2/3 >"), "{rendered}");
+            assert!(rendered.contains("  ? ask-info"), "{rendered}");
+            assert!(rendered.contains("Page size?"), "{rendered}");
+            assert!(rendered.contains("r recheck"), "{rendered}");
+            assert!(rendered.contains("n recheck with a note"), "{rendered}");
+        }
+
+        #[test]
+        fn the_popup_waits_for_the_daemon_before_its_first_detail() {
+            let mut app = with_a_run();
+            press(&mut app, "g g");
+            while !app
+                .selected_item()
+                .is_some_and(|item| item.title().as_str().starts_with("ENG-398"))
+            {
+                press(&mut app, "j");
+            }
+            press(&mut app, "RET");
+            let rendered = drawn(&app, 120, 30);
+            assert!(rendered.contains("waiting for vetinarid"), "{rendered}");
         }
     }
 }

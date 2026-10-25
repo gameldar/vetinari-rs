@@ -1149,6 +1149,27 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   script. `tests/fixtures/gate-run.script.json` has ENG-412 on its way to a pull request and
   ENG-398 waiting at `ask-info`.
 
+**The TUI side, as built (slice 12).**
+
+- `DaemonRuns` (`vetinari-adapters/src/daemon/client.rs`) keeps one `runs.watch` open,
+  reconnecting with backoff from 1 to 30 seconds, and is an `AttentionSource` named `vetinarid`:
+  each run is one queue item (`[run] title  strip`). A daemon never reached queues nothing and
+  reports no error, so a developer who does not run vetinarid sees no noise; one that was
+  reached and then lost is `unavailable` until it is back. Every other request (`run.watch`,
+  `gate.answer`, `run.cancel`) opens a connection of its own.
+- A change on the board polls only the daemon's source, not every source. The queue's
+  `absorb` clears every source's problems on any poll, so a failing source's warning can drop
+  off the status line until the next full refresh; the rows themselves are kept.
+- `RET` on a run opens its popup and the event loop keeps exactly one `run.watch` open for it,
+  reopened when `←`/`→` picks another round. At an `info-needed` gate `r` rechecks and `n`
+  rechecks with a note; at `review-stuck` `o` opens the PR anyway; `x` abandons (`run.cancel`)
+  and closes the popup.
+- `vetinari --daemon PATH` reads another socket than the default; the driver in
+  `.claude/skills/run-vetinari` uses it with a scripted vetinarid.
+- Open: a cancelled run's strip keeps the marks of its last graph, so a step that was in flight
+  still shows `◐`; and the popup keeps showing the last preflight's questions while the next
+  preflight runs. Both are display rules for the summary and notes to settle.
+
 ## 11. Testing
 
 Every test is written red first. No test sleeps: leases and backoffs are pure functions of

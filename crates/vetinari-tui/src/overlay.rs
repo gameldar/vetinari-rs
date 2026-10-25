@@ -3,10 +3,17 @@
 //! Each one carries what to do with its answer, so the reducer never has to
 //! remember why a prompt was opened.
 
+use std::num::NonZeroU32;
+
+use vetinari_core::application::devflow::api::RunDetail;
 use vetinari_core::application::ports::DeviceCodeChallenge;
 use vetinari_core::application::skills::SkillDraft;
 use vetinari_core::domain::attention::{IssueRef, MessageRef, PullRequestRef};
 use vetinari_core::domain::credentials::Provider;
+use vetinari_core::domain::devflow::ids::{NodeInstance, RunId};
+use vetinari_core::domain::devflow::lanes::{IterationSelection, RowKind};
+use vetinari_core::domain::devflow::step::GateKind;
+use vetinari_core::domain::devflow::summary::NeedsYou;
 use vetinari_core::domain::ids::{ItemId, ProfileId, SessionId, SkillId, SourceId, SpaceId};
 use vetinari_core::domain::skill::Skill;
 
@@ -51,6 +58,13 @@ pub enum PromptKind {
     },
     /// An API token for a provider.
     ApiToken(Provider),
+    /// A note for a recheck, answering a run's info-needed gate.
+    GateNote {
+        /// The run.
+        run: RunId,
+        /// The gate.
+        instance: NodeInstance,
+    },
 }
 
 /// A question with a text answer.
@@ -383,6 +397,80 @@ impl TextView {
     }
 }
 
+/// A run's popup: what the daemon last sent, and which round of each loop
+/// is being looked at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunView {
+    /// The run.
+    pub run: RunId,
+    /// Its queue title, until the first detail arrives.
+    pub title: String,
+    /// The latest detail, once one has arrived.
+    pub detail: Option<RunDetail>,
+    /// The rounds picked with the arrows.
+    pub selection: IterationSelection,
+}
+
+impl RunView {
+    /// A popup waiting for its first detail.
+    #[must_use]
+    pub fn new(run: RunId, title: impl Into<String>) -> Self {
+        Self {
+            run,
+            title: title.into(),
+            detail: None,
+            selection: IterationSelection::default(),
+        }
+    }
+
+    /// The gate the run is waiting at, if any.
+    #[must_use]
+    pub fn gate(&self) -> Option<(NodeInstance, GateKind)> {
+        match &self.detail.as_ref()?.item.summary.needs_you {
+            Some(NeedsYou::Gate { instance, gate }) => Some((instance.clone(), *gate)),
+            _ => None,
+        }
+    }
+
+    /// Look one round earlier or later in the latest loop that has more
+    /// than one; false when there is no such round.
+    pub fn step_round(&mut self, later: bool) -> bool {
+        let Some(detail) = &self.detail else {
+            return false;
+        };
+        let Some((node, selected, reached)) =
+            detail.rows.iter().rev().find_map(|row| match row.row.kind {
+                RowKind::Loop {
+                    reached, selected, ..
+                } if reached > 1 => Some((row.row.node.clone(), selected, reached)),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let selected = self
+            .selection
+            .iter()
+            .find_map(|(chosen, iteration)| (*chosen == node).then_some(iteration))
+            .unwrap_or(selected);
+        let next = if later {
+            selected
+                .get()
+                .checked_add(1)
+                .filter(|next| *next <= reached)
+        } else {
+            selected.get().checked_sub(1)
+        };
+        match next.and_then(NonZeroU32::new) {
+            Some(next) => {
+                self.selection = self.selection.clone().with(node, next);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Whatever currently has the foreground.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
@@ -398,6 +486,8 @@ pub enum Overlay {
     Details,
     /// A device-code challenge.
     DeviceCode(DeviceCodeView),
+    /// A run's popup.
+    Run(RunView),
 }
 
 #[cfg(test)]
