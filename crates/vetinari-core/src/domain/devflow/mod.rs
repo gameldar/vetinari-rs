@@ -10,6 +10,7 @@ pub mod compile;
 mod engine_rules;
 pub mod held;
 pub mod ids;
+pub mod lanes;
 pub mod outcome;
 pub mod result;
 pub mod run_view;

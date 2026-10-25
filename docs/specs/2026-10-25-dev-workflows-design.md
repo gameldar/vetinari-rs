@@ -445,7 +445,7 @@ template gets a strip without new code:
 crates/
   vetinari-core/src/
     domain/devflow/             ids, template, compile, step, outcome, result, task, held,
-                                run_view; engine_rules (test-only)
+                                run_view, summary, lanes; engine_rules (test-only)
     application/devflow/
       ports.rs                  TaskGateway, RunGateway, RunEvents, LeaseJournal, StepFiles
       launcher.rs               compile, register, start, refuse a second run per ticket
@@ -979,7 +979,10 @@ first one that does needs no view work):
 ```
 
 `lanes` orders a scope's nodes by depth from the scope's entries. Nodes at the same depth are one
-lane group. That is a property of the drawn graph, not of timing, so the layout does not jump as
+lane group. As built (`domain/devflow/lanes.rs`), depth is the longest path over the scope's own
+edges and ties keep graph order; every node gets a row, including an unreached `review-stuck`,
+and the renderer decides what to hide. A loop row carries the iterations reached, the selected
+one (the latest unless the developer picked another it has reached) and the bound. That is a property of the drawn graph, not of timing, so the layout does not jump as
 instances start and finish.
 
 The popup subscribes with `run.watch` while open and closes the stream on `esc`. `o` focuses the
