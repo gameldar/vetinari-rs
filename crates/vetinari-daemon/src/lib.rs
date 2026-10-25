@@ -5,5 +5,8 @@
 //! It is the only crate that depends on all the others: `compose` is its
 //! composition root.
 
+pub mod compose;
 pub mod hub;
+pub mod runtime;
+pub mod scripted;
 pub mod socket;

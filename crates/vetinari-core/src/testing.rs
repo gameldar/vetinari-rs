@@ -1134,6 +1134,14 @@ impl FakeRunGateway {
             .insert(graph.run.to_string(), graph);
     }
 
+    /// Forget a run, so fetching its graph is `NotFound`.
+    pub fn remove_graph(&self, run: &crate::domain::devflow::ids::RunId) {
+        self.graphs
+            .lock()
+            .expect("graphs lock")
+            .remove(run.as_str());
+    }
+
     /// The runs whose graph was fetched, in order.
     #[must_use]
     pub fn fetched(&self) -> Vec<String> {

@@ -1069,6 +1069,37 @@ The TUI never starts the daemon. `vetinarid` runs as a systemd user service (a u
 decide whether it owns it, and the answer would be wrong for whichever of the two clients started
 second.
 
+### 10.5 The skeleton, as built
+
+Slice 11 builds the daemon's run board end to end and nothing that claims work:
+
+- `ClientApi` (`application/devflow/api.rs`) has `hello` and a `RunBoard` of `RunItem`s (a
+  `RunSummary` with an optional `RunLabel { ticket, title }` and start time). Putting an
+  unchanged item reports no change, so a refetch that moves nothing costs clients nothing.
+- `protocol.rs` reads `hello`, `runs.watch` and `stream.close`; every other method is
+  `invalid` until its slice adds it. A run item goes out with each phase's `mark` name and its
+  glyph, and `needs_you` as `{ kind: gate | question, ... }`.
+- `socket.rs` serves the hub's snapshot and then its changes; a watcher that falls behind the
+  broadcast is sent a fresh snapshot. A socket file a live daemon answers on is not replaced.
+  `stream.close` of a stream that is not open is `not-found`.
+- `runtime.rs` has `feed_runs`: open the stream, watch every owned run, apply events, refetch
+  as the mirror asks, reopen a closed stream after a second (failed opens back off 1 to 60
+  seconds), and remove a run whose graph is `NotFound`. Its clock, `TokioClock`, reads tokio's
+  time, which is what lets its tests run with time paused.
+- `compose.rs` reads runs from a script (`--scripted <file>`) or a gateway (`--gateway <url>`,
+  with a fixed token from `VETINARI_AUTOGNOMUS_TOKEN` until slice 13). A gateway's runs are found
+  with `definitions` and `runs` and have no label yet: reading the ticket from a definition's
+  node config is left to the launcher slice, which also records labels for the runs it starts.
+- A script names runs with their starting graph and lists steps; a step waits `after_ms`, may
+  replace its run's graph, and emits one event (a `resync` when it only replaces the graph). Its
+  JSON is the gateway's own, read by the same adapter code, so a script exercises the mirror and
+  the summary exactly as a live run would. `tests/fixtures/feature-run.script.json` takes one run
+  from preflight to an opened pull request.
+
+Not yet composed: the worker's claim, heartbeat and agent loops, `LocalSteps` from the worker
+(every step reads as elsewhere until they are), and `hint_cancelled` from the mirror's `ending`.
+They need the configuration and sign-in of slice 13 to run against a real gateway.
+
 ## 11. Testing
 
 Every test is written red first. No test sleeps: leases and backoffs are pure functions of
