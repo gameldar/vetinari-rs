@@ -33,13 +33,15 @@ use crate::signin::{SignIn, SignInOutcome};
 use crate::steps::LocalBoard;
 use vetinari_core::application::auth::AuthState;
 
-/// Bind the socket at `path`, in a directory only this user can enter. A
-/// socket file left by a daemon that is no longer running is replaced; one
-/// a running daemon answers on is not.
+/// Bind the socket at `path`. A directory created for it is one only this
+/// user can enter; one that already exists, such as `/tmp`, is left as it
+/// is, because it is not the daemon's to restrict. A socket file left by a
+/// daemon that is no longer running is replaced; one a running daemon
+/// answers on is not.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::PermissionsExt;
 
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = path.parent().filter(|dir| !dir.exists()) {
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -851,6 +853,26 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[tokio::test]
+    async fn a_socket_in_a_directory_that_exists_leaves_the_directory_alone() {
+        // `--socket /tmp/v.sock` must not try to make /tmp private, which
+        // fails for anyone but root and would lock everyone else out for
+        // root.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).expect("dir");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+
+        drop(bind(&shared.join("v.sock")).expect("bind"));
+
+        let mode = std::fs::metadata(&shared)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o1777);
     }
 
     #[tokio::test]
