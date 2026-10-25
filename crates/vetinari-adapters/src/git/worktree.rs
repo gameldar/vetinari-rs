@@ -11,7 +11,7 @@ use std::process::Output;
 use async_trait::async_trait;
 use tokio::process::Command;
 use vetinari_core::application::ports::{PortError, PortResult, WorktreeManager};
-use vetinari_core::domain::git::{BranchName, Worktree, WorktreeSpec};
+use vetinari_core::domain::git::{BranchName, CommitId, Worktree, WorktreeSpec};
 
 /// Creates and removes git worktrees.
 #[derive(Debug, Clone)]
@@ -172,6 +172,14 @@ impl WorktreeManager for GitWorktreeManager {
             .await?;
         Ok(parse_porcelain(&output, repo))
     }
+
+    async fn head(&self, worktree: &Path) -> PortResult<CommitId> {
+        let output = self
+            .run_ok(worktree, "git rev-parse", &["rev-parse", "HEAD"])
+            .await?;
+        CommitId::parse(&output)
+            .map_err(|_| PortError::protocol("git", "rev-parse printed nothing"))
+    }
 }
 
 fn stderr_of(output: &Output) -> String {
@@ -305,6 +313,20 @@ mod tests {
             second.path().join("scratch.txt").is_file(),
             "adopting must not throw away work in progress"
         );
+    }
+
+    #[tokio::test]
+    async fn head_names_the_commit_a_worktree_has_checked_out() {
+        let repo = repo_with_a_commit().await;
+        let manager = GitWorktreeManager::default();
+        let head = manager.head(repo.path()).await.expect("head");
+        assert_eq!(
+            head.as_str(),
+            git(repo.path(), &["rev-parse", "HEAD"]).await
+        );
+
+        let missing = tempfile::tempdir().expect("tempdir");
+        assert!(manager.head(missing.path()).await.is_err());
     }
 
     #[tokio::test]

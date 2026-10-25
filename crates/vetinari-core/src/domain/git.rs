@@ -8,7 +8,15 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
+use super::ids::{EmptyId, opaque_id};
 use super::workspace::SpaceName;
+
+opaque_id!(
+    /// A commit, as `git rev-parse` names it.
+    CommitId
+);
 
 /// A git branch name that git will accept.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -159,6 +167,27 @@ impl WorktreeSpec {
         }
     }
 
+    /// The worktree a dev workflow run works in. Every step of the run uses
+    /// this one branch and directory, so a rerun adopts the work an earlier
+    /// attempt left.
+    #[must_use]
+    pub fn for_run(
+        repo: PathBuf,
+        worktree_root: &Path,
+        branch: &BranchName,
+        base: Option<&BranchName>,
+    ) -> Self {
+        let name = branch.as_str();
+        let name = name.strip_prefix("vetinari/").unwrap_or(name);
+        let directory = SpaceName::sanitized(&format!("{}-{name}", repo_label(&repo)));
+        Self {
+            path: worktree_root.join(directory.as_str()),
+            repo,
+            branch: branch.clone(),
+            base: base.map(ToString::to_string),
+        }
+    }
+
     /// The repository the worktree is cut from.
     #[must_use]
     pub fn repo(&self) -> &Path {
@@ -304,6 +333,35 @@ mod tests {
             Path::new("/work/trees/vetinari-feedback-add-a-which-key-popup")
         );
         assert_eq!(spec.base(), None);
+    }
+
+    #[test]
+    fn a_run_worktree_is_named_after_the_repository_and_the_run_branch() {
+        let branch = BranchName::sanitized("vetinari/eng-412-rate-limit-retries");
+        let base = BranchName::sanitized("main");
+        let spec = WorktreeSpec::for_run(
+            PathBuf::from("/work/repos/web"),
+            Path::new("/work/trees"),
+            &branch,
+            Some(&base),
+        );
+        assert_eq!(spec.branch(), &branch);
+        assert_eq!(
+            spec.path(),
+            Path::new("/work/trees/web-eng-412-rate-limit-retries")
+        );
+        assert_eq!(spec.base(), Some("main"));
+        assert_eq!(spec.repo(), Path::new("/work/repos/web"));
+        assert_eq!(
+            WorktreeSpec::for_run(
+                PathBuf::from("/work/repos/web"),
+                Path::new("/work/trees"),
+                &branch,
+                None
+            )
+            .base(),
+            None
+        );
     }
 
     #[test]

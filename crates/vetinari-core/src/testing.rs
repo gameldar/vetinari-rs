@@ -21,7 +21,7 @@ use crate::domain::attention::{
     AttentionItem, IssueRef, MessageRef, PullRequestRef, SourceCategory,
 };
 use crate::domain::credentials::{CredentialKey, Provider, StoredCredential};
-use crate::domain::git::{Worktree, WorktreeSpec};
+use crate::domain::git::{CommitId, Worktree, WorktreeSpec};
 use crate::domain::ids::{AgentId, SessionId, Slug, SourceId, SpaceId};
 use crate::domain::skill::SkillLibrary;
 use crate::domain::workspace::{Space, SpaceName, TargetKind};
@@ -551,9 +551,18 @@ pub struct FakeWorktreeManager {
     fetched: Mutex<Vec<(PathBuf, String, String)>>,
     failure: Mutex<Option<PortError>>,
     fetch_failure: Mutex<Option<PortError>>,
+    heads: Mutex<BTreeMap<PathBuf, CommitId>>,
 }
 
 impl FakeWorktreeManager {
+    /// Say which commit a worktree has checked out.
+    pub fn set_head(&self, worktree: &Path, commit: &str) {
+        self.heads.lock().expect("heads lock").insert(
+            worktree.to_path_buf(),
+            CommitId::parse(commit).expect("commit id"),
+        );
+    }
+
     /// Make the next creation fail.
     pub fn fail_create(&self, error: PortError) {
         *self.failure.lock().expect("failure lock") = Some(error);
@@ -623,6 +632,15 @@ impl WorktreeManager for FakeWorktreeManager {
             .expect("removed lock")
             .push(worktree.path().to_path_buf());
         Ok(())
+    }
+
+    async fn head(&self, worktree: &Path) -> PortResult<CommitId> {
+        self.heads
+            .lock()
+            .expect("heads lock")
+            .get(worktree)
+            .cloned()
+            .ok_or_else(|| PortError::not_found("worktree", worktree.display().to_string()))
     }
 
     async fn list(&self, repo: &Path) -> PortResult<Vec<Worktree>> {
@@ -851,4 +869,69 @@ pub fn polled(
             outcome: Ok(items),
         })
         .collect()
+}
+
+/// Step files held in memory, keyed by full path.
+#[derive(Debug, Default)]
+pub struct FakeStepFiles {
+    files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
+    prepared: Mutex<Vec<PathBuf>>,
+    prepare_failure: Mutex<Option<PortError>>,
+}
+
+impl FakeStepFiles {
+    /// Put a file in place, as a skill would.
+    pub fn put(&self, path: &Path, contents: &str) {
+        self.files
+            .lock()
+            .expect("files lock")
+            .insert(path.to_path_buf(), contents.as_bytes().to_vec());
+    }
+
+    /// A file's contents, if it exists.
+    #[must_use]
+    pub fn contents(&self, path: &Path) -> Option<String> {
+        self.files
+            .lock()
+            .expect("files lock")
+            .get(path)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// The worktrees prepared, in order.
+    #[must_use]
+    pub fn prepared(&self) -> Vec<PathBuf> {
+        self.prepared.lock().expect("prepared lock").clone()
+    }
+
+    /// Make the next preparation fail.
+    pub fn fail_prepare(&self, error: PortError) {
+        *self.prepare_failure.lock().expect("failure lock") = Some(error);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::StepFiles for FakeStepFiles {
+    async fn prepare(&self, worktree: &Path) -> PortResult<()> {
+        if let Some(error) = self.prepare_failure.lock().expect("failure lock").take() {
+            return Err(error);
+        }
+        self.prepared
+            .lock()
+            .expect("prepared lock")
+            .push(worktree.to_path_buf());
+        Ok(())
+    }
+
+    async fn read(&self, path: &Path) -> PortResult<Option<Vec<u8>>> {
+        Ok(self.files.lock().expect("files lock").get(path).cloned())
+    }
+
+    async fn write(&self, path: &Path, contents: &[u8]) -> PortResult<()> {
+        self.files
+            .lock()
+            .expect("files lock")
+            .insert(path.to_path_buf(), contents.to_vec());
+        Ok(())
+    }
 }

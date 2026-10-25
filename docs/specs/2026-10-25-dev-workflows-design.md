@@ -519,8 +519,10 @@ stopped. The skill's prompt names the path, and the agent writes it last.
 `.vetinari/steps/review@2-1.json`. In the worktree, because agent CLIs commonly refuse writes
 outside their working directory. One file per attempt, so a stale result from iteration 1 or
 from a lost attempt can never be read as the current one. `start_step` adds `.vetinari/` to the
-worktree's `info/exclude`, so the file is never committed and the developer's `.gitignore` is
-untouched. The path is also passed as `VETINARI_STEP_RESULT`.
+worktree's `info/exclude` through the `StepFiles` port (`prepare`, `read`, `write`), whose
+`FsStepFiles` adapter asks `git rev-parse --git-path info/exclude` where that file is, because a
+linked worktree shares it with the repository. The file is therefore never committed and the
+developer's `.gitignore` is untouched. The path is also passed as `VETINARI_STEP_RESULT`.
 
 **Shape.**
 
@@ -568,7 +570,8 @@ One shortcut makes a lost completion cheap. Before starting an agent for attempt
 worker looks for a valid result from an earlier attempt of the same instance whose recorded
 `head` matches the worktree's current `HEAD`. If one exists, the work finished and only the
 completion was lost, so it completes at once. This needs `WorktreeManager::head`, a one-line
-port addition, and the worker records `head` beside the outcome when it reads a result.
+port addition, and the worker records `head` beside the outcome when it reads a result, as
+`.vetinari/steps/<instance>-<attempt>.head` next to the result file.
 
 **Skills.** Three built-ins join the library: `ticket-preflight`, `implement-tdd` and
 `self-review`. Each template takes `{{ticket}}`, `{{result_path}}`, `{{iteration}}` and, where
@@ -672,9 +675,14 @@ claimed
 ```
 
 `start_step` is the new `WorkflowEngine` method. It is `run_isolated` with the run's
-`WorktreeSpec` (a new `WorktreeSpec::for_run(repo, root, branch)`), the step's skill and
-bindings, a space named for the ticket that is reused when it already exists, and two more
-environment variables: `VETINARI_STEP_RESULT` and `VETINARI_RUN`.
+`WorktreeSpec` (a new `WorktreeSpec::for_run(repo, root, branch, base)`, directory
+`<repo>-<branch without vetinari/>`), the step's skill and bindings, a space named
+`<ticket-key>-<title>` that is reused when one of that name is already open on the worktree, and
+two more environment variables: `VETINARI_STEP_RESULT` and `VETINARI_RUN`. It binds `ticket` and
+`result_path` itself; the worker supplies `iteration`, `findings` and `note`, always all three
+(`none` when empty), because a template refuses to render with a binding missing. The
+`StepFiles` port is passed in rather than held, so `WorkflowEngine`'s constructor and the TUI's
+composition are unchanged. A pinned `config.agent` wins over the skill's own agent.
 
 `AgentSupervisor` is a single task in the runtime that owns the daemon's `AgentRegistry` and
 calls `poll` every `[general] tick` (the TUI's cadence). The registry wants `&mut self` for

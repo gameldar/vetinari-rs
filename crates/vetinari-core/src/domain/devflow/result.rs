@@ -10,9 +10,11 @@
 //! same skill again will not write a different file.
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::ids::TaskId;
 use super::outcome::{
     Finding, GateAnswer, ImplementOutcome, Line, ListError, OpenPrOutcome, PreflightOutcome,
     ReviewOutcome, ShortList, StepOutcome, Summary, label,
@@ -73,6 +75,30 @@ pub struct StepResult;
 impl StepResult {
     /// The schema this version writes into skill prompts and reads back.
     pub const SCHEMA: u64 = 1;
+
+    /// Where a task's result file goes, relative to the run's worktree:
+    /// `.vetinari/steps/<instance>-<attempt>.json`. One file per attempt, so
+    /// a stale result from an earlier iteration or a lost attempt is never
+    /// read as the current one.
+    #[must_use]
+    pub fn path_for(task: &TaskId) -> PathBuf {
+        Self::step_file(task, "json")
+    }
+
+    /// Where a task's recorded `HEAD` goes, beside its result file, so a
+    /// later attempt can tell whether the work it describes is still there.
+    #[must_use]
+    pub fn head_path_for(task: &TaskId) -> PathBuf {
+        Self::step_file(task, "head")
+    }
+
+    fn step_file(task: &TaskId, extension: &str) -> PathBuf {
+        PathBuf::from(".vetinari/steps").join(format!(
+            "{}-{}.{extension}",
+            task.instance(),
+            task.attempt()
+        ))
+    }
 
     /// Parse the bytes of a result file written by a step of `kind`.
     pub fn parse(kind: StepKind, bytes: &[u8]) -> Result<StepOutcome, ResultError> {
@@ -284,6 +310,19 @@ mod tests {
 
     fn line(text: &str) -> Line {
         Line::parse(text).expect("line")
+    }
+
+    #[test]
+    fn each_attempt_has_its_own_result_and_head_file() {
+        let task = TaskId::parse("01JB7Z~review@2~1").expect("id");
+        assert_eq!(
+            StepResult::path_for(&task),
+            PathBuf::from(".vetinari/steps/review@2-1.json")
+        );
+        assert_eq!(
+            StepResult::head_path_for(&task),
+            PathBuf::from(".vetinari/steps/review@2-1.head")
+        );
     }
 
     #[test]

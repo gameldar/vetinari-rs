@@ -15,7 +15,7 @@ use crate::domain::attention::{
     AttentionItem, IssueRef, MessageRef, PullRequestRef, SourceCategory,
 };
 use crate::domain::credentials::{CredentialKey, Provider, StoredCredential};
-use crate::domain::git::{Worktree, WorktreeSpec};
+use crate::domain::git::{CommitId, Worktree, WorktreeSpec};
 use crate::domain::ids::{AgentId, SessionId, Slug, SourceId, SpaceId};
 use crate::domain::skill::SkillLibrary;
 use crate::domain::workspace::{Space, SpaceName, TargetKind};
@@ -326,6 +326,9 @@ pub trait WorktreeManager: Send + Sync {
 
     /// Every worktree of a repository.
     async fn list(&self, repo: &Path) -> PortResult<Vec<Worktree>>;
+
+    /// The commit a worktree has checked out.
+    async fn head(&self, worktree: &Path) -> PortResult<CommitId>;
 }
 
 /// Where the skill library is persisted.

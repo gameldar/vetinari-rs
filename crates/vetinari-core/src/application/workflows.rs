@@ -13,10 +13,14 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 use super::agents::AgentRegistry;
+use super::devflow::ports::StepFiles;
 use super::ports::{PortError, PortResult, WorktreeManager};
 use super::workspaces::WorkspaceDirectory;
 use crate::domain::agent::TaskSpec;
 use crate::domain::attention::{EventRef, PullRequestRef};
+use crate::domain::devflow::ids::TaskId;
+use crate::domain::devflow::result::StepResult;
+use crate::domain::devflow::step::StepConfig;
 use crate::domain::feedback::FeedbackRequest;
 use crate::domain::git::{Worktree, WorktreeSpec};
 use crate::domain::ids::{AgentId, SessionId, SkillId, SpaceId};
@@ -37,6 +41,28 @@ pub struct WorkflowOutcome {
     pub worktree: Option<Worktree>,
     /// Non-fatal problems: the work started, but not everything worked.
     pub warnings: Vec<PortError>,
+}
+
+/// A dev workflow step to start: the claimed task, its config, and the
+/// template values only the worker knows (`iteration`, `findings`, `note`).
+/// `start_step` binds `ticket` and `result_path` itself.
+#[derive(Debug, Clone)]
+pub struct StepLaunch<'a> {
+    /// The task, which names the run, instance and attempt.
+    pub task: &'a TaskId,
+    /// What the step needs.
+    pub config: &'a StepConfig,
+    /// Further template values.
+    pub bindings: Bindings,
+}
+
+/// A dev workflow step whose agent is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepStarted {
+    /// The agent, its space and the worktree.
+    pub outcome: WorkflowOutcome,
+    /// Where the skill will write its result.
+    pub result: PathBuf,
 }
 
 /// The skills the built-in workflows render.
@@ -237,6 +263,107 @@ impl WorkflowEngine {
             worktree: None,
             warnings: Vec::new(),
         })
+    }
+
+    /// Start one agent step of a dev workflow run: the run's worktree on the
+    /// run's branch, adopted when an earlier step or attempt cut it, with
+    /// `.vetinari/` kept out of git; the run's space, reused while it is still
+    /// open; and the step's skill, told where to write its result.
+    pub async fn start_step(
+        &self,
+        launch: StepLaunch<'_>,
+        files: &dyn StepFiles,
+        library: &SkillLibrary,
+        profile: &Profile,
+        registry: &mut AgentRegistry,
+    ) -> PortResult<StepStarted> {
+        let config = launch.config;
+        let skill_id = config.skill.as_ref().ok_or_else(|| {
+            PortError::not_configured(
+                config.step.name(),
+                "the step names no skill, so no agent can run it",
+            )
+        })?;
+        let skill = library
+            .get(skill_id)
+            .ok_or_else(|| PortError::not_found("skill", skill_id.as_str()))?;
+        let worktree_root = self.worktree_root(profile, &config.repo.path);
+        let worktree_spec = WorktreeSpec::for_run(
+            config.repo.path.clone(),
+            &worktree_root,
+            &config.branch,
+            config.base.as_ref(),
+        );
+        let result = worktree_spec.path().join(StepResult::path_for(launch.task));
+        let ticket = &config.ticket;
+        let bindings = launch
+            .bindings
+            .with(
+                "ticket",
+                match &ticket.url {
+                    Some(url) => format!("{} {} ({url})", ticket.key, ticket.title),
+                    None => format!("{} {}", ticket.key, ticket.title),
+                },
+            )
+            .with("result_path", result.display().to_string());
+        let spec = render(skill, &bindings, &config.repo.path)?
+            .with_env("VETINARI_STEP_RESULT", result.display().to_string())
+            .with_env("VETINARI_RUN", launch.task.run().as_str());
+
+        let worktree = self.worktrees.create(&worktree_spec).await?;
+        files.prepare(worktree.path()).await?;
+        let spec = spec
+            .in_directory(worktree.path().to_path_buf())
+            .with_env("VETINARI_PROFILE", profile.id().as_str())
+            .with_env("VETINARI_WORKTREE", worktree.path().display().to_string());
+
+        let mut warnings = Vec::new();
+        let space_name = SpaceName::sanitized(&format!("{}-{}", ticket.key, ticket.title));
+        let space = match self
+            .space_for_run(profile.target(), &space_name, worktree.path())
+            .await
+        {
+            Ok(space) => Some(space),
+            Err(error) => {
+                warnings.push(error);
+                None
+            }
+        };
+
+        let pinned = config.agent.as_ref().or(skill.agent());
+        let agent = profile.routing().resolve(spec.class(), pinned).clone();
+        let session = registry.spawn(spec, profile.routing(), pinned).await?;
+        if let Some(space) = &space {
+            registry.attach_space(&session, space.clone());
+        }
+        Ok(StepStarted {
+            outcome: WorkflowOutcome {
+                session,
+                agent,
+                space,
+                worktree: Some(worktree),
+                warnings,
+            },
+            result,
+        })
+    }
+
+    /// The run's space: the one already open for its worktree, or a new one.
+    async fn space_for_run(
+        &self,
+        kind: TargetKind,
+        name: &SpaceName,
+        path: &Path,
+    ) -> PortResult<SpaceId> {
+        let target = self.workspaces.target(kind)?;
+        if let Ok(spaces) = target.list_spaces().await
+            && let Some(open) = spaces
+                .iter()
+                .find(|space| space.name() == name && space.path() == path)
+        {
+            return Ok(open.id().clone());
+        }
+        target.create_space(name, path).await
     }
 
     /// Run an engine's command line inside a space, so the agent sits beside
@@ -815,5 +942,199 @@ mod tests {
         assert_eq!(h.target.commands().len(), 1);
         assert_eq!(h.target.commands()[0].0, space.as_str());
         assert_eq!(command, h.target.commands()[0].1);
+    }
+
+    mod steps {
+        use super::*;
+        use crate::domain::devflow::step::StepKind;
+        use crate::domain::devflow::template::{RepoTarget, TemplateKind, TicketRef};
+        use crate::domain::git::BranchName;
+        use crate::domain::ids::Slug;
+        use crate::testing::FakeStepFiles;
+
+        fn config(step: StepKind, skill: Option<&str>) -> StepConfig {
+            StepConfig {
+                step,
+                template: TemplateKind::FeatureFromTicket,
+                ticket: TicketRef {
+                    source: Slug::parse("jira").expect("id"),
+                    key: NonEmptyText::parse("ENG-412").expect("key"),
+                    title: NonEmptyText::parse("Rate-limit retries").expect("title"),
+                    url: Some("https://acme.atlassian.net/browse/ENG-412".to_owned()),
+                },
+                repo: RepoTarget {
+                    path: PathBuf::from("/work/repos/web"),
+                    remote: NonEmptyText::parse("acme/web").expect("remote"),
+                },
+                profile: ProfileId::parse("work").expect("id"),
+                branch: BranchName::sanitized("vetinari/eng-412-rate-limit-retries"),
+                base: Some(BranchName::sanitized("main")),
+                skill: skill.map(|skill| SkillId::parse(skill).expect("id")),
+                agent: None,
+            }
+        }
+
+        fn task(instance: &str) -> TaskId {
+            TaskId::parse(&format!("01JB7Z~{instance}~1")).expect("id")
+        }
+
+        fn bindings() -> Bindings {
+            Bindings::new()
+                .with("iteration", "1")
+                .with("findings", "none")
+                .with("note", "none")
+        }
+
+        async fn start(
+            h: &mut Harness,
+            files: &FakeStepFiles,
+            task: &TaskId,
+            config: &StepConfig,
+        ) -> PortResult<StepStarted> {
+            h.workflows
+                .start_step(
+                    StepLaunch {
+                        task,
+                        config,
+                        bindings: bindings(),
+                    },
+                    files,
+                    &h.library,
+                    &h.profile,
+                    &mut h.registry,
+                )
+                .await
+        }
+
+        const TREE: &str = "/work/trees/web-eng-412-rate-limit-retries";
+
+        #[tokio::test]
+        async fn a_step_runs_its_skill_in_the_runs_worktree_and_knows_where_to_report() {
+            let mut h = harness();
+            let files = FakeStepFiles::default();
+            let config = config(StepKind::Implement, Some("implement-tdd"));
+            let task = task("implement@1");
+
+            let started = start(&mut h, &files, &task, &config).await.expect("start");
+
+            assert_eq!(
+                h.worktrees.created(),
+                [WorktreeSpec::for_run(
+                    PathBuf::from("/work/repos/web"),
+                    Path::new("/work/trees"),
+                    &config.branch,
+                    config.base.as_ref(),
+                )]
+            );
+            assert_eq!(files.prepared(), [PathBuf::from(TREE)]);
+            let result = PathBuf::from(TREE).join(".vetinari/steps/implement@1-1.json");
+            assert_eq!(started.result, result);
+
+            let spaces = h.target.spaces();
+            assert_eq!(spaces.len(), 1);
+            assert_eq!(spaces[0].name().as_str(), "eng-412-rate-limit-retries");
+            assert_eq!(started.outcome.space.as_ref(), Some(spaces[0].id()));
+
+            let spawned = h.claude.spawned();
+            assert_eq!(spawned.len(), 1);
+            assert_eq!(spawned[0].working_dir(), Path::new(TREE));
+            let prompt = spawned[0].prompt().as_str();
+            assert!(prompt.contains("ENG-412"), "{prompt}");
+            assert!(prompt.contains(&result.display().to_string()), "{prompt}");
+            let env = spawned[0].env();
+            assert!(env.contains(&(
+                "VETINARI_STEP_RESULT".to_owned(),
+                result.display().to_string()
+            )));
+            assert!(env.contains(&("VETINARI_RUN".to_owned(), "01JB7Z".to_owned())));
+        }
+
+        #[tokio::test]
+        async fn a_later_step_reuses_the_runs_open_space() {
+            let mut h = harness();
+            let files = FakeStepFiles::default();
+            let implement = config(StepKind::Implement, Some("implement-tdd"));
+            let review = config(StepKind::Review, Some("self-review"));
+
+            let first = start(&mut h, &files, &task("implement@1"), &implement)
+                .await
+                .expect("implement");
+            let second = start(&mut h, &files, &task("review@1"), &review)
+                .await
+                .expect("review");
+
+            assert_eq!(h.target.spaces().len(), 1);
+            assert_eq!(first.outcome.space, second.outcome.space);
+            assert_eq!(
+                h.worktrees.created().len(),
+                2,
+                "the second adopts the first"
+            );
+            assert_eq!(h.worktrees.created()[0], h.worktrees.created()[1]);
+        }
+
+        #[tokio::test]
+        async fn a_pinned_agent_runs_the_step() {
+            let mut h = harness();
+            let files = FakeStepFiles::default();
+            let mut config = config(StepKind::Review, Some("self-review"));
+            config.agent = Some(AgentId::parse("agy-gemini").expect("id"));
+
+            let started = start(&mut h, &files, &task("review@1"), &config)
+                .await
+                .expect("start");
+
+            assert_eq!(started.outcome.agent.as_str(), "agy-gemini");
+            assert_eq!(h.gemini.spawned().len(), 1);
+            assert!(h.claude.spawned().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_step_with_no_skill_starts_nothing() {
+            let mut h = harness();
+            let files = FakeStepFiles::default();
+            let config = config(StepKind::OpenPr, None);
+
+            let error = start(&mut h, &files, &task("open-pr"), &config)
+                .await
+                .expect_err("no skill");
+
+            assert!(matches!(error, PortError::NotConfigured { .. }));
+            assert!(h.worktrees.created().is_empty());
+            assert!(h.target.spaces().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_worktree_that_cannot_be_prepared_gets_no_agent() {
+            let mut h = harness();
+            let files = FakeStepFiles::default();
+            files.fail_prepare(PortError::unavailable("git", "no info/exclude"));
+            let config = config(StepKind::Implement, Some("implement-tdd"));
+
+            assert!(
+                start(&mut h, &files, &task("implement@1"), &config)
+                    .await
+                    .is_err()
+            );
+            assert!(h.target.spaces().is_empty());
+            assert!(h.claude.spawned().is_empty());
+        }
+
+        #[test]
+        fn the_dev_workflow_skills_are_built_in_and_render_with_the_workers_bindings() {
+            let library = SkillLibrary::builtin();
+            let bindings = bindings()
+                .with("ticket", "ENG-412")
+                .with("result_path", "/r.json");
+            for id in ["ticket-preflight", "implement-tdd", "self-review"] {
+                let skill = library
+                    .get(&SkillId::parse(id).expect("id"))
+                    .unwrap_or_else(|| panic!("{id} is built in"));
+                let task = skill
+                    .to_task(&bindings, PathBuf::from("/w"))
+                    .unwrap_or_else(|error| panic!("{id}: {error}"));
+                assert!(task.prompt().as_str().contains("/r.json"), "{id}");
+            }
+        }
     }
 }
