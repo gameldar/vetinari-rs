@@ -841,7 +841,6 @@ mod tests {
         publisher: Arc<FakePullRequestPublisher>,
         target: Arc<FakeWorkspaceTarget>,
         claude: Arc<FakeAgentEngine>,
-        script: Arc<FakeAgentEngine>,
     }
 
     fn harness_with(max_agent_steps: usize) -> Harness {
@@ -858,10 +857,8 @@ mod tests {
         let claude = Arc::new(FakeAgentEngine::new(
             AgentId::parse("claude-code").expect("id"),
         ));
-        let script = Arc::new(FakeAgentEngine::new(AgentId::parse("script").expect("id")));
         let mut registry = AgentRegistry::new(clock.clone());
         registry.register(claude.clone());
-        registry.register(script.clone());
         let profile = Profile::new(
             ProfileId::parse("work").expect("id"),
             NonEmptyText::parse("Work").expect("name"),
@@ -900,7 +897,6 @@ mod tests {
             publisher,
             target,
             claude,
-            script,
         }
     }
 
@@ -1487,7 +1483,7 @@ mod tests {
             )
             .await
             .expect("accept");
-        let prompt = h.script.spawned()[0].prompt().as_str().to_owned();
+        let prompt = h.claude.spawned()[0].prompt().as_str().to_owned();
         assert!(prompt.contains("Page size is 50"), "{prompt}");
     }
 

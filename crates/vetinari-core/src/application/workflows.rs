@@ -16,7 +16,7 @@ use super::agents::AgentRegistry;
 use super::devflow::ports::StepFiles;
 use super::ports::{PortError, PortResult, WorktreeManager};
 use super::workspaces::WorkspaceDirectory;
-use crate::domain::agent::TaskSpec;
+use crate::domain::agent::{TaskClass, TaskSpec};
 use crate::domain::attention::{EventRef, PullRequestRef};
 use crate::domain::devflow::ids::TaskId;
 use crate::domain::devflow::result::StepResult;
@@ -42,6 +42,11 @@ pub struct WorkflowOutcome {
     /// Non-fatal problems: the work started, but not everything worked.
     pub warnings: Vec<PortError>,
 }
+
+/// The class every dev workflow agent step routes by, whatever its skill's
+/// class: a step works in the run's worktree, so it needs the coding agent
+/// even when it only reads, as preflight and review do.
+const STEP_CLASS: TaskClass = TaskClass::DeepCodeChange;
 
 /// A dev workflow step to start: the claimed task, its config, and the
 /// template values only the worker knows (`iteration`, `findings`, `note`).
@@ -327,9 +332,15 @@ impl WorkflowEngine {
             }
         };
 
-        let pinned = config.agent.as_ref().or(skill.agent());
-        let agent = profile.routing().resolve(spec.class(), pinned).clone();
-        let session = registry.spawn(spec, profile.routing(), pinned).await?;
+        let agent = config
+            .agent
+            .as_ref()
+            .or(skill.agent())
+            .unwrap_or_else(|| profile.routing().agent_for(STEP_CLASS))
+            .clone();
+        let session = registry
+            .spawn(spec, profile.routing(), Some(&agent))
+            .await?;
         if let Some(space) = &space {
             registry.attach_space(&session, space.clone());
         }
@@ -1095,6 +1106,23 @@ mod tests {
             assert_eq!(started.outcome.agent.as_str(), "agy-gemini");
             assert_eq!(h.gemini.spawned().len(), 1);
             assert!(h.claude.spawned().is_empty());
+        }
+
+        #[tokio::test]
+        async fn every_agent_step_runs_on_the_coding_agent_whatever_its_skills_class() {
+            let mut h = harness();
+            let files = FakeStepFiles::default();
+            for (step, skill, instance) in [
+                (StepKind::Preflight, "ticket-preflight", "preflight@1"),
+                (StepKind::Implement, "implement-tdd", "implement@1"),
+                (StepKind::Review, "self-review", "review@1"),
+            ] {
+                let started = start(&mut h, &files, &task(instance), &config(step, Some(skill)))
+                    .await
+                    .expect("start");
+                assert_eq!(started.outcome.agent.as_str(), "claude-code", "{skill}");
+            }
+            assert_eq!(h.claude.spawned().len(), 3);
         }
 
         #[tokio::test]

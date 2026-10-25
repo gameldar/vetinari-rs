@@ -596,13 +596,13 @@ port addition, and the worker records `head` beside the outcome when it reads a 
 **Skills.** Three built-ins join the library: `ticket-preflight`, `implement-tdd` and
 `self-review`. Each template takes `{{ticket}}`, `{{result_path}}`, `{{iteration}}` and, where
 it applies, `{{findings}}` or `{{note}}`. `implement-tdd` states the repository's TDD rule:
-failing test first, then the code. Routing uses existing task classes: preflight is
-`IssueSummary`, implement is `DeepCodeChange`, review is `PrReview`.
+failing test first, then the code.
 
-Under the default routing table `IssueSummary` goes to the `script` engine, which cannot read a
-codebase, so a preflight on an unconfigured machine runs on the wrong agent. Until that is
-settled, a machine running the daemon needs an `IssueSummary` rule (or a pinned `config.agent`).
-Open: give preflight its own task class, or route it as `DeepCodeChange` (16).
+Every agent step (preflight, implement, review) runs on the profile's coding agent, the engine
+`DeepCodeChange` routes to, whatever its skill's class. A step's `config.agent`, or a skill that
+pins an agent, overrides that. A step never falls back to the `script` engine: preflight's skill
+is classed `IssueSummary`, which routes to `script` by default, and `script` cannot read a
+codebase. `start_step` resolves the agent itself and passes it to the registry as pinned.
 
 ## 7. The step worker
 
@@ -1297,12 +1297,10 @@ clean.
    of section 12? Slice 13 can be built against `MockServer` either way, but the first live run
    cannot happen until this is known.
 
-2. **Preflight's routing.** `IssueSummary` defaults to the `script` engine (6). Either a new
-   task class or routing preflight as `DeepCodeChange`.
-
 Decided, with the defaults recorded here:
 
 | Question | Decision |
 |---|---|
+| Preflight's routing | Every agent step runs on the profile's coding agent (`DeepCodeChange`'s engine) unless the step config or its skill pins one (6) |
 | Worktree removal | Stays an explicit action on the finished run item (7.6). No "pushed?" query is needed |
 | Reminders | A schedule-triggered workflow with one gate on the human queue. Nothing new is needed from autognomus |
