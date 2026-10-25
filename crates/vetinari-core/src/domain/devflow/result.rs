@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::TaskId;
+use super::ids::NodeInstance;
 use super::outcome::{
     Finding, GateAnswer, ImplementOutcome, Line, ListError, OpenPrOutcome, PreflightOutcome,
     ReviewOutcome, ShortList, StepOutcome, Summary, label,
@@ -81,23 +81,19 @@ impl StepResult {
     /// a stale result from an earlier iteration or a lost attempt is never
     /// read as the current one.
     #[must_use]
-    pub fn path_for(task: &TaskId) -> PathBuf {
-        Self::step_file(task, "json")
+    pub fn path_for(instance: &NodeInstance, attempt: NonZeroU32) -> PathBuf {
+        Self::step_file(instance, attempt, "json")
     }
 
     /// Where a task's recorded `HEAD` goes, beside its result file, so a
     /// later attempt can tell whether the work it describes is still there.
     #[must_use]
-    pub fn head_path_for(task: &TaskId) -> PathBuf {
-        Self::step_file(task, "head")
+    pub fn head_path_for(instance: &NodeInstance, attempt: NonZeroU32) -> PathBuf {
+        Self::step_file(instance, attempt, "head")
     }
 
-    fn step_file(task: &TaskId, extension: &str) -> PathBuf {
-        PathBuf::from(".vetinari/steps").join(format!(
-            "{}-{}.{extension}",
-            task.instance(),
-            task.attempt()
-        ))
+    fn step_file(instance: &NodeInstance, attempt: NonZeroU32, extension: &str) -> PathBuf {
+        PathBuf::from(".vetinari/steps").join(format!("{instance}-{attempt}.{extension}"))
     }
 
     /// Parse the bytes of a result file written by a step of `kind`.
@@ -314,13 +310,13 @@ mod tests {
 
     #[test]
     fn each_attempt_has_its_own_result_and_head_file() {
-        let task = TaskId::parse("01JB7Z~review@2~1").expect("id");
+        let instance = NodeInstance::parse("review@2").expect("instance");
         assert_eq!(
-            StepResult::path_for(&task),
+            StepResult::path_for(&instance, NonZeroU32::MIN),
             PathBuf::from(".vetinari/steps/review@2-1.json")
         );
         assert_eq!(
-            StepResult::head_path_for(&task),
+            StepResult::head_path_for(&instance, NonZeroU32::MIN),
             PathBuf::from(".vetinari/steps/review@2-1.head")
         );
     }

@@ -294,7 +294,10 @@ impl WorkflowEngine {
             &config.branch,
             config.base.as_ref(),
         );
-        let result = worktree_spec.path().join(StepResult::path_for(launch.task));
+        let result = worktree_spec.path().join(StepResult::path_for(
+            launch.task.instance(),
+            launch.task.attempt(),
+        ));
         let ticket = &config.ticket;
         let bindings = launch
             .bindings

@@ -730,15 +730,19 @@ written atomically through a temporary file and rename.
 
 ```rust
 pub struct HeldLease {
-    pub task: TaskId,
-    pub lease: LeaseToken,
-    pub expires_at: OffsetDateTime,
-    pub queue: TaskQueue,
-    pub step: StepKind,
+    pub task: ClaimedTask,  // the whole claim, with its current expiry
     pub state: HeldState,   // Starting | Running { session, worktree, space: Option<_> }
                             // | AwaitingPerson | Completing { output: StepOutput }
+                            // | Failing { failure: StepFailure }
 }
 ```
+
+The whole claim is kept, not just its identifiers, because a restart inside the lease starts the
+step again and needs its config and input to do so. The journal stores it in the claim reply's
+own form and reads it back through `ClaimedTask::parse`; a `StepInput::Plain` is stored as `{}`,
+since no step reads its predecessor's output, and `previous` is a `StepOutput`. `Failing` is the
+counterpart of `Completing`: a failure that could not reach the gateway is kept and resent,
+exactly as a completion is (7.5 says "retry" for both).
 
 `HeldLease` is a domain type (`domain/devflow/held.rs`); the file format is the adapter's own,
 versioned, with `output` stored as the `StepOutput` document. An entry that does not parse fails

@@ -203,7 +203,7 @@ mod tests {
     use vetinari_core::domain::devflow::ids::{DefinitionId, Rounds, WorkerName};
     use vetinari_core::domain::devflow::outcome::{ReviewOutcome, StepOutcome};
     use vetinari_core::domain::devflow::step::StepKind;
-    use vetinari_core::domain::devflow::task::{ClaimedTask, StepInput};
+    use vetinari_core::domain::devflow::task::{ClaimedTask, StepInput, StepOutput};
     use vetinari_core::domain::devflow::template::{
         DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
     };
@@ -330,7 +330,11 @@ mod tests {
         assert_eq!(task.config.step, StepKind::Implement);
         let StepInput::Iteration {
             iteration,
-            previous: Some(StepOutcome::Review(ReviewOutcome::ChangesRequested { findings })),
+            previous:
+                Some(StepOutput {
+                    outcome: StepOutcome::Review(ReviewOutcome::ChangesRequested { findings }),
+                    ..
+                }),
         } = task.input
         else {
             panic!("expected review findings, got {:?}", task.input);

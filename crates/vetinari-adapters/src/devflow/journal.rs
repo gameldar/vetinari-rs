@@ -14,8 +14,9 @@ use vetinari_core::application::devflow::ports::LeaseJournal;
 use vetinari_core::application::ports::{PortError, PortResult};
 use vetinari_core::domain::devflow::held::{HeldLease, HeldState};
 use vetinari_core::domain::devflow::ids::{LeaseToken, TaskId, TaskQueue};
-use vetinari_core::domain::devflow::step::StepKind;
-use vetinari_core::domain::devflow::task::StepOutput;
+use vetinari_core::domain::devflow::task::{
+    ClaimedTask, FailureKind, RawTask, StepFailure, StepOutput,
+};
 use vetinari_core::domain::ids::{SessionId, SpaceId};
 
 /// How errors from this adapter name it.
@@ -114,13 +115,21 @@ impl JournalFile {
 
 #[derive(Serialize, Deserialize)]
 struct LeaseEntry {
-    task: String,
+    task: TaskEntry,
+    state: StateEntry,
+}
+
+/// The claim as the gateway sent it, so loading reads it with the same
+/// parser a claim goes through.
+#[derive(Serialize, Deserialize)]
+struct TaskEntry {
+    id: String,
     lease: String,
     #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
     queue: String,
-    step: String,
-    state: StateEntry,
+    config: serde_json::Value,
+    input: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -137,16 +146,24 @@ enum StateEntry {
     Completing {
         output: serde_json::Value,
     },
+    Failing {
+        permanent: bool,
+        message: String,
+    },
 }
 
 impl From<&HeldLease> for LeaseEntry {
     fn from(held: &HeldLease) -> Self {
+        let task = &held.task;
         Self {
-            task: held.task.to_string(),
-            lease: held.lease.to_string(),
-            expires_at: held.expires_at,
-            queue: held.queue.to_string(),
-            step: held.step.name().to_owned(),
+            task: TaskEntry {
+                id: task.id.to_string(),
+                lease: task.lease.to_string(),
+                expires_at: task.expires_at,
+                queue: task.queue.to_string(),
+                config: task.config.to_json(),
+                input: task.input.to_json(),
+            },
             state: match &held.state {
                 HeldState::Starting => StateEntry::Starting,
                 HeldState::Running {
@@ -162,6 +179,10 @@ impl From<&HeldLease> for LeaseEntry {
                 HeldState::Completing { output } => StateEntry::Completing {
                     output: output.to_json(),
                 },
+                HeldState::Failing { failure } => StateEntry::Failing {
+                    permanent: failure.kind == FailureKind::Permanent,
+                    message: failure.message.clone(),
+                },
             },
         }
     }
@@ -170,15 +191,16 @@ impl From<&HeldLease> for LeaseEntry {
 impl LeaseEntry {
     fn into_held(self) -> Result<HeldLease, String> {
         let field = |name: &str, error: &dyn std::fmt::Display| format!("{name}: {error}");
+        let raw = RawTask::new(
+            TaskId::parse(&self.task.id).map_err(|error| field("task", &error))?,
+            LeaseToken::parse(&self.task.lease).map_err(|error| field("lease", &error))?,
+            self.task.expires_at,
+            TaskQueue::parse(&self.task.queue).map_err(|error| field("queue", &error))?,
+            self.task.config,
+            self.task.input,
+        );
         Ok(HeldLease {
-            task: TaskId::parse(&self.task).map_err(|error| field("task", &error))?,
-            lease: LeaseToken::parse(&self.lease).map_err(|error| field("lease", &error))?,
-            expires_at: self.expires_at,
-            queue: TaskQueue::parse(&self.queue).map_err(|error| field("queue", &error))?,
-            step: self
-                .step
-                .parse::<StepKind>()
-                .map_err(|error| field("step", &error))?,
+            task: ClaimedTask::parse(&raw).map_err(|error| field("task", &error))?,
             state: match self.state {
                 StateEntry::Starting => HeldState::Starting,
                 StateEntry::Running {
@@ -198,6 +220,13 @@ impl LeaseEntry {
                 StateEntry::Completing { output } => HeldState::Completing {
                     output: StepOutput::parse(&output).map_err(|error| field("output", &error))?,
                 },
+                StateEntry::Failing { permanent, message } => HeldState::Failing {
+                    failure: if permanent {
+                        StepFailure::permanent(message)
+                    } else {
+                        StepFailure::transient(message)
+                    },
+                },
             },
         })
     }
@@ -209,19 +238,27 @@ mod tests {
     use vetinari_core::domain::devflow::ids::{LeaseToken, TaskId, TaskQueue};
     use vetinari_core::domain::devflow::outcome::{GateAnswer, Line, StepOutcome};
     use vetinari_core::domain::devflow::step::{GateKind, StepKind};
-    use vetinari_core::domain::devflow::task::StepOutput;
     use vetinari_core::domain::git::BranchName;
     use vetinari_core::domain::ids::{SessionId, SpaceId};
 
     use super::*;
 
     fn held(instance: &str, step: StepKind, state: HeldState) -> HeldLease {
+        let raw = RawTask::new(
+            TaskId::parse(&format!("01JB7Z~{instance}~1")).expect("id"),
+            LeaseToken::parse("01JB80").expect("lease"),
+            datetime!(2026-10-25 10:05:00 UTC),
+            TaskQueue::parse("vetinari-hex-agent").expect("queue"),
+            serde_json::json!({
+                "schema": 1, "step": step.name(), "template": "feature-from-ticket",
+                "ticket": { "source": "jira", "key": "ENG-412", "title": "Retries" },
+                "repo": { "path": "/work/repos/web", "remote": "acme/web" },
+                "profile": "work", "branch": "vetinari/eng-412-retries"
+            }),
+            serde_json::json!({ "input": {}, "iteration": 1 }),
+        );
         HeldLease {
-            task: TaskId::parse(&format!("01JB7Z~{instance}~1")).expect("id"),
-            lease: LeaseToken::parse("01JB80").expect("lease"),
-            expires_at: datetime!(2026-10-25 10:05:00 UTC),
-            queue: TaskQueue::parse("vetinari-hex-agent").expect("queue"),
-            step,
+            task: ClaimedTask::parse(&raw).expect("claim"),
             state,
         }
     }
@@ -262,6 +299,20 @@ mod tests {
                         }),
                         git_branch: BranchName::sanitized("vetinari/eng-412-retries"),
                     },
+                },
+            ),
+            held(
+                "review@1",
+                StepKind::Review,
+                HeldState::Failing {
+                    failure: StepFailure::transient("claude-code exited 1"),
+                },
+            ),
+            held(
+                "implement@1",
+                StepKind::Implement,
+                HeldState::Failing {
+                    failure: StepFailure::permanent("the skill wrote no result"),
                 },
             ),
         ]
@@ -312,6 +363,7 @@ mod tests {
         let text = std::fs::read_to_string(&path)
             .expect("read")
             .replace("01JB7Z~preflight@1~1", "not-a-task-id");
+        assert!(text.contains("not-a-task-id"));
         std::fs::write(&path, text).expect("write");
         assert!(matches!(
             journal.load().await,

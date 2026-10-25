@@ -89,6 +89,19 @@ pub struct ClaimedTask {
 }
 
 impl ClaimedTask {
+    /// The claim in the form it was read from, for keeping it in the journal.
+    #[must_use]
+    pub fn to_raw(&self) -> RawTask {
+        RawTask::new(
+            self.id.clone(),
+            self.lease.clone(),
+            self.expires_at,
+            self.queue.clone(),
+            self.config.to_json(),
+            self.input.to_json(),
+        )
+    }
+
     /// Read a claim as a vetinari step.
     pub fn parse(raw: &RawTask) -> Result<Self, ClaimError> {
         Ok(Self {
@@ -99,6 +112,55 @@ impl ClaimedTask {
             config: StepConfig::parse(&raw.config)?,
             input: StepInput::parse(&raw.input)?,
         })
+    }
+}
+
+/// Whether a failure might go away if the step ran again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureKind {
+    /// It might: the retry policy decides.
+    Transient,
+    /// It will not: the run fails.
+    Permanent,
+}
+
+impl FailureKind {
+    /// The name the gateway uses.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            FailureKind::Transient => "transient",
+            FailureKind::Permanent => "permanent",
+        }
+    }
+}
+
+/// Why a step failed, as the worker tells the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepFailure {
+    /// Whether to retry.
+    pub kind: FailureKind,
+    /// What went wrong.
+    pub message: String,
+}
+
+impl StepFailure {
+    /// A failure the retry policy may retry.
+    #[must_use]
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Transient,
+            message: message.into(),
+        }
+    }
+
+    /// A failure that fails the run.
+    #[must_use]
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Permanent,
+            message: message.into(),
+        }
     }
 }
 
@@ -123,13 +185,32 @@ pub enum StepInput {
     Iteration {
         /// Which iteration this is.
         iteration: NonZeroU32,
-        /// The exit node's outcome from the iteration before, when it
+        /// The exit node's output from the iteration before, when it
         /// produced one.
-        previous: Option<StepOutcome>,
+        previous: Option<StepOutput>,
     },
 }
 
 impl StepInput {
+    /// The input as the journal keeps it. `Plain` keeps nothing, because no
+    /// step reads its predecessor's output.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            StepInput::Plain => serde_json::json!({}),
+            StepInput::Iteration {
+                iteration,
+                previous,
+            } => {
+                let mut envelope = serde_json::json!({ "input": {}, "iteration": iteration.get() });
+                if let Some(previous) = previous {
+                    envelope["previous"] = previous.to_json();
+                }
+                envelope
+            }
+        }
+    }
+
     /// Read a task's input. An object with an `iteration` key is a loop
     /// envelope; no step's output carries that key.
     pub fn parse(input: &serde_json::Value) -> Result<Self, InputError> {
@@ -143,7 +224,7 @@ impl StepInput {
             .ok_or_else(|| InputError::Iteration(iteration.to_string()))?;
         let previous = match input.get("previous") {
             None | Some(serde_json::Value::Null) => None,
-            Some(previous) => Some(StepOutput::parse(previous)?.outcome),
+            Some(previous) => Some(StepOutput::parse(previous)?),
         };
         Ok(Self::Iteration {
             iteration,
@@ -369,9 +450,30 @@ mod tests {
             ),
             Ok(StepInput::Iteration {
                 iteration: NonZeroU32::new(2).expect("non-zero"),
-                previous: Some(findings())
+                previous: Some(previous)
             })
         );
+    }
+
+    #[test]
+    fn an_input_round_trips_through_the_journals_form() {
+        let inputs = [
+            StepInput::Plain,
+            StepInput::Iteration {
+                iteration: NonZeroU32::MIN,
+                previous: None,
+            },
+            StepInput::Iteration {
+                iteration: NonZeroU32::new(3).expect("non-zero"),
+                previous: Some(StepOutput {
+                    outcome: findings(),
+                    git_branch: branch(),
+                }),
+            },
+        ];
+        for input in inputs {
+            assert_eq!(StepInput::parse(&input.to_json()), Ok(input));
+        }
     }
 
     #[test]
@@ -391,6 +493,25 @@ mod tests {
             ),
             Err(InputError::Previous(_))
         ));
+    }
+
+    #[test]
+    fn a_claim_round_trips_through_its_raw_form() {
+        let task = ClaimedTask::parse(&RawTask::new(
+            TaskId::parse("01JB7Z~review@2~1").expect("id"),
+            LeaseToken::parse("01JB80").expect("lease"),
+            OffsetDateTime::UNIX_EPOCH,
+            TaskQueue::parse("vetinari-hex-agent").expect("queue"),
+            json!({
+                "schema": 1, "step": "review", "template": "feature-from-ticket",
+                "ticket": { "source": "jira", "key": "ENG-412", "title": "Retries" },
+                "repo": { "path": "/work/repos/web", "remote": "acme/web" },
+                "profile": "work", "branch": "vetinari/eng-412-retries", "skill": "self-review"
+            }),
+            json!({}),
+        ))
+        .expect("claim");
+        assert_eq!(ClaimedTask::parse(&task.to_raw()), Ok(task));
     }
 
     #[test]

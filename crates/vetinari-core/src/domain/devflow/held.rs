@@ -2,28 +2,26 @@
 
 use std::path::PathBuf;
 
-use time::OffsetDateTime;
-
-use super::ids::{LeaseToken, TaskId, TaskQueue};
 use super::step::StepKind;
-use super::task::StepOutput;
+use super::task::{ClaimedTask, StepFailure, StepOutput};
 use crate::domain::ids::{SessionId, SpaceId};
 
-/// A claimed task this worker has not yet completed or failed.
+/// A claimed task this worker has not yet completed or failed. The whole
+/// claim is kept, because a restarted daemon starts the step again from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldLease {
-    /// The task.
-    pub task: TaskId,
-    /// The lease the claim holds.
-    pub lease: LeaseToken,
-    /// When the lease runs out without a heartbeat.
-    pub expires_at: OffsetDateTime,
-    /// The queue it was claimed from.
-    pub queue: TaskQueue,
-    /// What the step does.
-    pub step: StepKind,
+    /// The claim, with its current expiry.
+    pub task: ClaimedTask,
     /// How far the worker got.
     pub state: HeldState,
+}
+
+impl HeldLease {
+    /// What the step does.
+    #[must_use]
+    pub const fn step(&self) -> StepKind {
+        self.task.config.step
+    }
 }
 
 /// How far the worker got with a held task, which decides what a restarted
@@ -47,5 +45,10 @@ pub enum HeldState {
     Completing {
         /// What to complete it with.
         output: StepOutput,
+    },
+    /// The step failed; the failure has not reached the gateway yet.
+    Failing {
+        /// What to fail it with.
+        failure: StepFailure,
     },
 }
