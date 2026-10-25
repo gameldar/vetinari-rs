@@ -916,7 +916,12 @@ right-aligned where other items show their state tag:
 | `·` | not reached |
 
 A loop phase shows its iteration and bound while it runs (`impl●2/3`), and drops them once it
-finishes on its first round (`pre✓`). The strip drops
+finishes on its first round (`pre✓`). As built, the round shows only once the loop is past its
+first iteration, while the phase is active or done: the second example row's `pre?` is on round
+1 and shows none, which the sentence above alone would contradict. A phase whose loop is on a
+round its nodes have not reached yet is `○` (`rev○` above, after `review@1`). `summarise` takes
+the template, for `node_step`, and leaves the ticket and title to the caller: the graph view has
+no config to read them from. The strip drops
 from the right when the title needs the room, and the phase that needs the developer is never
 the one dropped.
 

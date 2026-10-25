@@ -14,5 +14,6 @@ pub mod outcome;
 pub mod result;
 pub mod run_view;
 pub mod step;
+pub mod summary;
 pub mod task;
 pub mod template;
