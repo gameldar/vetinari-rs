@@ -310,8 +310,10 @@ const MAX_BACKOFF: StdDuration = StdDuration::from_secs(60);
 /// Claim from one queue for as long as the owner runs: ask for capacity,
 /// long-poll, hand over what comes. An unreachable gateway backs off 1, 2,
 /// 4 ... 60 seconds. A token the gateway refuses even renewed asks for a
-/// sign-in and waits for it when the daemon can sign in; any other refusal
-/// stops the loop, since asking again will not change the answer.
+/// sign-in and waits for it when the daemon can sign in, and backs off like
+/// an unreachable gateway when the token comes from a file, which may yet be
+/// rotated; any other refusal stops the loop, since asking again will not
+/// change the answer.
 pub async fn claim_loop(
     tasks: Arc<dyn TaskGateway>,
     queue: TaskQueue,
@@ -352,6 +354,11 @@ pub async fn claim_loop(
                     sign_in.lost();
                     sign_in.signed_in().await;
                     backoff = CLAIM_PAUSE;
+                }
+                (PortError::Unauthenticated { .. }, None) => {
+                    tracing::warn!(%queue, "autognomus refused the token file's token; backing off");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
                 _ => {
                     tracing::error!(%error, %queue, "claiming stopped");
@@ -608,6 +615,21 @@ mod tests {
         claim_on(&h, queues().human);
         settle(StdDuration::from_secs(120)).await;
         assert_eq!(claims(&h), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_token_the_daemon_cannot_sign_in_for_is_tried_again_later() {
+        let h = harness();
+        h.tasks.on_claim(Err(PortError::Unauthenticated {
+            provider: vetinari_core::domain::credentials::Provider::Autognomus,
+        }));
+        claim_on(&h, queues().human);
+        settle(StdDuration::from_secs(120)).await;
+        assert!(
+            claims(&h) >= 2,
+            "a token file may be rotated: {}",
+            claims(&h)
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
-use vetinari_adapters::autognomus::client::{AuthBearer, HttpGateway};
+use vetinari_adapters::autognomus::client::{AuthBearer, Bearer, FileBearer, HttpGateway};
 use vetinari_adapters::config::{candidate_paths, load_or_default};
 use vetinari_adapters::credentials::KeyringStore;
 use vetinari_adapters::daemon::client::DaemonRuns;
@@ -23,7 +23,7 @@ use vetinari_adapters::oauth::OidcDeviceCodeFlow;
 use vetinari_adapters::skills::FileSkillStore;
 use vetinari_adapters::{HttpClient, Paths, Runtime};
 use vetinari_core::application::auth::{AuthService, AuthState};
-use vetinari_core::application::config::AutognomusConfig;
+use vetinari_core::application::config::{AutognomusConfig, GatewayCredential, OidcClient};
 use vetinari_core::application::config::{Config, ParseContext, SourceSettings};
 use vetinari_core::application::devflow::api::ClientApi;
 use vetinari_core::application::devflow::launcher::{Launcher, RunOrigin};
@@ -145,7 +145,8 @@ fn hostname() -> Option<String> {
 pub fn gateway_config(config: &Config) -> Result<&AutognomusConfig, DaemonError> {
     config.autognomus.as_ref().ok_or_else(|| {
         DaemonError::Config(
-            "no gateway is configured: add [autognomus] with gateway_url, issuer and client_id"
+            "no gateway is configured: add [autognomus] with gateway_url, and issuer and \
+             client_id or a token_file"
                 .to_owned(),
         )
     })
@@ -153,16 +154,12 @@ pub fn gateway_config(config: &Config) -> Result<&AutognomusConfig, DaemonError>
 
 /// The credential service for the gateway's issuer. Only the daemon builds
 /// one: refresh tokens rotate on use.
-fn gateway_auth(
-    autognomus: &AutognomusConfig,
-    http: HttpClient,
-    clock: Arc<dyn Clock>,
-) -> Arc<AuthService> {
+fn gateway_auth(oidc: &OidcClient, http: HttpClient, clock: Arc<dyn Clock>) -> Arc<AuthService> {
     Arc::new(AuthService::new(
         Arc::new(KeyringStore),
         Arc::new(OidcDeviceCodeFlow::new(
             Provider::Autognomus,
-            autognomus.oidc.clone(),
+            oidc.clone(),
             http,
             clock.clone(),
         )),
@@ -170,25 +167,58 @@ fn gateway_auth(
     ))
 }
 
-/// Find the gateway's runs once the daemon is signed in, for a daemon that
-/// started without a usable token.
-async fn discover_once_signed_in(
+/// The gateway's bearer token, and the sign-in behind it when the daemon
+/// signs in itself rather than reading a token file.
+async fn gateway_bearer(
+    credential: &GatewayCredential,
+    http: HttpClient,
+    clock: Arc<dyn Clock>,
+) -> (Arc<dyn Bearer>, Option<Arc<SignIn>>) {
+    match credential {
+        GatewayCredential::SignIn(oidc) => {
+            let auth = gateway_auth(oidc, http, clock);
+            let sign_in = SignIn::new(auth.clone());
+            sign_in.check().await;
+            (Arc::new(AuthBearer::new(auth)), Some(sign_in))
+        }
+        GatewayCredential::TokenFile(path) => (Arc::new(FileBearer::new(path.clone())), None),
+    }
+}
+
+/// Find the gateway's runs once it takes the daemon's token, for a daemon
+/// that started without a usable one: after a sign-in, or, reading a token
+/// file, once the file holds a token the gateway accepts.
+async fn discover_once_accepted(
     runs: Arc<dyn RunGateway>,
-    sign_in: Arc<SignIn>,
+    sign_in: Option<Arc<SignIn>>,
     launches: Arc<GatewayLaunches>,
     feed: mpsc::UnboundedSender<RunChange>,
 ) {
-    sign_in.signed_in().await;
-    match discover(runs.as_ref()).await {
-        Ok(found) => {
-            launches.know(found.origins).await;
-            for run in found.owned {
-                let _ = feed.send(RunChange::Owned(run));
+    let found = loop {
+        if let Some(sign_in) = &sign_in {
+            sign_in.lost();
+            sign_in.signed_in().await;
+        } else {
+            tokio::time::sleep(TOKEN_FILE_RETRY).await;
+        }
+        match discover(runs.as_ref()).await {
+            Ok(found) => break found,
+            Err(PortError::Unauthenticated { .. }) => {}
+            Err(error) => {
+                tracing::warn!(%error, "cannot list the gateway's runs");
+                return;
             }
         }
-        Err(error) => tracing::warn!(%error, "cannot list the gateway's runs after signing in"),
+    };
+    launches.know(found.origins).await;
+    for run in found.owned {
+        let _ = feed.send(RunChange::Owned(run));
     }
 }
+
+/// How long a daemon reading a token file waits before trying a refused
+/// token file again.
+const TOKEN_FILE_RETRY: Duration = Duration::from_secs(60);
 
 /// Sign the daemon in on stdout (design 12). A running daemon is asked to
 /// sign itself in, since it holds the credential; with none running the
@@ -212,7 +242,14 @@ pub async fn login(socket: PathBuf, config: Option<PathBuf>) -> Result<(), Daemo
         let (config, _) = load_config(config)?;
         let autognomus = gateway_config(&config)?.clone();
         let clock: Arc<dyn Clock> = Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc()));
-        let sign_in = SignIn::new(gateway_auth(&autognomus, HttpClient::new()?, clock));
+        let GatewayCredential::SignIn(oidc) = &autognomus.credential else {
+            return Err(DaemonError::SignIn(
+                "vetinarid reads its token from autognomus.token_file: there is nothing to \
+                 sign in to"
+                    .to_owned(),
+            ));
+        };
+        let sign_in = SignIn::new(gateway_auth(oidc, HttpClient::new()?, clock));
         let (challenge, ended) = sign_in.begin().await?;
         print_challenge(&challenge);
         match ended.await {
@@ -482,13 +519,12 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 hostname().as_deref(),
             );
             let http = HttpClient::new()?;
-            let auth = gateway_auth(&autognomus, http.clone(), clock.clone());
-            let sign_in = SignIn::new(auth.clone());
-            sign_in.check().await;
+            let (bearer, sign_in) =
+                gateway_bearer(&autognomus.credential, http.clone(), clock.clone()).await;
             let gateway = Arc::new(HttpGateway::new(
                 autognomus.gateway_url.as_str(),
                 http,
-                Arc::new(AuthBearer::new(auth)),
+                bearer,
             ));
             let local = LocalBoard::new();
             let hub = Arc::new(Hub::default());
@@ -514,9 +550,8 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                     found.owned
                 }
                 Err(PortError::Unauthenticated { .. }) => {
-                    tracing::warn!("autognomus needs a sign-in; serving until it has one");
-                    sign_in.lost();
-                    tokio::spawn(discover_once_signed_in(
+                    tracing::warn!("autognomus refused the token; serving until it takes one");
+                    tokio::spawn(discover_once_accepted(
                         gateway.clone(),
                         sign_in.clone(),
                         launches.clone(),
@@ -535,7 +570,7 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 claims: Some(claims),
                 gates: Arc::new(NoGates),
                 local,
-                sign_in: Some(sign_in),
+                sign_in,
                 hub,
                 launches,
                 changes,

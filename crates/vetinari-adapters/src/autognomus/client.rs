@@ -6,7 +6,8 @@
 //! statuses.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -62,6 +63,49 @@ impl StaticBearer {
 impl Bearer for StaticBearer {
     async fn token(&self, _refresh: bool) -> PortResult<String> {
         Ok(self.0.clone())
+    }
+}
+
+/// A token read from a file kept current by something else, read again
+/// whenever the gateway refuses the one held, so a rotated file is picked
+/// up without a restart.
+pub struct FileBearer {
+    path: PathBuf,
+    held: Mutex<Option<String>>,
+}
+
+impl FileBearer {
+    /// Read tokens from `path`.
+    #[must_use]
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            held: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl Bearer for FileBearer {
+    async fn token(&self, refresh: bool) -> PortResult<String> {
+        if !refresh && let Some(token) = self.held.lock().expect("lock").clone() {
+            return Ok(token);
+        }
+        let unreadable = || PortError::Unauthenticated {
+            provider: Provider::Autognomus,
+        };
+        let text = tokio::fs::read_to_string(&self.path)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, path = %self.path.display(), "cannot read the token file");
+                unreadable()
+            })?;
+        let token = text.trim();
+        if token.is_empty() {
+            return Err(unreadable());
+        }
+        *self.held.lock().expect("lock") = Some(token.to_owned());
+        Ok(token.to_owned())
     }
 }
 
@@ -892,6 +936,55 @@ mod tests {
             server.requests()[1].header("authorization"),
             Some("Bearer fresh")
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_file_is_read_again_when_its_token_is_refused() {
+        let server = MockServer::start(vec![
+            (200, r#"{"expires_at":"2026-10-25T10:10:00Z"}"#.to_owned()),
+            (401, String::new()),
+            (200, r#"{"expires_at":"2026-10-25T10:20:00Z"}"#.to_owned()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("token");
+        std::fs::write(&file, "first\n").expect("written");
+        let gateway = gateway_with(&server.base_url, Arc::new(FileBearer::new(file.clone())));
+
+        gateway.heartbeat(&task(), &lease()).await.expect("first");
+        std::fs::write(&file, "second\n").expect("rotated");
+        gateway.heartbeat(&task(), &lease()).await.expect("second");
+
+        let sent: Vec<_> = server
+            .requests()
+            .iter()
+            .map(|request| request.header("authorization").map(str::to_owned))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                Some("Bearer first".to_owned()),
+                Some("Bearer first".to_owned()),
+                Some("Bearer second".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_file_that_cannot_be_read_is_unauthenticated() {
+        let dir = tempfile::tempdir().expect("dir");
+        let missing = FileBearer::new(dir.path().join("missing"));
+        let blank = dir.path().join("blank");
+        std::fs::write(&blank, "  \n").expect("written");
+
+        for bearer in [missing, FileBearer::new(blank)] {
+            assert_eq!(
+                bearer.token(false).await,
+                Err(PortError::Unauthenticated {
+                    provider: Provider::Autognomus
+                })
+            );
+        }
     }
 
     #[tokio::test]

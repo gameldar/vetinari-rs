@@ -1308,7 +1308,8 @@ socket up, reports `unauthenticated`, and surfaces an "autognomus needs sign-in"
 **As built (slice 13).**
 
 - `[autognomus]` is parsed into `AutognomusConfig { gateway_url, oidc: OidcClient { issuer,
-  client_id, audience, scopes }, worker }`, URLs as `HttpUrl`. `scopes` defaults to
+  client_id, audience, scopes }, worker }`, URLs as `HttpUrl` (`oidc` has since become
+  `credential`, see the token file below). `scopes` defaults to
   `openid offline_access`. `vetinarid` without `--scripted` needs the table; `--gateway` is gone.
   The worker label is `--worker`, else `[autognomus] worker`, else the hostname.
 - `OidcDeviceCodeFlow` (`vetinari-adapters/src/oauth/oidc.rs`) reads discovery once (a failed
@@ -1348,8 +1349,34 @@ If the issuer cannot do 1, the fallback is a loopback redirect with PKCE served 
 on `127.0.0.1`, which this document does not design.
 
 Keyring access from a daemon needs the user's Secret Service session. Under a systemd user unit
-in a desktop session it has one. A headless machine has none, and the credential adapter has
-no file fallback today; that is gap 7.
+in a desktop session it has one. A headless machine has none; it reads a token file instead.
+
+**A token file instead of a sign-in.** `token_file` in `[autognomus]` replaces `issuer` and
+`client_id`: `vetinarid` sends the token the file holds (trimmed) as a static bearer, and never
+touches the keyring or an issuer. It is for a headless machine with no Secret Service session,
+and for the local autognomus dev stack, whose issuer has no device code endpoint. Whatever
+writes the file keeps it current; `vetinarid` only reads it.
+
+```toml
+[autognomus]
+gateway_url = "http://127.0.0.1:8080"
+token_file  = "~/.config/vetinari/autognomus-token"
+```
+
+As built:
+
+- `AutognomusConfig.credential` is `GatewayCredential::SignIn(OidcClient)` or
+  `GatewayCredential::TokenFile(PathBuf)` (`~` expanded). `token_file` wins when both are
+  given; a table with neither `token_file` nor `issuer` and `client_id` is a config error, as is
+  a blank `token_file`.
+- `FileBearer` (`vetinari-adapters/src/autognomus/client.rs`) holds the token it last read and
+  reads the file again when the gateway refuses it, so a rotated file is picked up on the next
+  `401` without a restart. A missing, unreadable or empty file is `unauthenticated`.
+- A token-file daemon has no `SignIn`: `auth.status` says `valid`, `auth.begin` and
+  `vetinarid login` refuse with "nothing to sign in to", and no "needs sign-in" item appears.
+  A claim loop whose token is refused backs off 1 ... 60 seconds and claims again, rather than
+  stopping, since the file may yet be rotated; a daemon that starts with a refused token lists
+  the gateway's runs once a retry, every 60 seconds, is accepted.
 
 ## 13. Engine spec points, resolved
 
@@ -1427,8 +1454,9 @@ clean.
    gateway would need the queue to be a scope (engine gap 2).
 6. **Restarted steps lose agent context.** A restart within the lease restarts the agent in the
    same worktree with a fresh session; it continues from the files, not from its conversation.
-7. **No headless keyring.** `vetinarid` on a machine without a Secret Service session cannot
-   store its token (12).
+7. **No headless sign-in.** `vetinarid` on a machine without a Secret Service session cannot
+   store a signed-in token. It reads `token_file` instead (12), which something outside
+   vetinari has to keep current; there is no refresh of a token-file token.
 
 **Out of scope:**
 

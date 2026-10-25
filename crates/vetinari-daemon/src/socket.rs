@@ -269,7 +269,7 @@ async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>, back
                 None => Outbound::Error {
                     id: Some(id),
                     error: ApiError::Invalid(
-                        "this daemon replays a script and signs in to nothing".to_owned(),
+                        "this daemon has nothing to sign in to: it replays a script or reads a token file".to_owned(),
                     ),
                 },
                 Some(sign_in) => match sign_in.begin().await {
