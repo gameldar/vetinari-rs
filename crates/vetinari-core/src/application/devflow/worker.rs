@@ -443,7 +443,7 @@ impl StepWorker {
             return self.complete(&task.id, output).await;
         }
         let library = match self.ports.skills.load().await {
-            Ok(library) => library,
+            Ok(library) => library.or_builtin(),
             Err(error) => return self.fail(&task.id, failure_from(&error)).await,
         };
         let bindings = self.bindings(task).await;
@@ -805,6 +805,7 @@ mod tests {
 
     use super::*;
     use crate::application::workspaces::WorkspaceDirectory;
+    use crate::domain::agent::TaskClass;
     use crate::domain::devflow::compile::LeaseSecs;
     use crate::domain::devflow::ids::LeaseToken;
     use crate::domain::devflow::outcome::{Line, OpenPrOutcome};
@@ -814,6 +815,7 @@ mod tests {
     use crate::domain::git::BranchName;
     use crate::domain::ids::{AgentId, ProfileId, SkillId, Slug};
     use crate::domain::profile::Profile;
+    use crate::domain::skill::{PromptTemplate, Skill, SkillLibrary};
     use crate::domain::text::NonEmptyText;
     use crate::domain::workspace::TargetKind;
     use crate::testing::{
@@ -844,6 +846,10 @@ mod tests {
     }
 
     fn harness_with(max_agent_steps: usize) -> Harness {
+        harness_with_skills(max_agent_steps, SkillLibrary::builtin())
+    }
+
+    fn harness_with_skills(max_agent_steps: usize, saved: SkillLibrary) -> Harness {
         let clock = Arc::new(FixedClock::new(NOW));
         let tasks = Arc::new(FakeTaskGateway::new(LATER));
         let runs = Arc::new(FakeRunGateway::default());
@@ -872,7 +878,7 @@ mod tests {
                 journal: journal.clone(),
                 files: files.clone(),
                 worktrees: worktrees.clone(),
-                skills: Arc::new(MemorySkillStore::default()),
+                skills: Arc::new(MemorySkillStore::with_library(saved)),
                 publisher: publisher.clone(),
                 clock: clock.clone(),
             },
@@ -1062,6 +1068,54 @@ mod tests {
             h.files
                 .contents(&PathBuf::from(TREE).join(".vetinari/steps/implement@1-1.head")),
             Some("abc123".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_runs_on_the_built_in_skills_when_none_are_saved() {
+        // The skills file does not exist until someone edits a skill, and a
+        // file saved before these skills shipped does not hold them.
+        let mut h = harness_with_skills(2, SkillLibrary::default());
+        h.tasks
+            .on_claim(Ok(Some(raw("preflight@1", StepKind::Preflight))));
+
+        let progress = h
+            .worker
+            .claim(&queue(AGENT_QUEUE), &mut h.registry)
+            .await
+            .expect("claim");
+
+        assert!(
+            matches!(progress, Some(Progress::Running(_))),
+            "{progress:?}"
+        );
+        assert!(failures(&h).is_empty(), "{:?}", failures(&h));
+    }
+
+    #[tokio::test]
+    async fn a_saved_skill_wins_over_the_built_in_it_replaces() {
+        let mut saved = SkillLibrary::default();
+        saved.upsert(Skill::new(
+            SkillId::parse("ticket-preflight").expect("id"),
+            NonEmptyText::parse("Our preflight").expect("name"),
+            PromptTemplate::parse("Our own check of {{ticket}}").expect("template"),
+            TaskClass::IssueSummary,
+        ));
+        let mut h = harness_with_skills(2, saved);
+        h.tasks
+            .on_claim(Ok(Some(raw("preflight@1", StepKind::Preflight))));
+
+        h.worker
+            .claim(&queue(AGENT_QUEUE), &mut h.registry)
+            .await
+            .expect("claim");
+
+        let spawned = h.claude.spawned();
+        assert_eq!(spawned.len(), 1);
+        assert!(
+            spawned[0].prompt().as_str().starts_with("Our own check of"),
+            "{}",
+            spawned[0].prompt().as_str()
         );
     }
 

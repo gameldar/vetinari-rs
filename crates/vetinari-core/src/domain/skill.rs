@@ -305,6 +305,14 @@ impl SkillLibrary {
         self.skills.insert(skill.id.clone(), skill);
     }
 
+    /// This library, with every built-in it does not define added.
+    #[must_use]
+    pub fn or_builtin(self) -> Self {
+        let mut library = Self::builtin();
+        library.skills.extend(self.skills);
+        library
+    }
+
     /// Look a skill up.
     #[must_use]
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
@@ -458,6 +466,28 @@ mod tests {
 
     fn template(raw: &str) -> PromptTemplate {
         PromptTemplate::parse(raw).expect("template")
+    }
+
+    #[test]
+    fn built_ins_fill_in_what_a_saved_library_lacks_and_never_replace_it() {
+        let ours = Skill::new(
+            SkillId::parse("pr-review").expect("id"),
+            NonEmptyText::parse("Our review").expect("name"),
+            template("Ours"),
+            TaskClass::PrReview,
+        );
+        let mut saved = SkillLibrary::default();
+        saved.upsert(ours.clone());
+
+        let library = saved.or_builtin();
+
+        assert_eq!(library.get(&ours.id), Some(&ours));
+        assert_eq!(library.len(), SkillLibrary::builtin().len());
+        assert!(
+            library
+                .get(&SkillId::parse("ticket-preflight").expect("id"))
+                .is_some()
+        );
     }
 
     #[test]
