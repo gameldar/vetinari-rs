@@ -5,6 +5,7 @@
 //! else: the ports speak replies, and only this module knows they were
 //! statuses.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -13,12 +14,20 @@ use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime};
-use vetinari_core::application::devflow::ports::{LeaseReply, TaskGateway, TaskReply};
+use vetinari_core::application::devflow::ports::{
+    CancelReply, LeaseReply, RunGateway, TaskGateway, TaskReply,
+};
 use vetinari_core::application::ports::{PortError, PortResult};
-use vetinari_core::domain::devflow::ids::{LeaseToken, TaskId, TaskQueue, WorkerName};
+use vetinari_core::domain::devflow::compile::WorkflowGraph;
+use vetinari_core::domain::devflow::ids::{
+    DefinitionId, LeaseToken, RunId, TaskId, TaskQueue, WorkerName,
+};
+use vetinari_core::domain::devflow::run_view::{RunGraph, RunHeader};
 use vetinari_core::domain::devflow::task::{RawTask, StepFailure, StepOutput};
 
-use super::wire::ClaimReply;
+use super::wire::{
+    ClaimReply, RunGraphReply, RunViewReply, StartedReply, WorkflowBody, WorkflowSummaryReply,
+};
 use crate::HttpClient;
 
 /// How errors from this backend name it.
@@ -150,6 +159,21 @@ impl Answer {
             WHAT,
             format!("{what}: {}", describe(self.status, &self.body)),
         )
+    }
+
+    /// A status that is not a reply: a `400` refused, a `404` for `id`, or
+    /// something unexpected.
+    fn refusal(&self, what: &str, id: &str) -> PortError {
+        match self.status {
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY => {
+                PortError::Refused {
+                    what: WHAT.to_owned(),
+                    detail: describe(self.status, &self.body),
+                }
+            }
+            StatusCode::NOT_FOUND => PortError::not_found(what, id),
+            _ => self.unexpected(what),
+        }
     }
 
     /// A `409`'s reason, as the reply it stands for.
@@ -309,6 +333,119 @@ impl TaskGateway for HttpGateway {
     }
 }
 
+/// How many runs of one definition to list: the gateway's cap. A
+/// definition has one run, so this is never reached.
+const MAX_RUNS: u32 = 200;
+
+#[async_trait]
+impl RunGateway for HttpGateway {
+    async fn register(&self, graph: &WorkflowGraph) -> PortResult<()> {
+        let body = serde_json::to_value(WorkflowBody::from(graph))
+            .map_err(|error| PortError::protocol(WHAT, error.to_string()))?;
+        let answer = self
+            .send(Method::POST, "/v1/workflows", Some(&body), None)
+            .await?;
+        match answer.status {
+            StatusCode::CREATED | StatusCode::OK => Ok(()),
+            _ => Err(answer.refusal("register", graph.id.as_str())),
+        }
+    }
+
+    async fn start(&self, definition: &DefinitionId, input: &Value) -> PortResult<RunId> {
+        let body = json!({ "input": input });
+        let answer = self
+            .send(
+                Method::POST,
+                &format!("/v1/workflows/{definition}/runs"),
+                Some(&body),
+                None,
+            )
+            .await?;
+        match answer.status {
+            StatusCode::CREATED | StatusCode::OK => {
+                let started: StartedReply = answer.json("start")?;
+                RunId::parse(&started.run)
+                    .map_err(|error| PortError::protocol(WHAT, format!("run id: {error}")))
+            }
+            _ => Err(answer.refusal("workflow", definition.as_str())),
+        }
+    }
+
+    async fn remove(&self, definition: &DefinitionId) -> PortResult<()> {
+        let answer = self
+            .send(
+                Method::DELETE,
+                &format!("/v1/workflows/{definition}"),
+                None,
+                None,
+            )
+            .await?;
+        match answer.status {
+            StatusCode::NO_CONTENT | StatusCode::OK | StatusCode::NOT_FOUND => Ok(()),
+            _ => Err(answer.refusal("workflow", definition.as_str())),
+        }
+    }
+
+    async fn definitions(&self) -> PortResult<Vec<DefinitionId>> {
+        let answer = self.send(Method::GET, "/v1/workflows", None, None).await?;
+        if answer.status != StatusCode::OK {
+            return Err(answer.unexpected("workflows"));
+        }
+        let listed: Vec<WorkflowSummaryReply> = answer.json("workflows")?;
+        Ok(listed
+            .into_iter()
+            .filter_map(|summary| DefinitionId::parse(&summary.id).ok())
+            .collect())
+    }
+
+    async fn runs(&self, definition: &DefinitionId) -> PortResult<Vec<RunHeader>> {
+        let answer = self
+            .send(
+                Method::GET,
+                &format!("/v1/workflows/{definition}/runs?limit={MAX_RUNS}"),
+                None,
+                None,
+            )
+            .await?;
+        if answer.status != StatusCode::OK {
+            return Err(answer.refusal("workflow", definition.as_str()));
+        }
+        let runs: Vec<RunViewReply> = answer.json("runs")?;
+        runs.into_iter().map(RunViewReply::into_header).collect()
+    }
+
+    async fn graph(&self, run: &RunId) -> PortResult<RunGraph> {
+        let answer = self
+            .send(Method::GET, &format!("/v1/runs/{run}/graph"), None, None)
+            .await?;
+        if answer.status != StatusCode::OK {
+            return Err(answer.refusal("run", run.as_str()));
+        }
+        answer.json::<RunGraphReply>("graph")?.into_graph()
+    }
+
+    async fn cancel(&self, run: &RunId) -> PortResult<CancelReply> {
+        let answer = self
+            .send(Method::POST, &format!("/v1/runs/{run}/cancel"), None, None)
+            .await?;
+        match answer.status {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(CancelReply::Cancelled),
+            StatusCode::CONFLICT => Ok(CancelReply::AlreadyFinished),
+            _ => Err(answer.refusal("run", run.as_str())),
+        }
+    }
+
+    async fn outputs(&self, run: &RunId) -> PortResult<BTreeMap<String, Value>> {
+        let answer = self
+            .send(Method::GET, &format!("/v1/runs/{run}"), None, None)
+            .await?;
+        if answer.status != StatusCode::OK {
+            return Err(answer.refusal("run", run.as_str()));
+        }
+        Ok(answer.json::<RunViewReply>("run")?.outputs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -317,6 +454,7 @@ mod tests {
     use crate::testing::MockServer;
     use time::macros::datetime;
     use vetinari_core::domain::devflow::outcome::{ReviewOutcome, StepOutcome, Summary};
+    use vetinari_core::domain::devflow::run_view::RunStatus;
     use vetinari_core::domain::git::BranchName;
 
     const TASK: &str = "01JB7ZR2M4Q9V8C6T3N5HKD0WX~implement@2~1";
@@ -630,5 +768,210 @@ mod tests {
             .expect_err("refused");
         assert!(matches!(error, PortError::Refused { .. }), "{error:?}");
         assert!(!error.is_transient());
+    }
+
+    // Definitions and runs
+
+    const RUN: &str = "01JB7ZR2M4Q9V8C6T3N5HKD0WX";
+    const DEFINITION: &str = "vetinari-feature-01JB7ZQ3XK";
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/autognomus/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture")
+    }
+
+    fn run() -> RunId {
+        RunId::parse(RUN).expect("run")
+    }
+
+    fn definition() -> DefinitionId {
+        DefinitionId::parse(DEFINITION).expect("definition")
+    }
+
+    fn compiled() -> WorkflowGraph {
+        use vetinari_core::domain::devflow::compile::{StepPolicies, WorkerQueues, compile};
+        use vetinari_core::domain::devflow::ids::Rounds;
+        use vetinari_core::domain::devflow::template::{
+            DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
+        };
+        use vetinari_core::domain::ids::{ProfileId, SourceId};
+        use vetinari_core::domain::text::NonEmptyText;
+
+        let feature = FeatureFromTicket {
+            ticket: TicketRef {
+                source: SourceId::parse("jira").expect("id"),
+                key: NonEmptyText::parse("ENG-412").expect("key"),
+                title: NonEmptyText::parse("Rate-limit webhook retries").expect("title"),
+                url: Some("https://acme.atlassian.net/browse/ENG-412".to_owned()),
+            },
+            repo: RepoTarget {
+                path: std::path::PathBuf::from("/work/repos/web"),
+                remote: NonEmptyText::parse("acme/web").expect("remote"),
+            },
+            profile: ProfileId::parse("work").expect("id"),
+            base: Some(BranchName::sanitized("main")),
+            max_review_rounds: Rounds::new(3).expect("rounds"),
+            max_intake_rounds: Rounds::new(3).expect("rounds"),
+            agent: None,
+        };
+        compile(
+            &DevWorkflow::FeatureFromTicket(feature),
+            definition(),
+            &WorkerQueues::for_worker(&WorkerName::parse("hex").expect("worker")),
+            &StepPolicies::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn registering_posts_the_compiled_body() {
+        let server = MockServer::start(vec![(
+            201,
+            json!({ "id": DEFINITION, "version": 1 }).to_string(),
+        )])
+        .await;
+        gateway(&server)
+            .register(&compiled())
+            .await
+            .expect("register");
+
+        let request = server.request();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/v1/workflows");
+        assert_eq!(
+            request.json(),
+            serde_json::from_str::<Value>(&fixture("feature-from-ticket.workflow.json"))
+                .expect("golden body")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definition_the_engine_will_not_take_is_refused() {
+        let server = MockServer::start(vec![(
+            400,
+            json!({ "error": { "code": "invalid", "message": "exit not in body" } }).to_string(),
+        )])
+        .await;
+        let error = gateway(&server)
+            .register(&compiled())
+            .await
+            .expect_err("refused");
+        match error {
+            PortError::Refused { detail, .. } => assert!(detail.contains("exit not in body")),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn starting_a_run_posts_its_input_and_reads_the_run_id() {
+        let server = MockServer::start(vec![(
+            201,
+            json!({ "run": RUN, "state": "pending" }).to_string(),
+        )])
+        .await;
+        let started = gateway(&server)
+            .start(&definition(), &json!({ "ticket": "ENG-412" }))
+            .await
+            .expect("start");
+
+        assert_eq!(started, run());
+        let request = server.request();
+        assert_eq!(request.target, format!("/v1/workflows/{DEFINITION}/runs"));
+        assert_eq!(request.json(), json!({ "input": { "ticket": "ENG-412" } }));
+    }
+
+    #[tokio::test]
+    async fn starting_a_run_of_a_missing_definition_is_not_found() {
+        let server = MockServer::start(vec![(
+            404,
+            json!({ "error": { "code": "not_found", "message": DEFINITION } }).to_string(),
+        )])
+        .await;
+        let error = gateway(&server)
+            .start(&definition(), &json!({}))
+            .await
+            .expect_err("missing");
+        assert!(matches!(error, PortError::NotFound { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_definition_deletes_it() {
+        let server = MockServer::start(vec![(204, String::new())]).await;
+        gateway(&server)
+            .remove(&definition())
+            .await
+            .expect("remove");
+        let request = server.request();
+        assert_eq!(request.method, "DELETE");
+        assert_eq!(request.target, format!("/v1/workflows/{DEFINITION}"));
+    }
+
+    #[tokio::test]
+    async fn only_vetinaris_definitions_are_listed() {
+        let server = MockServer::start(vec![(200, fixture("workflows.json"))]).await;
+        let listed = gateway(&server).definitions().await.expect("definitions");
+        assert_eq!(listed, [definition()]);
+        assert_eq!(server.request().target, "/v1/workflows");
+    }
+
+    #[tokio::test]
+    async fn a_definitions_runs_are_listed_as_headers() {
+        let server = MockServer::start(vec![(200, fixture("workflow-runs.json"))]).await;
+        let runs = gateway(&server).runs(&definition()).await.expect("runs");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(
+            server.request().target,
+            format!("/v1/workflows/{DEFINITION}/runs?limit=200")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runs_graph_is_fetched_and_read() {
+        let server = MockServer::start(vec![(200, fixture("run-graph.json"))]).await;
+        let graph = gateway(&server).graph(&run()).await.expect("graph");
+        assert_eq!(graph.seq, 17);
+        assert_eq!(server.request().target, format!("/v1/runs/{RUN}/graph"));
+    }
+
+    #[tokio::test]
+    async fn the_graph_of_an_unknown_run_is_not_found() {
+        let server = MockServer::start(vec![(404, String::new())]).await;
+        let error = gateway(&server).graph(&run()).await.expect_err("missing");
+        assert!(matches!(error, PortError::NotFound { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_finished_run_says_so() {
+        let server = MockServer::start(vec![
+            (204, String::new()),
+            (
+                409,
+                json!({ "error": { "code": "conflict", "message": "finished" } }).to_string(),
+            ),
+        ])
+        .await;
+        let gateway = gateway(&server);
+        assert_eq!(
+            gateway.cancel(&run()).await.expect("cancel"),
+            CancelReply::Cancelled
+        );
+        assert_eq!(
+            gateway.cancel(&run()).await.expect("cancel"),
+            CancelReply::AlreadyFinished
+        );
+        let request = server.request();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, format!("/v1/runs/{RUN}/cancel"));
+    }
+
+    #[tokio::test]
+    async fn a_runs_outputs_come_from_the_run_view() {
+        let server = MockServer::start(vec![(200, fixture("run-view.json"))]).await;
+        let outputs = gateway(&server).outputs(&run()).await.expect("outputs");
+        assert_eq!(outputs["ask-info@1"]["note"], json!("Page size is 50"));
+        assert_eq!(server.request().target, format!("/v1/runs/{RUN}"));
     }
 }

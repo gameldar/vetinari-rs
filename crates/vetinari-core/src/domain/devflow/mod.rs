@@ -12,6 +12,7 @@ pub mod held;
 pub mod ids;
 pub mod outcome;
 pub mod result;
+pub mod run_view;
 pub mod step;
 pub mod task;
 pub mod template;

@@ -399,6 +399,25 @@ pub enum InstanceStatus {
 }
 ```
 
+As built (`domain/devflow/run_view.rs`): `Offered` keeps its queue, since "offered to this
+machine" and "offered elsewhere" draw differently; a node's kind is `External { queue }`,
+`Loop { body, exit, max_iterations }` or `Engine` (a component, delay or join, which vetinari's
+templates never contain but a graph may show); the step kind is not on the node, because the
+graph view does not carry a node's config, so `summarise` reads it from the template's node ids.
+A pending run is `Active`. `RunHeader` is a listing entry, and `RunGateway` covers register,
+start, remove, the vetinari definitions, a definition's runs, the graph, cancel
+(`CancelReply::{Cancelled, AlreadyFinished}`, the `204` and `409`) and the outputs of
+`GET /v1/runs/{id}`.
+
+The adapter folds the engine's legacy `running` and `suspended`, and any state it does not know,
+into `Active`, so such a run stays watched. An instance whose status it does not know is left out
+of the graph, as if not reached, and logged; the next event or refetch brings it back.
+
+The engine spec gives these types but not their serde shape. The fixtures follow the engine's
+own views (`RunView`, `TaskView`): a status flattened beside its fields and tagged by `state`, a
+node kind flattened and tagged by `kind`, lowercase, timestamps RFC 3339. That is a point to
+settle with the gateway when the graph endpoint lands (13).
+
 Three pure functions sit on it:
 
 | Function | Produces | Used by |

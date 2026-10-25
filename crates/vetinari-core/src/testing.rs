@@ -1115,13 +1115,37 @@ impl crate::application::devflow::ports::LeaseJournal for MemoryLeaseJournal {
     }
 }
 
-/// A run gateway whose outputs are set by the test.
+/// A run gateway whose outputs and graphs are set by the test. Definition
+/// calls are refused until a test needs them.
 #[derive(Debug, Default)]
 pub struct FakeRunGateway {
     outputs: Mutex<BTreeMap<String, BTreeMap<String, serde_json::Value>>>,
+    graphs: Mutex<BTreeMap<String, crate::domain::devflow::run_view::RunGraph>>,
+    fetched: Mutex<Vec<String>>,
+    cancelled: Mutex<Vec<String>>,
 }
 
 impl FakeRunGateway {
+    /// The graph a fetch of its run returns from now on.
+    pub fn set_graph(&self, graph: crate::domain::devflow::run_view::RunGraph) {
+        self.graphs
+            .lock()
+            .expect("graphs lock")
+            .insert(graph.run.to_string(), graph);
+    }
+
+    /// The runs whose graph was fetched, in order.
+    #[must_use]
+    pub fn fetched(&self) -> Vec<String> {
+        self.fetched.lock().expect("fetched lock").clone()
+    }
+
+    /// The runs cancelled, in order.
+    #[must_use]
+    pub fn cancelled(&self) -> Vec<String> {
+        self.cancelled.lock().expect("cancelled lock").clone()
+    }
+
     /// Record an output for a run's instance.
     pub fn set_output(&self, run: &str, instance: &str, output: serde_json::Value) {
         self.outputs
@@ -1135,6 +1159,66 @@ impl FakeRunGateway {
 
 #[async_trait]
 impl crate::application::devflow::ports::RunGateway for FakeRunGateway {
+    async fn register(
+        &self,
+        _graph: &crate::domain::devflow::compile::WorkflowGraph,
+    ) -> PortResult<()> {
+        Err(PortError::unsupported("fake run gateway", "register"))
+    }
+
+    async fn start(
+        &self,
+        _definition: &crate::domain::devflow::ids::DefinitionId,
+        _input: &serde_json::Value,
+    ) -> PortResult<crate::domain::devflow::ids::RunId> {
+        Err(PortError::unsupported("fake run gateway", "start"))
+    }
+
+    async fn remove(
+        &self,
+        _definition: &crate::domain::devflow::ids::DefinitionId,
+    ) -> PortResult<()> {
+        Err(PortError::unsupported("fake run gateway", "remove"))
+    }
+
+    async fn definitions(&self) -> PortResult<Vec<crate::domain::devflow::ids::DefinitionId>> {
+        Err(PortError::unsupported("fake run gateway", "definitions"))
+    }
+
+    async fn runs(
+        &self,
+        _definition: &crate::domain::devflow::ids::DefinitionId,
+    ) -> PortResult<Vec<crate::domain::devflow::run_view::RunHeader>> {
+        Err(PortError::unsupported("fake run gateway", "runs"))
+    }
+
+    async fn graph(
+        &self,
+        run: &crate::domain::devflow::ids::RunId,
+    ) -> PortResult<crate::domain::devflow::run_view::RunGraph> {
+        self.fetched
+            .lock()
+            .expect("fetched lock")
+            .push(run.to_string());
+        self.graphs
+            .lock()
+            .expect("graphs lock")
+            .get(run.as_str())
+            .cloned()
+            .ok_or_else(|| PortError::not_found("run", run.as_str()))
+    }
+
+    async fn cancel(
+        &self,
+        run: &crate::domain::devflow::ids::RunId,
+    ) -> PortResult<crate::application::devflow::ports::CancelReply> {
+        self.cancelled
+            .lock()
+            .expect("cancelled lock")
+            .push(run.to_string());
+        Ok(crate::application::devflow::ports::CancelReply::Cancelled)
+    }
+
     async fn outputs(
         &self,
         run: &crate::domain::devflow::ids::RunId,

@@ -1,0 +1,15 @@
+[
+  { "instance": "implement@1", "state": "ready", "attempt": null },
+  { "instance": "implement@1", "state": "running", "attempt": 1 },
+  { "instance": "implement@1", "state": "waiting", "until": "2026-10-25T10:01:00Z", "attempt": 1 },
+  { "instance": "implement@1", "state": "offered", "queue": "vetinari-hex-agent", "attempt": 1 },
+  { "instance": "implement@1", "state": "claimed", "worker": "ci-runner.07",
+    "expires_at": "2026-10-25T10:05:00Z", "attempt": 2 },
+  { "instance": "rework", "state": "looping", "iteration": 2 },
+  { "instance": "review@1", "state": "done", "branch": "approved", "attempt": 1,
+    "first_ready_at": "2026-10-25T09:42:00Z", "finished_at": "2026-10-25T09:50:00Z" },
+  { "instance": "implement@1", "state": "done", "attempt": 1 },
+  { "instance": "implement@1", "state": "failed", "error": "agent crashed", "attempt": 3 },
+  { "instance": "open-pr", "state": "skipped" },
+  { "instance": "implement@1", "state": "cancelled", "attempt": 1 }
+]

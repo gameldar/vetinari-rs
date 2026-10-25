@@ -21,3 +21,25 @@ claim-open-pr.json
     envelope and loop output), with `TaskId` in the resolved
     `<run>~<instance>~<attempt>` form. `config` is the matching node's
     config from feature-from-ticket.workflow.json.
+
+run-graph.json
+instance-statuses.json
+    autognomus 0c95213, engine spec section 6 (`RunGraphView`,
+    `GraphNode`, `InstanceView`, `InstanceStatus`) and the amended
+    `RunStateView` (`Pending | Active { in_flight } | Completed | Failed
+    | Cancelled`). The spec gives the types, not their serde shape; the
+    shape here follows the engine's own views (`RunView`, `TaskView`):
+    a status flattened beside its fields and tagged by `state`, a node
+    kind flattened and tagged by `kind`, lowercase, timestamps RFC 3339.
+    Confirm against the gateway when the graph endpoint lands.
+
+run-view.json
+workflow-runs.json
+    autognomus 0c95213, autognomus-workflow-api/src/view.rs (`RunView`,
+    outputs keyed by instance) with the amended state, and
+    autognomus-gateway/src/http/runs.rs (`GET /v1/runs/{id}`,
+    `GET /v1/workflows/{id}/runs` returning `[RunView]`).
+
+workflows.json
+    autognomus 0c95213, autognomus-gateway/src/http/workflows.rs
+    (`GET /v1/workflows` returning `[WorkflowView]`). Only `id` is read.

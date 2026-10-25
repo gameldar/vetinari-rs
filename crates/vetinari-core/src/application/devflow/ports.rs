@@ -7,9 +7,11 @@ use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
 
 use crate::application::ports::PortResult;
+use crate::domain::devflow::compile::WorkflowGraph;
 use crate::domain::devflow::held::HeldLease;
-use crate::domain::devflow::ids::{LeaseToken, RunId, TaskId, TaskQueue, WorkerName};
+use crate::domain::devflow::ids::{DefinitionId, LeaseToken, RunId, TaskId, TaskQueue, WorkerName};
 use crate::domain::devflow::outcome::OpenPrOutcome;
+use crate::domain::devflow::run_view::{RunGraph, RunHeader};
 use crate::domain::devflow::step::StepConfig;
 use crate::domain::devflow::task::{RawTask, StepFailure, StepOutput};
 use crate::domain::profile::Profile;
@@ -76,9 +78,43 @@ pub trait TaskGateway: Send + Sync {
     ) -> PortResult<TaskReply>;
 }
 
-/// The engine's run endpoints, as far as the worker needs them.
+/// What the engine said to a cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReply {
+    /// The run is cancelled; its in-flight instances are abandoned.
+    Cancelled,
+    /// The run had already finished.
+    AlreadyFinished,
+}
+
+/// The engine's definition and run endpoints.
 #[async_trait]
 pub trait RunGateway: Send + Sync {
+    /// Register a compiled definition under its id.
+    async fn register(&self, graph: &WorkflowGraph) -> PortResult<()>;
+
+    /// Start a run of a definition.
+    async fn start(
+        &self,
+        definition: &DefinitionId,
+        input: &serde_json::Value,
+    ) -> PortResult<RunId>;
+
+    /// Delete a definition. Deleting one that is not there succeeds.
+    async fn remove(&self, definition: &DefinitionId) -> PortResult<()>;
+
+    /// Every live definition vetinari registered: those whose id says so.
+    async fn definitions(&self) -> PortResult<Vec<DefinitionId>>;
+
+    /// The runs of a definition.
+    async fn runs(&self, definition: &DefinitionId) -> PortResult<Vec<RunHeader>>;
+
+    /// A run's graph as it is now.
+    async fn graph(&self, run: &RunId) -> PortResult<RunGraph>;
+
+    /// Cancel a run.
+    async fn cancel(&self, run: &RunId) -> PortResult<CancelReply>;
+
     /// Every output a run has recorded, keyed by instance string form.
     async fn outputs(&self, run: &RunId) -> PortResult<BTreeMap<String, serde_json::Value>>;
 }
