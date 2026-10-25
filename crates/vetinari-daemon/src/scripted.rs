@@ -560,6 +560,7 @@ mod tests {
             },
             owned,
             tokio::sync::mpsc::unbounded_channel().1,
+            tokio::sync::mpsc::unbounded_channel().1,
         ));
 
         tokio::time::sleep(StdDuration::from_millis(500)).await;
@@ -610,6 +611,7 @@ mod tests {
             },
             owned,
             touched,
+            tokio::sync::mpsc::unbounded_channel().1,
         ));
         tokio::time::sleep(StdDuration::from_secs(60)).await;
         let gated = |hub: &Hub| {

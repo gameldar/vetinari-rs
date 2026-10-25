@@ -38,6 +38,7 @@ use vetinari_core::testing::{
 };
 use vetinari_daemon::compose::{Claims, Services, serve};
 use vetinari_daemon::gates::NoGates;
+use vetinari_daemon::launches::NoLaunches;
 use vetinari_daemon::runtime::TokioClock;
 use vetinari_daemon::signin::SignIn;
 use vetinari_daemon::steps::{LocalBoard, StepParts};
@@ -209,6 +210,9 @@ async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
             gates: Arc::new(NoGates),
             local: LocalBoard::new(),
             sign_in: None,
+            hub: Arc::default(),
+            launches: Arc::new(NoLaunches),
+            changes: tokio::sync::mpsc::unbounded_channel().1,
             claims: Some(claims(
                 dir.path(),
                 http,
@@ -277,6 +281,9 @@ async fn a_daemon_whose_token_is_refused_keeps_serving_and_asks_for_a_sign_in() 
             gates: Arc::new(NoGates),
             local: LocalBoard::new(),
             sign_in: Some(sign_in),
+            hub: Arc::default(),
+            launches: Arc::new(NoLaunches),
+            changes: tokio::sync::mpsc::unbounded_channel().1,
             claims: Some(claims(dir.path(), http, clock, json!({}))),
         },
     ));

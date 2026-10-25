@@ -61,6 +61,16 @@ pub struct OwnedRun {
     pub started_at: Option<OffsetDateTime>,
 }
 
+/// A change to which runs the daemon owns, from outside the run stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunChange {
+    /// A run to own from now on: one just started, or one found on the
+    /// gateway after the daemon started.
+    Owned(OwnedRun),
+    /// A run dismissed: no longer owned, and off the board.
+    Dismissed(RunId),
+}
+
 /// What `feed_runs` needs.
 pub struct Feed {
     /// The run endpoints.
@@ -89,6 +99,7 @@ pub async fn feed_runs(
     feed: Feed,
     owned: Vec<OwnedRun>,
     mut touched: mpsc::UnboundedReceiver<RunId>,
+    mut changes: mpsc::UnboundedReceiver<RunChange>,
 ) {
     let mut owned: BTreeMap<RunId, OwnedRun> = owned
         .into_iter()
@@ -130,6 +141,19 @@ pub async fn feed_runs(
                         steps.ending(run);
                     }
                 }
+                Some(change) = changes.recv() => match change {
+                    RunChange::Owned(run) => {
+                        let id = run.run.clone();
+                        owned.insert(id.clone(), run);
+                        mirror.watch(id.clone());
+                        publish(&feed, &mirror, &owned, &id);
+                    }
+                    RunChange::Dismissed(run) => {
+                        mirror.forget(&run);
+                        owned.remove(&run);
+                        feed.hub.remove(&run);
+                    }
+                },
                 Some(run) = touched.recv() => {
                     if !owned.contains_key(&run) {
                         owned.insert(run.clone(), OwnedRun {
@@ -306,6 +330,8 @@ mod tests {
         hub: Arc<Hub>,
         local: Arc<LocalBoard>,
         touched: Mutex<Option<mpsc::UnboundedReceiver<RunId>>>,
+        changes: mpsc::UnboundedSender<RunChange>,
+        changed: Mutex<Option<mpsc::UnboundedReceiver<RunChange>>>,
         steps: Steps,
         commands: Mutex<Option<mpsc::Receiver<Command>>>,
     }
@@ -326,7 +352,13 @@ mod tests {
             .expect("lock")
             .take()
             .expect("started once");
-        tokio::spawn(feed_runs(feed, owned, touched));
+        let changed = h
+            .changed
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("started once");
+        tokio::spawn(feed_runs(feed, owned, touched, changed));
     }
 
     fn start(h: &Harness) {
@@ -336,7 +368,10 @@ mod tests {
     fn harness() -> Harness {
         let (local, touched) = LocalBoard::new();
         let (steps, commands) = Steps::detached();
+        let (changes, changed) = mpsc::unbounded_channel();
         Harness {
+            changes,
+            changed: Mutex::new(Some(changed)),
             runs: Arc::new(FakeRunGateway::default()),
             events: Arc::new(FakeRunEvents::default()),
             hub: Arc::new(Hub::default()),
@@ -512,6 +547,40 @@ mod tests {
         assert_eq!(h.hub.snapshot().len(), 1);
 
         h.runs.remove_graph(&run());
+        stream.send(RunEvent::Resync).expect("send");
+        settle().await;
+        assert!(h.hub.snapshot().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_started_after_the_daemon_is_owned_with_its_label() {
+        let h = harness();
+        let _stream = h.events.stream();
+        h.runs.set_graph(graph(3, InstanceStatus::Running));
+        start_owning(&h, Vec::new());
+        settle().await;
+        assert!(h.hub.snapshot().is_empty());
+
+        h.changes.send(RunChange::Owned(owned())).expect("send");
+        settle().await;
+        let items = h.hub.snapshot();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, owned().label);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dismissed_run_leaves_the_board_and_stays_off_it() {
+        let h = harness();
+        let stream = h.events.stream();
+        h.runs
+            .set_graph(graph(3, InstanceStatus::Done { branch: None }));
+        start(&h);
+        settle().await;
+        assert_eq!(h.hub.snapshot().len(), 1);
+
+        h.changes.send(RunChange::Dismissed(run())).expect("send");
+        settle().await;
+        assert!(h.hub.snapshot().is_empty());
         stream.send(RunEvent::Resync).expect("send");
         settle().await;
         assert!(h.hub.snapshot().is_empty());

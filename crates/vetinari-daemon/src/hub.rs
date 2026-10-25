@@ -55,6 +55,11 @@ impl Hub {
         let _ = self.touched.send(run);
     }
 
+    /// A run's item.
+    pub fn item(&self, run: &RunId) -> Option<RunItem> {
+        self.board.lock().expect("board lock").get(run)
+    }
+
     /// A run's item and graph, when it has both.
     pub fn run(&self, run: &RunId) -> Option<(RunItem, RunGraph)> {
         let item = self.board.lock().expect("board lock").get(run)?;

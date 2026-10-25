@@ -15,8 +15,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use vetinari_adapters::daemon::protocol::{
     MAX_FRAME, Outbound, Request, auth_event, auth_status_result, challenge_event, change_event,
-    detail_event, gate_result, hello_result, parse_request, sign_in_ended_event, snapshot_event,
-    stream_opened,
+    detail_event, gate_result, hello_result, parse_request, run_started_result,
+    sign_in_ended_event, snapshot_event, stream_opened,
 };
 use vetinari_core::application::devflow::api::{
     ApiError, BoardChange, ClientApi, RunDetail, RunItem,
@@ -28,6 +28,7 @@ use vetinari_core::domain::devflow::template::TemplateKind;
 
 use crate::gates::Gates;
 use crate::hub::Hub;
+use crate::launches::Launches;
 use crate::signin::{SignIn, SignInOutcome};
 use crate::steps::LocalBoard;
 use vetinari_core::application::auth::AuthState;
@@ -60,6 +61,8 @@ pub struct Backend {
     pub runs: Arc<dyn RunGateway>,
     /// Who answers gates.
     pub gates: Arc<dyn Gates>,
+    /// Who starts and dismisses runs.
+    pub launches: Arc<dyn Launches>,
     /// This machine's steps, for a run's detail.
     pub local: Arc<LocalBoard>,
     /// The template every run is of.
@@ -222,6 +225,34 @@ async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>, back
                 Err(error) => Outbound::Error {
                     id: Some(id),
                     error: error.into(),
+                },
+            },
+            Ok((id, Request::RunStart(workflow))) => {
+                match backend.launches.start(*workflow).await {
+                    Ok(run) => Outbound::Reply {
+                        id,
+                        result: run_started_result(&run),
+                    },
+                    Err(error) => Outbound::Error {
+                        id: Some(id),
+                        error,
+                    },
+                }
+            }
+            Ok((
+                id,
+                Request::RunDismiss {
+                    run,
+                    remove_worktree,
+                },
+            )) => match backend.launches.dismiss(&run, remove_worktree).await {
+                Ok(()) => Outbound::Reply {
+                    id,
+                    result: serde_json::json!({}),
+                },
+                Err(error) => Outbound::Error {
+                    id: Some(id),
+                    error,
                 },
             },
             Ok((id, Request::AuthStatus)) => {
@@ -438,6 +469,40 @@ mod tests {
         hub: Arc<Hub>,
         runs: Arc<FakeRunGateway>,
         gates: Arc<RecordingGates>,
+        launches: Arc<RecordingLaunches>,
+    }
+
+    /// Starts each ticket once, as `run-<n>`, and records dismissals.
+    #[derive(Default)]
+    struct RecordingLaunches {
+        started: Mutex<Vec<String>>,
+        dismissed: Mutex<Vec<(String, bool)>>,
+    }
+
+    #[async_trait]
+    impl Launches for RecordingLaunches {
+        async fn start(
+            &self,
+            workflow: vetinari_core::domain::devflow::template::DevWorkflow,
+        ) -> Result<RunId, ApiError> {
+            let vetinari_core::domain::devflow::template::DevWorkflow::FeatureFromTicket(feature) =
+                workflow;
+            let mut started = self.started.lock().expect("lock");
+            let ticket = feature.ticket.key.to_string();
+            if started.contains(&ticket) {
+                return Err(ApiError::Conflict(format!("{ticket} already has a run")));
+            }
+            started.push(ticket);
+            Ok(RunId::parse(&format!("run-{}", started.len())).expect("run"))
+        }
+
+        async fn dismiss(&self, run: &RunId, remove_worktree: bool) -> Result<(), ApiError> {
+            self.dismissed
+                .lock()
+                .expect("lock")
+                .push((run.to_string(), remove_worktree));
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -474,9 +539,11 @@ mod tests {
         ));
         let runs = Arc::new(FakeRunGateway::default());
         let gates = Arc::new(RecordingGates::default());
+        let launches = Arc::new(RecordingLaunches::default());
         let backend = Arc::new(Backend {
             runs: runs.clone(),
             gates: gates.clone(),
+            launches: launches.clone(),
             local: LocalBoard::new().0,
             template: TemplateKind::FeatureFromTicket,
             sign_in,
@@ -488,6 +555,7 @@ mod tests {
             hub,
             runs,
             gates,
+            launches,
         }
     }
 
@@ -647,6 +715,62 @@ mod tests {
             .await;
         assert_eq!(client.frame().await, json!({ "id": 4, "result": {} }));
         assert_eq!(server.runs.cancelled(), ["r1"]);
+    }
+
+    #[tokio::test]
+    async fn a_start_names_its_run_and_a_second_for_the_ticket_is_a_conflict() {
+        use vetinari_adapters::daemon::protocol::run_start_params;
+        use vetinari_core::domain::devflow::ids::Rounds;
+        use vetinari_core::domain::devflow::template::{
+            DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
+        };
+        use vetinari_core::domain::ids::{ProfileId, SourceId};
+
+        let server = server().await;
+        let mut client = Client::connect(&server).await;
+        let params = run_start_params(&DevWorkflow::FeatureFromTicket(FeatureFromTicket {
+            ticket: TicketRef {
+                source: SourceId::parse("jira").expect("source"),
+                key: NonEmptyText::parse("ENG-412").expect("key"),
+                title: NonEmptyText::parse("Rate-limit retries").expect("title"),
+                url: None,
+            },
+            repo: RepoTarget {
+                path: std::path::PathBuf::from("/work/repos/web"),
+                remote: NonEmptyText::parse("acme/web").expect("remote"),
+            },
+            profile: ProfileId::parse("work").expect("profile"),
+            base: None,
+            max_review_rounds: Rounds::DEFAULT,
+            max_intake_rounds: Rounds::DEFAULT,
+            agent: None,
+        }));
+        let start =
+            |id: u64| json!({ "id": id, "method": "run.start", "params": params }).to_string();
+        client.send(&start(1)).await;
+        assert_eq!(
+            client.frame().await,
+            json!({ "id": 1, "result": { "run": "run-1" } })
+        );
+        client.send(&start(2)).await;
+        let refused = client.frame().await;
+        assert_eq!(refused["id"], json!(2));
+        assert_eq!(refused["error"]["code"], json!("conflict"));
+        assert_eq!(server.launches.started.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dismissal_goes_to_the_launcher() {
+        let server = server().await;
+        let mut client = Client::connect(&server).await;
+        client
+            .send(r#"{"id":5,"method":"run.dismiss","params":{"run":"r1","remove_worktree":true}}"#)
+            .await;
+        assert_eq!(client.frame().await, json!({ "id": 5, "result": {} }));
+        assert_eq!(
+            server.launches.dismissed.lock().expect("lock").clone(),
+            [("r1".to_owned(), true)]
+        );
     }
 
     struct Client {

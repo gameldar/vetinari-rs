@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,7 +17,9 @@ use vetinari_core::application::devflow::api::{
 };
 use vetinari_core::application::devflow::worker::GateReply;
 use vetinari_core::application::ports::DeviceCodeChallenge;
-use vetinari_core::domain::devflow::ids::{BranchLabel, NodeId, NodeInstance, RunId, TaskQueue};
+use vetinari_core::domain::devflow::ids::{
+    BranchLabel, NodeId, NodeInstance, Rounds, RunId, TaskQueue,
+};
 use vetinari_core::domain::devflow::lanes::{IterationSelection, Lane, LaneRow, RowKind};
 use vetinari_core::domain::devflow::notes::{ReviewFindings, RunNotes};
 use vetinari_core::domain::devflow::outcome::{Finding, GateAnswer, Line};
@@ -25,6 +28,10 @@ use vetinari_core::domain::devflow::run_view::{InstanceState, InstanceStatus};
 use vetinari_core::domain::devflow::step::StepKind;
 use vetinari_core::domain::devflow::summary::{Mark, NeedsYou};
 use vetinari_core::domain::devflow::summary::{Phase, PhaseCell, Round, RunSummary};
+use vetinari_core::domain::devflow::template::{
+    DevWorkflow, FeatureFromTicket, RepoTarget, TemplateKind, TicketRef,
+};
+use vetinari_core::domain::ids::{ProfileId, SourceId};
 use vetinari_core::domain::text::NonEmptyText;
 
 /// The longest frame either end accepts, newline excluded.
@@ -79,6 +86,15 @@ pub enum Request {
     RunCancel {
         /// The run.
         run: RunId,
+    },
+    /// `run.start`: a run of a template, for one ticket.
+    RunStart(Box<DevWorkflow>),
+    /// `run.dismiss`: take a finished run off the queue.
+    RunDismiss {
+        /// The run.
+        run: RunId,
+        /// Whether its worktree goes too.
+        remove_worktree: bool,
     },
     /// `auth.status`: whether the daemon is signed in to the gateway.
     AuthStatus,
@@ -196,11 +212,123 @@ pub fn parse_request(line: &str) -> Result<(u64, Request), BadFrame> {
                 run: run_id(&run).map_err(invalid)?,
             }
         }
+        "run.start" => Request::RunStart(Box::new(run_start(&frame.params).map_err(invalid)?)),
+        "run.dismiss" => {
+            #[derive(Deserialize)]
+            struct Params {
+                run: String,
+                remove_worktree: bool,
+            }
+            let Params {
+                run,
+                remove_worktree,
+            } = serde_json::from_value(frame.params.clone()).map_err(params)?;
+            Request::RunDismiss {
+                run: run_id(&run).map_err(invalid)?,
+                remove_worktree,
+            }
+        }
         "auth.status" => Request::AuthStatus,
         "auth.begin" => Request::AuthBegin,
         other => return Err(invalid(format!("no method {other:?}"))),
     };
     Ok((frame.id, request))
+}
+
+/// `run.start`'s params for `workflow`, as a client sends them.
+#[must_use]
+pub fn run_start_params(workflow: &DevWorkflow) -> Value {
+    match workflow {
+        DevWorkflow::FeatureFromTicket(feature) => json!({
+            "template": workflow.kind().name(),
+            "ticket": {
+                "source": feature.ticket.source.as_str(),
+                "key": feature.ticket.key.as_str(),
+                "title": feature.ticket.title.as_str(),
+                "url": feature.ticket.url,
+            },
+            "repo": {
+                "path": feature.repo.path,
+                "remote": feature.repo.remote.as_str(),
+            },
+            "profile": feature.profile.as_str(),
+            "max_review_rounds": feature.max_review_rounds.get().get(),
+        }),
+    }
+}
+
+/// Read `run.start`'s params: a ticket, its repository and profile, for
+/// the one template there is. What a run does not say is the default.
+fn run_start(params: &Value) -> Result<DevWorkflow, String> {
+    #[derive(Deserialize)]
+    struct Params {
+        template: String,
+        ticket: Ticket,
+        repo: Repo,
+        profile: String,
+        #[serde(default)]
+        max_review_rounds: Option<u32>,
+    }
+    #[derive(Deserialize)]
+    struct Ticket {
+        source: String,
+        key: String,
+        title: String,
+        #[serde(default)]
+        url: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Repo {
+        path: PathBuf,
+        remote: String,
+    }
+    let params: Params = serde_json::from_value(params.clone())
+        .map_err(|error| format!("run.start params: {error}"))?;
+    let text = |field: &str, raw: &str| {
+        NonEmptyText::parse(raw).map_err(|error| format!("{field}: {error}"))
+    };
+    let template: TemplateKind = params
+        .template
+        .parse()
+        .map_err(|error| format!("template: {error}"))?;
+    let max_review_rounds = params
+        .max_review_rounds
+        .map(Rounds::new)
+        .transpose()
+        .map_err(|error| format!("max_review_rounds: {error}"))?
+        .unwrap_or(Rounds::DEFAULT);
+    match template {
+        TemplateKind::FeatureFromTicket => Ok(DevWorkflow::FeatureFromTicket(FeatureFromTicket {
+            ticket: TicketRef {
+                source: SourceId::parse(&params.ticket.source)
+                    .map_err(|error| format!("ticket source: {error}"))?,
+                key: text("ticket key", &params.ticket.key)?,
+                title: text("ticket title", &params.ticket.title)?,
+                url: params.ticket.url,
+            },
+            repo: RepoTarget {
+                path: params.repo.path,
+                remote: text("repo remote", &params.repo.remote)?,
+            },
+            profile: ProfileId::parse(&params.profile)
+                .map_err(|error| format!("profile: {error}"))?,
+            base: None,
+            max_review_rounds,
+            max_intake_rounds: Rounds::DEFAULT,
+            agent: None,
+        })),
+    }
+}
+
+/// `run.start`'s result.
+#[must_use]
+pub fn run_started_result(run: &RunId) -> Value {
+    json!({ "run": run.as_str() })
+}
+
+/// Read `run.start`'s result.
+pub fn read_run_started(value: &Value) -> Result<RunId, String> {
+    run_id(value["run"].as_str().unwrap_or_default())
 }
 
 fn run_id(raw: &str) -> Result<RunId, String> {
@@ -1006,6 +1134,108 @@ mod tests {
         )
         .expect_err("invalid");
         assert_eq!((bad.id, bad.error.code()), (Some(6), "invalid"));
+    }
+
+    fn feature() -> DevWorkflow {
+        DevWorkflow::FeatureFromTicket(FeatureFromTicket {
+            ticket: TicketRef {
+                source: SourceId::parse("jira").expect("source"),
+                key: NonEmptyText::parse("ENG-412").expect("key"),
+                title: NonEmptyText::parse("Rate-limit retries").expect("title"),
+                url: Some("https://acme.atlassian.net/browse/ENG-412".to_owned()),
+            },
+            repo: RepoTarget {
+                path: std::path::PathBuf::from("/work/repos/web"),
+                remote: NonEmptyText::parse("acme/web").expect("remote"),
+            },
+            profile: ProfileId::parse("work").expect("profile"),
+            base: None,
+            max_review_rounds: Rounds::new(3).expect("rounds"),
+            max_intake_rounds: Rounds::new(3).expect("rounds"),
+            agent: None,
+        })
+    }
+
+    #[test]
+    fn a_run_is_started_for_a_ticket_in_a_repository_under_a_profile() {
+        let raw = r#"{"id":7,"method":"run.start","params":{
+            "template":"feature-from-ticket",
+            "ticket":{"source":"jira","key":"ENG-412","title":"Rate-limit retries",
+                "url":"https://acme.atlassian.net/browse/ENG-412"},
+            "repo":{"path":"/work/repos/web","remote":"acme/web"},
+            "profile":"work"}}"#
+            .replace('\n', "");
+        assert_eq!(
+            parse_request(&raw),
+            Ok((7, Request::RunStart(Box::new(feature()))))
+        );
+
+        let rounds = raw.replace(
+            r#""profile":"work""#,
+            r#""profile":"work","max_review_rounds":5"#,
+        );
+        let Ok((_, Request::RunStart(workflow))) = parse_request(&rounds) else {
+            panic!("a start");
+        };
+        let DevWorkflow::FeatureFromTicket(started) = *workflow;
+        assert_eq!(started.max_review_rounds.get().get(), 5);
+    }
+
+    #[test]
+    fn a_start_of_another_template_or_out_of_range_rounds_is_invalid() {
+        let start = run_start_params(&feature());
+        for (field, value) in [
+            ("template", json!("deploy")),
+            ("max_review_rounds", json!(21)),
+            ("profile", json!("Not A Profile")),
+        ] {
+            let mut params = start.clone();
+            params[field] = value;
+            let raw = json!({ "id": 8, "method": "run.start", "params": params }).to_string();
+            let error = parse_request(&raw).expect_err(field);
+            assert_eq!(
+                (error.id, error.error.code()),
+                (Some(8), "invalid"),
+                "{field}"
+            );
+            assert!(
+                error.error.to_string().contains(field),
+                "{field}: {}",
+                error.error
+            );
+        }
+    }
+
+    #[test]
+    fn the_daemon_reads_the_start_a_client_writes() {
+        let raw = json!({ "id": 1, "method": "run.start", "params": run_start_params(&feature()) })
+            .to_string();
+        assert_eq!(
+            parse_request(&raw),
+            Ok((1, Request::RunStart(Box::new(feature()))))
+        );
+        let run = RunId::parse("01JB80").expect("run");
+        assert_eq!(run_started_result(&run), json!({ "run": "01JB80" }));
+        assert_eq!(read_run_started(&run_started_result(&run)), Ok(run));
+    }
+
+    #[test]
+    fn a_run_is_dismissed_with_or_without_its_worktree() {
+        assert_eq!(
+            parse_request(
+                r#"{"id":9,"method":"run.dismiss","params":{"run":"r1","remove_worktree":true}}"#
+            ),
+            Ok((
+                9,
+                Request::RunDismiss {
+                    run: RunId::parse("r1").expect("run"),
+                    remove_worktree: true,
+                }
+            ))
+        );
+        let bad = parse_request(r#"{"id":10,"method":"run.dismiss","params":{"run":"r1"}}"#)
+            .expect_err("remove_worktree is required");
+        assert_eq!((bad.id, bad.error.code()), (Some(10), "invalid"));
     }
 
     #[test]

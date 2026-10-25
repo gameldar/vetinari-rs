@@ -8,6 +8,7 @@
 pub mod compose;
 pub mod gates;
 pub mod hub;
+pub mod launches;
 pub mod runtime;
 pub mod scripted;
 pub mod signin;

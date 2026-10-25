@@ -144,12 +144,6 @@ impl LocalBoard {
             .unwrap_or_default()
     }
 
-    /// Have the receiver watch `run`, though nothing here changed: a run
-    /// found on the gateway after the daemon started.
-    pub(crate) fn adopt(&self, run: RunId) {
-        let _ = self.touched.send(run);
-    }
-
     /// Replace every run's steps, telling the receiver of each run that
     /// changed.
     pub(crate) fn replace(&self, next: BTreeMap<RunId, LocalSteps>) {

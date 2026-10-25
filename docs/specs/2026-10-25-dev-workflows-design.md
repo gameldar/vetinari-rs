@@ -1093,8 +1093,8 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   `[autognomus]` names, signed in as section 12 says (slice 13 replaced the
   `--gateway <url>` flag and its `VETINARI_AUTOGNOMUS_TOKEN` stopgap; no environment override
   is kept, since the design names none). A gateway's runs are found
-  with `definitions` and `runs` and have no label yet: reading the ticket from a definition's
-  node config is left to the launcher slice, which also records labels for the runs it starts.
+  with `definitions` and `runs`, and labelled from `step_config`, which reads the definition
+  back (`GET /v1/workflows/{id}`) for the config its first external node carries (slice 14).
 - A script names runs with their starting graph and lists steps; a step waits `after_ms`, may
   replace its run's graph, and emits one event (a `resync` when it only replaces the graph). Its
   JSON is the gateway's own, read by the same adapter code, so a script exercises the mirror and
@@ -1169,6 +1169,33 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
 - Open: a cancelled run's strip keeps the marks of its last graph, so a step that was in flight
   still shows `◐`; and the popup keeps showing the last preflight's questions while the next
   preflight runs. Both are display rules for the summary and notes to settle.
+
+**Starting and dismissing, as built (slice 14).**
+
+- `Launcher` (`application/devflow/launcher.rs`) compiles one definition per run under
+  `DefinitionId::for_run` (`vetinari-feature-<ulid>`, the ULID from a `RunIds` port; the daemon's
+  `SystemRunIds` makes one from the clock and the standard library's random hash keys, so no
+  dependency is added for randomness), registers it and starts it with `{}`. A definition whose
+  run will not start is deleted again. It speaks of a run as a `RunOrigin`: the run, its
+  definition and the `StepConfig` every step carries, which is where its label comes from.
+- One run per ticket (15) is checked against every run the daemon owns, finished or not, not only
+  live ones: every run of a ticket shares one branch and worktree, so a second waits until the
+  first is dismissed. `run.start` replies `conflict` otherwise.
+- `run.start`'s params are `{ template, ticket: { source, key, title, url? }, repo: { path,
+  remote }, profile, max_review_rounds? }`; both loops default to `Rounds::DEFAULT`, 3. `base` and
+  `agent` are not on the socket yet, so a run branches from the default branch and routing picks
+  its agent.
+- `run.dismiss` refuses a run that is still going with `conflict` (cancel it first): deleting its
+  definition would hide a run the worker still serves. With `remove_worktree` the worktree goes
+  first, through a `RunWorktrees` port the daemon implements with
+  `WorkflowEngine::remove_run_worktree` under the run's profile; a worktree that will not go keeps
+  the run, so it can be dismissed again without. Then the definition is deleted and the run leaves
+  the board. A run the daemon does not own is `not-found`.
+- In the daemon, `GatewayLaunches` holds the origins of every owned run (found at start, after a
+  late sign-in, or started here) and takes starts and dismissals in turn, so two starts for one
+  ticket cannot both pass the check. It tells `feed_runs` through a `RunChange` channel
+  (`Owned`, `Dismissed`), which replaced `LocalBoard::adopt`. A `--scripted` daemon answers both
+  methods `invalid`, as it does `auth.begin`.
 
 ## 11. Testing
 

@@ -518,6 +518,9 @@ impl Rounds {
     /// The engine's `MAX_LOOP_ITERATIONS`.
     pub const MAX: u32 = 20;
 
+    /// What a loop is bounded by when its run does not say (design 4.2).
+    pub const DEFAULT: Self = Self(NonZeroU32::new(3).expect("three is not zero"));
+
     /// Accept a count within the engine's range.
     pub fn new(count: u32) -> Result<Self, RoundsError> {
         NonZeroU32::new(count)

@@ -17,7 +17,7 @@ use vetinari_adapters::autognomus::client::{AuthBearer, HttpGateway};
 use vetinari_adapters::config::{candidate_paths, load_or_default};
 use vetinari_adapters::credentials::KeyringStore;
 use vetinari_adapters::daemon::client::DaemonRuns;
-use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles};
+use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles, SystemRunIds};
 use vetinari_adapters::git::GitWorktreeManager;
 use vetinari_adapters::oauth::OidcDeviceCodeFlow;
 use vetinari_adapters::skills::FileSkillStore;
@@ -26,12 +26,16 @@ use vetinari_core::application::auth::{AuthService, AuthState};
 use vetinari_core::application::config::AutognomusConfig;
 use vetinari_core::application::config::{Config, ParseContext};
 use vetinari_core::application::devflow::api::ClientApi;
+use vetinari_core::application::devflow::launcher::{Launcher, RunOrigin};
 use vetinari_core::application::devflow::ports::PullRequestPublisher;
-use vetinari_core::application::devflow::ports::{RunEvents, RunGateway, TaskGateway};
+use vetinari_core::application::devflow::ports::{
+    RunEvents, RunGateway, RunWorktrees, TaskGateway,
+};
 use vetinari_core::application::devflow::worker::{StepWorker, WorkerPorts, WorkerSettings};
 use vetinari_core::application::ports::DeviceCodeChallenge;
 use vetinari_core::application::ports::{Clock, PortError};
 use vetinari_core::application::ports::{PortResult, WorktreeManager};
+use vetinari_core::application::workflows::WorkflowEngine;
 use vetinari_core::domain::credentials::Provider;
 use vetinari_core::domain::devflow::compile::StepPolicies;
 use vetinari_core::domain::devflow::compile::WorkerQueues;
@@ -40,10 +44,12 @@ use vetinari_core::domain::devflow::outcome::OpenPrOutcome;
 use vetinari_core::domain::devflow::step::StepConfig;
 use vetinari_core::domain::devflow::template::TemplateKind;
 use vetinari_core::domain::profile::Profile;
+use vetinari_core::domain::profile::ProfileSet;
 
 use crate::gates::{Gates, NoGates};
 use crate::hub::Hub;
-use crate::runtime::{Feed, OwnedRun, TokioClock, feed_runs};
+use crate::launches::{GatewayLaunches, Launches, NoLaunches};
+use crate::runtime::{Feed, OwnedRun, RunChange, TokioClock, feed_runs};
 use crate::scripted::{Script, ScriptError};
 use crate::signin::{SignIn, SignInOutcome};
 use crate::socket::{self, Backend};
@@ -172,13 +178,15 @@ fn gateway_auth(
 async fn discover_once_signed_in(
     runs: Arc<dyn RunGateway>,
     sign_in: Arc<SignIn>,
-    local: Arc<LocalBoard>,
+    launches: Arc<GatewayLaunches>,
+    feed: mpsc::UnboundedSender<RunChange>,
 ) {
     sign_in.signed_in().await;
     match discover(runs.as_ref()).await {
-        Ok(owned) => {
-            for run in owned {
-                local.adopt(run.run);
+        Ok(found) => {
+            launches.know(found.origins).await;
+            for run in found.owned {
+                let _ = feed.send(RunChange::Owned(run));
             }
         }
         Err(error) => tracing::warn!(%error, "cannot list the gateway's runs after signing in"),
@@ -227,21 +235,46 @@ fn print_challenge(challenge: &DeviceCodeChallenge) {
     );
 }
 
+/// The runs a gateway holds for vetinari, and what each definition says
+/// they are about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Discovered {
+    /// Every run to own.
+    pub owned: Vec<OwnedRun>,
+    /// Each run whose definition could be read, by its definition.
+    pub origins: Vec<RunOrigin>,
+}
+
 /// The runs a gateway holds for vetinari: every run of every live
 /// vetinari definition, since a definition lives until its run is
-/// dismissed (design 7.7).
-pub async fn discover(runs: &dyn RunGateway) -> Result<Vec<OwnedRun>, PortError> {
-    let mut owned = Vec::new();
+/// dismissed (design 7.7), labelled from the definition's step config. A
+/// definition that cannot be read leaves its runs unlabelled rather than
+/// unowned.
+pub async fn discover(runs: &dyn RunGateway) -> Result<Discovered, PortError> {
+    let mut found = Discovered::default();
     for definition in runs.definitions().await? {
+        let config = match runs.step_config(&definition).await {
+            Ok(config) => Some(config),
+            Err(error) => {
+                tracing::warn!(%error, %definition, "cannot read what a definition is about");
+                None
+            }
+        };
         for header in runs.runs(&definition).await? {
-            owned.push(OwnedRun {
+            let origin = config.clone().map(|config| RunOrigin {
+                run: header.id.clone(),
+                definition: definition.clone(),
+                config,
+            });
+            found.owned.push(OwnedRun {
                 run: header.id,
-                label: None,
+                label: origin.as_ref().map(RunOrigin::label),
                 started_at: Some(header.created_at),
             });
+            found.origins.extend(origin);
         }
     }
-    Ok(owned)
+    Ok(found)
 }
 
 /// The claiming half of a daemon: the task endpoints, the worker's queues,
@@ -276,6 +309,12 @@ pub struct Services {
     /// How the daemon signs in to its gateway; none for a script or a
     /// fixed token.
     pub sign_in: Option<Arc<SignIn>>,
+    /// The board clients watch.
+    pub hub: Arc<Hub>,
+    /// Who starts and dismisses runs.
+    pub launches: Arc<dyn Launches>,
+    /// The runs owned or dismissed after start.
+    pub changes: mpsc::UnboundedReceiver<RunChange>,
 }
 
 /// How many agent steps run at once until `[daemon] max_agent_steps` is
@@ -297,15 +336,33 @@ impl PullRequestPublisher for NoPublisher {
     }
 }
 
+/// A run's worktree, removed by the engine that cut it, under the run's
+/// profile.
+struct EngineRunWorktrees {
+    workflows: Arc<WorkflowEngine>,
+    profiles: ProfileSet,
+}
+
+#[async_trait::async_trait]
+impl RunWorktrees for EngineRunWorktrees {
+    async fn remove(&self, config: &StepConfig) -> PortResult<()> {
+        let profile = self.profiles.get(&config.profile).ok_or_else(|| {
+            PortError::not_configured("profile", format!("no profile {}", config.profile))
+        })?;
+        self.workflows.remove_run_worktree(config, profile).await
+    }
+}
+
 /// The worker for a gateway, from vetinari's own configuration: its
-/// profiles, agent engines and workspace targets, as the TUI reads them.
+/// profiles, agent engines and workspace targets, as the TUI reads them;
+/// and how a dismissed run's worktree is removed, by the same engine.
 pub fn claims(
     config: Config,
     paths: &Paths,
     gateway: Arc<HttpGateway>,
     worker: &WorkerName,
     clock: Arc<dyn Clock>,
-) -> Result<Claims, DaemonError> {
+) -> Result<(Claims, Arc<dyn RunWorktrees>), DaemonError> {
     let tick = Duration::from_millis(config.general.tick_rate_ms);
     let profiles = config.profiles.clone();
     let runtime = Runtime::build(config, paths.clone())?;
@@ -314,6 +371,11 @@ pub fn claims(
     }
     let worktrees: Arc<dyn WorktreeManager> = Arc::new(GitWorktreeManager::default());
     let queues = WorkerQueues::for_worker(worker);
+    let workflows = Arc::new(runtime.workflows);
+    let run_worktrees = Arc::new(EngineRunWorktrees {
+        workflows: workflows.clone(),
+        profiles: profiles.clone(),
+    });
     let step_worker = StepWorker::new(
         WorkerPorts {
             tasks: gateway.clone(),
@@ -329,7 +391,7 @@ pub fn claims(
             publisher: Arc::new(NoPublisher),
             clock: clock.clone(),
         },
-        Arc::new(runtime.workflows),
+        workflows,
         profiles,
         WorkerSettings {
             name: worker.clone(),
@@ -338,16 +400,19 @@ pub fn claims(
             policies: StepPolicies::default(),
         },
     );
-    Ok(Claims {
-        tasks: gateway,
-        queues,
-        parts: StepParts {
-            worker: step_worker,
-            registry: runtime.agents,
-            clock,
-            tick,
+    Ok((
+        Claims {
+            tasks: gateway,
+            queues,
+            parts: StepParts {
+                worker: step_worker,
+                registry: runtime.agents,
+                clock,
+                tick,
+            },
         },
-    })
+        run_worktrees,
+    ))
 }
 
 /// vetinari's configuration and directories, found as the TUI finds them.
@@ -401,6 +466,9 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 gates,
                 local,
                 sign_in: None,
+                hub: Arc::new(Hub::default()),
+                launches: Arc::new(NoLaunches),
+                changes: mpsc::unbounded_channel().1,
             }
         }
         Source::Gateway => {
@@ -421,21 +489,41 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 Arc::new(AuthBearer::new(auth)),
             ));
             let local = LocalBoard::new();
+            let hub = Arc::new(Hub::default());
+            let (feed, changes) = mpsc::unbounded_channel();
+            let (claims, run_worktrees) =
+                claims(config, &paths, gateway.clone(), &worker, clock.clone())?;
+            let launcher = Launcher::new(
+                gateway.clone(),
+                Arc::new(SystemRunIds::default()),
+                run_worktrees,
+                claims.queues.clone(),
+                StepPolicies::default(),
+            );
+            let launches = Arc::new(GatewayLaunches::new(
+                launcher,
+                hub.clone(),
+                clock.clone(),
+                feed.clone(),
+            ));
             let owned = match discover(gateway.as_ref()).await {
-                Ok(owned) => owned,
+                Ok(found) => {
+                    launches.know(found.origins).await;
+                    found.owned
+                }
                 Err(PortError::Unauthenticated { .. }) => {
                     tracing::warn!("autognomus needs a sign-in; serving until it has one");
                     sign_in.lost();
                     tokio::spawn(discover_once_signed_in(
                         gateway.clone(),
                         sign_in.clone(),
-                        local.0.clone(),
+                        launches.clone(),
+                        feed,
                     ));
                     Vec::new()
                 }
                 Err(error) => return Err(error.into()),
             };
-            let claims = claims(config, &paths, gateway.clone(), &worker, clock.clone())?;
             Services {
                 runs: gateway.clone(),
                 events: gateway,
@@ -446,6 +534,9 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 gates: Arc::new(NoGates),
                 local,
                 sign_in: Some(sign_in),
+                hub,
+                launches,
+                changes,
             }
         }
     };
@@ -460,7 +551,7 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
         error,
     };
     let listener = socket::bind(&socket).map_err(socket_error)?;
-    let hub = Arc::new(Hub::default());
+    let hub = services.hub;
     let api = Arc::new(ClientApi::new(
         concat!("vetinarid ", env!("CARGO_PKG_VERSION")),
         services.worker.clone(),
@@ -488,6 +579,7 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
     let backend = Arc::new(Backend {
         runs: services.runs.clone(),
         gates,
+        launches: services.launches,
         local: local.clone(),
         template: TemplateKind::FeatureFromTicket,
         sign_in: services.sign_in.clone(),
@@ -501,7 +593,12 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
         local,
         steps,
     };
-    tasks.push(tokio::spawn(feed_runs(feed, services.owned, touched)));
+    tasks.push(tokio::spawn(feed_runs(
+        feed,
+        services.owned,
+        touched,
+        services.changes,
+    )));
     let served = tokio::select! {
         served = socket::serve(listener, api, hub, backend) => served.map_err(socket_error),
         _ = tokio::signal::ctrl_c() => Ok(()),
@@ -551,8 +648,18 @@ mod tests {
                 DefinitionId::parse("vetinari-feature-01B").expect("id"),
             ])
         }
-        async fn step_config(&self, _definition: &DefinitionId) -> PortResult<StepConfig> {
-            Err(PortError::unsupported("listing", "step_config"))
+        async fn step_config(&self, definition: &DefinitionId) -> PortResult<StepConfig> {
+            if definition.as_str().ends_with("01B") {
+                return Err(PortError::protocol("listing", "an unreadable definition"));
+            }
+            Ok(StepConfig::parse(&json!({
+                "schema": 1, "step": "preflight", "template": "feature-from-ticket",
+                "ticket": { "source": "jira", "key": "ENG-412", "title": "Rate-limit retries" },
+                "repo": { "path": "/work/repos/web", "remote": "acme/web" },
+                "profile": "work", "branch": "vetinari/eng-412-rate-limit-retries",
+                "skill": "ticket-preflight"
+            }))
+            .expect("a step config"))
         }
         async fn runs(&self, definition: &DefinitionId) -> PortResult<Vec<RunHeader>> {
             Ok(vec![RunHeader {
@@ -589,7 +696,7 @@ mod tests {
         let clock: Arc<dyn Clock> =
             Arc::new(TokioClock::starting_at(datetime!(2026-10-25 09:00 UTC)));
 
-        let claims = claims(
+        let (claims, _) = claims(
             config,
             &Paths {
                 config_dir: dir.path().join("config"),
@@ -640,8 +747,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_run_of_every_vetinari_definition_is_owned() {
-        let owned = discover(&Listing).await.expect("discover");
+    async fn every_run_of_every_vetinari_definition_is_owned_and_labelled_from_it() {
+        let found = discover(&Listing).await.expect("discover");
+        let owned = &found.owned;
         assert_eq!(
             owned
                 .iter()
@@ -649,8 +757,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["run-of-vetinari-feature-01A", "run-of-vetinari-feature-01B"]
         );
-        assert_eq!(owned[0].label, None);
+        assert_eq!(
+            owned[0].label.as_ref().map(|label| label.ticket.as_str()),
+            Some("ENG-412")
+        );
         assert_eq!(owned[0].started_at, Some(datetime!(2026-10-25 09:00 UTC)));
+        assert_eq!(owned[1].label, None, "an unreadable definition");
+        assert_eq!(
+            found
+                .origins
+                .iter()
+                .map(|origin| (origin.run.as_str(), origin.definition.as_str()))
+                .collect::<Vec<_>>(),
+            [("run-of-vetinari-feature-01A", "vetinari-feature-01A")]
+        );
     }
 
     #[tokio::test]
