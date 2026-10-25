@@ -207,6 +207,13 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
     let mut phases = Vec::new();
     let mut needs_you = None;
     let mut before_done = true;
+    // Only cancellation abandons an instance, and the run's own cancellation
+    // follows its instances', so a cancelled one means the run is ending.
+    let ending = graph.status.is_finished()
+        || graph
+            .instances
+            .iter()
+            .any(|state| state.status == InstanceStatus::Cancelled);
     for phase in Phase::ALL {
         let nodes: Vec<(&RunNode, StepKind)> = graph
             .nodes
@@ -249,7 +256,7 @@ pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -
             Seen::Pending => Mark::Next,
             Seen::Done => Mark::Done,
             Seen::Unreached if pending => Mark::Next,
-            Seen::Unreached if before_done && !graph.status.is_finished() => Mark::Next,
+            Seen::Unreached if before_done && !ending => Mark::Next,
             Seen::Unreached => Mark::NotReached,
         };
         before_done = before_done && mark == Mark::Done;
@@ -608,6 +615,21 @@ mod tests {
             &LocalSteps::default(),
         );
         assert_eq!(strip(&summary), "pre✓ impl◐ rev◐ pr·");
+    }
+
+    #[test]
+    fn a_run_being_cancelled_has_no_next_phase() {
+        // The engine announces each abandoned instance before the run's own
+        // cancellation, so the run still reads as active in between.
+        let summary = summary(
+            vec![
+                state("intake", InstanceStatus::Cancelled),
+                state("preflight@1", done(Some("needs-info"))),
+                state("ask-info@1", InstanceStatus::Cancelled),
+            ],
+            &LocalSteps::default(),
+        );
+        assert_eq!(strip(&summary), "pre✓ impl· rev· pr·");
     }
 
     #[test]
