@@ -22,6 +22,7 @@ use crate::hub::Hub;
 use crate::runtime::{Feed, OwnedRun, TokioClock, feed_runs};
 use crate::scripted::{Script, ScriptError};
 use crate::socket;
+use crate::steps::LocalBoard;
 
 /// Where the daemon's runs come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,14 +153,17 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
         concat!("vetinarid ", env!("CARGO_PKG_VERSION")),
         settings.worker.clone(),
     ));
+    let (local, touched) = LocalBoard::new();
     let feed = Feed {
         runs,
         events,
         clock: Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc())),
         template: TemplateKind::FeatureFromTicket,
         hub: hub.clone(),
+        local,
+        steps: None,
     };
-    let feeding = tokio::spawn(feed_runs(feed, owned));
+    let feeding = tokio::spawn(feed_runs(feed, owned, touched));
     let served = tokio::select! {
         served = socket::serve(listener, api, hub) => served.map_err(socket_error),
         _ = tokio::signal::ctrl_c() => Ok(()),

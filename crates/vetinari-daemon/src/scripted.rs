@@ -350,8 +350,11 @@ mod tests {
                 clock: Arc::new(TokioClock::starting_at(datetime!(2026-10-25 10:00 UTC))),
                 template: TemplateKind::FeatureFromTicket,
                 hub: hub.clone(),
+                local: crate::steps::LocalBoard::new().0,
+                steps: None,
             },
             owned,
+            tokio::sync::mpsc::unbounded_channel().1,
         ));
 
         tokio::time::sleep(StdDuration::from_millis(500)).await;

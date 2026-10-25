@@ -18,10 +18,11 @@ use vetinari_core::application::devflow::ports::{RunEventStream, RunEvents, RunG
 use vetinari_core::application::ports::{Clock, PortError};
 use vetinari_core::domain::devflow::ids::RunId;
 use vetinari_core::domain::devflow::run_view::RunEvent;
-use vetinari_core::domain::devflow::summary::{LocalSteps, summarise};
+use vetinari_core::domain::devflow::summary::summarise;
 use vetinari_core::domain::devflow::template::TemplateKind;
 
 use crate::hub::Hub;
+use crate::steps::{LocalBoard, Steps};
 
 /// A clock that reads tokio's time from a fixed start, so a test with
 /// paused time moves the application's clock with its own.
@@ -72,6 +73,10 @@ pub struct Feed {
     pub template: TemplateKind,
     /// Where the items go.
     pub hub: Arc<Hub>,
+    /// What this machine knows of each run's steps.
+    pub local: Arc<LocalBoard>,
+    /// The worker, told when a run may be over; none when nothing claims.
+    pub steps: Option<Steps>,
 }
 
 /// The longest wait between attempts to open the stream.
@@ -80,7 +85,11 @@ const MAX_BACKOFF: StdDuration = StdDuration::from_secs(60);
 /// Keep the hub's items for `owned` current, forever: open the stream, then
 /// fetch each graph, then apply events and refetch as the mirror asks. A
 /// closed stream is reopened with backoff, and every graph refetched.
-pub async fn feed_runs(feed: Feed, owned: Vec<OwnedRun>) {
+pub async fn feed_runs(
+    feed: Feed,
+    owned: Vec<OwnedRun>,
+    mut touched: mpsc::UnboundedReceiver<RunId>,
+) {
     let mut owned: BTreeMap<RunId, OwnedRun> = owned
         .into_iter()
         .map(|run| (run.run.clone(), run))
@@ -113,9 +122,24 @@ pub async fn feed_runs(feed: Feed, owned: Vec<OwnedRun>) {
             tokio::select! {
                 event = received.recv() => {
                     let Some(event) = event else { break };
-                    if let Some(run) = mirror.observe(&event).changed {
+                    let observed = mirror.observe(&event);
+                    if let Some(run) = observed.changed {
                         publish(&feed, &mirror, &owned, &run);
                     }
+                    if let (Some(run), Some(steps)) = (observed.ending, &feed.steps) {
+                        steps.ending(run);
+                    }
+                }
+                Some(run) = touched.recv() => {
+                    if !owned.contains_key(&run) {
+                        owned.insert(run.clone(), OwnedRun {
+                            run: run.clone(),
+                            label: None,
+                            started_at: None,
+                        });
+                        mirror.watch(run.clone());
+                    }
+                    publish(&feed, &mirror, &owned, &run);
                 }
                 () = sleep_or_forever(wait) => {
                     for run in mirror.refetches_due() {
@@ -167,7 +191,7 @@ fn publish(feed: &Feed, mirror: &RunMirror, owned: &BTreeMap<RunId, OwnedRun>, r
         return;
     };
     feed.hub.put(RunItem {
-        summary: summarise(graph, feed.template, &LocalSteps::default()),
+        summary: summarise(graph, feed.template, &feed.local.get(run)),
         label: known.label.clone(),
         started_at: known.started_at,
     });
@@ -186,10 +210,13 @@ mod tests {
         InstanceState, InstanceStatus, NodeChange, RunGraph, RunNode, RunNodeKind, RunStatus,
     };
     use vetinari_core::domain::devflow::summary::Mark;
+    use vetinari_core::domain::devflow::summary::{LocalStep, LocalSteps};
+    use vetinari_core::domain::ids::SessionId;
     use vetinari_core::domain::text::NonEmptyText;
     use vetinari_core::testing::FakeRunGateway;
 
     use super::*;
+    use crate::steps::Command;
 
     const START: OffsetDateTime = datetime!(2026-10-25 10:00 UTC);
 
@@ -276,25 +303,102 @@ mod tests {
         runs: Arc<FakeRunGateway>,
         events: Arc<FakeRunEvents>,
         hub: Arc<Hub>,
+        local: Arc<LocalBoard>,
+        touched: Mutex<Option<mpsc::UnboundedReceiver<RunId>>>,
+        steps: Steps,
+        commands: Mutex<Option<mpsc::Receiver<Command>>>,
     }
 
-    fn start(h: &Harness) {
+    fn start_owning(h: &Harness, owned: Vec<OwnedRun>) {
         let feed = Feed {
             runs: h.runs.clone(),
             events: h.events.clone(),
             clock: Arc::new(TokioClock::starting_at(START)),
             template: TemplateKind::FeatureFromTicket,
             hub: h.hub.clone(),
+            local: h.local.clone(),
+            steps: Some(h.steps.clone()),
         };
-        tokio::spawn(feed_runs(feed, vec![owned()]));
+        let touched = h
+            .touched
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("started once");
+        tokio::spawn(feed_runs(feed, owned, touched));
+    }
+
+    fn start(h: &Harness) {
+        start_owning(h, vec![owned()]);
     }
 
     fn harness() -> Harness {
+        let (local, touched) = LocalBoard::new();
+        let (steps, commands) = Steps::detached();
         Harness {
             runs: Arc::new(FakeRunGateway::default()),
             events: Arc::new(FakeRunEvents::default()),
             hub: Arc::new(Hub::default()),
+            local,
+            touched: Mutex::new(Some(touched)),
+            steps,
+            commands: Mutex::new(Some(commands)),
         }
+    }
+
+    fn running_here() -> BTreeMap<RunId, LocalSteps> {
+        BTreeMap::from([(
+            run(),
+            LocalSteps::default().with(
+                NodeInstance::parse("open-pr").expect("instance"),
+                LocalStep::Running {
+                    session: SessionId::parse("claude-code-1").expect("id"),
+                    question: None,
+                },
+            ),
+        )])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_running_here_is_marked_so_as_soon_as_the_worker_says() {
+        let h = harness();
+        let _stream = h.events.stream();
+        h.runs.set_graph(graph(3, InstanceStatus::Running));
+        start(&h);
+        settle().await;
+        assert_eq!(pr_mark(&h.hub), Some(Mark::Elsewhere));
+
+        h.local.replace(running_here());
+        settle().await;
+        assert_eq!(pr_mark(&h.hub), Some(Mark::RunningHere));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_this_machine_claimed_from_is_watched_though_it_was_not_owned() {
+        let h = harness();
+        let _stream = h.events.stream();
+        h.runs.set_graph(graph(3, InstanceStatus::Running));
+        start_owning(&h, Vec::new());
+        settle().await;
+        assert!(h.hub.snapshot().is_empty());
+
+        h.local.replace(running_here());
+        settle().await;
+        assert_eq!(pr_mark(&h.hub), Some(Mark::RunningHere));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_step_hints_the_worker_to_heartbeat_its_run() {
+        let h = harness();
+        let stream = h.events.stream();
+        h.runs.set_graph(graph(3, InstanceStatus::Running));
+        start(&h);
+        settle().await;
+
+        stream.send(event(4, NodeChange::Cancelled)).expect("send");
+        settle().await;
+        let mut commands = h.commands.lock().expect("lock").take().expect("commands");
+        assert!(matches!(commands.try_recv(), Ok(Command::Ending(ending)) if ending == run()));
     }
 
     fn pr_mark(hub: &Hub) -> Option<Mark> {
