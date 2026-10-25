@@ -109,6 +109,17 @@ impl WorktreeManager for GitWorktreeManager {
         Ok(())
     }
 
+    async fn push(&self, repo: &Path, remote: &str, branch: &BranchName) -> PortResult<()> {
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let output = self
+            .run(repo, &["push", "--quiet", remote, &refspec])
+            .await?;
+        if !output.status.success() {
+            return Err(PortError::unavailable("git push", stderr_of(&output)));
+        }
+        Ok(())
+    }
+
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree> {
         if self.is_worktree(spec.path()).await {
             return Ok(Worktree::new(
@@ -500,6 +511,60 @@ mod tests {
             worktree.path().join("fix.txt").is_file(),
             "the worktree holds the fetched branch's work"
         );
+    }
+
+    #[tokio::test]
+    async fn a_branch_is_pushed_to_the_same_name_on_the_remote() {
+        let origin = tempfile::tempdir().expect("tempdir");
+        let output = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(origin.path())
+            .output()
+            .await
+            .expect("git init runs");
+        assert!(output.status.success());
+        let clone = repo_with_a_commit().await;
+        git(
+            clone.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.path().to_str().expect("utf-8"),
+            ],
+        )
+        .await;
+        git(clone.path(), &["branch", "vetinari/eng-412-retries"]).await;
+
+        let manager = GitWorktreeManager::default();
+        let branch = BranchName::sanitized("vetinari/eng-412-retries");
+        manager
+            .push(clone.path(), "origin", &branch)
+            .await
+            .expect("push");
+        manager
+            .push(clone.path(), "origin", &branch)
+            .await
+            .expect("pushing again changes nothing");
+
+        assert_eq!(
+            git(
+                origin.path(),
+                &["rev-parse", "refs/heads/vetinari/eng-412-retries"]
+            )
+            .await,
+            git(clone.path(), &["rev-parse", "vetinari/eng-412-retries"]).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_that_fails_is_worth_trying_again() {
+        let repo = repo_with_a_commit().await;
+        let error = GitWorktreeManager::default()
+            .push(repo.path(), "origin", &BranchName::sanitized("main"))
+            .await
+            .expect_err("no remote");
+        assert!(matches!(error, PortError::Unavailable { .. }), "{error:?}");
     }
 
     #[tokio::test]

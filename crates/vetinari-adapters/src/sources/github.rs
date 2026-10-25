@@ -80,13 +80,7 @@ impl GitHubSource {
     /// The URL for an API path.
     #[must_use]
     pub fn endpoint(&self, path: &str) -> String {
-        let base = self
-            .settings
-            .base_url
-            .as_deref()
-            .unwrap_or("https://api.github.com")
-            .trim_end_matches('/');
-        format!("{base}{path}")
+        endpoint(self.settings.base_url.as_deref(), path)
     }
 
     async fn token(&self, account: Option<&Slug>) -> PortResult<String> {
@@ -97,43 +91,57 @@ impl GitHubSource {
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> PortResult<Value> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| PortError::unavailable("github", error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| PortError::unavailable("github", error.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN && body.contains("Bad credentials")
-        {
-            return Err(PortError::Unauthenticated {
-                provider: Provider::GitHub,
-            });
-        }
-        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(PortError::unavailable(
-                "github",
-                format!("{status}: {}", body.trim()),
-            ));
-        }
-        if !status.is_success() {
-            return Err(PortError::Refused {
-                what: "github".to_owned(),
-                detail: message_of(&body).unwrap_or_else(|| format!("{status}: {}", body.trim())),
-            });
-        }
-
-        if body.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str(&body).map_err(|error| {
-            PortError::protocol("github", format!("could not read the reply: {error}"))
-        })
+        send(request).await
     }
+}
+
+/// The URL for an API path on github.com, or on an enterprise base URL.
+pub(crate) fn endpoint(base_url: Option<&str>, path: &str) -> String {
+    let base = base_url
+        .unwrap_or("https://api.github.com")
+        .trim_end_matches('/');
+    format!("{base}{path}")
+}
+
+/// Send a GitHub API request and read its JSON reply, mapping GitHub's
+/// statuses onto port errors.
+pub(crate) async fn send(request: reqwest::RequestBuilder) -> PortResult<Value> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| PortError::unavailable("github", error.to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| PortError::unavailable("github", error.to_string()))?;
+
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN && body.contains("Bad credentials")
+    {
+        return Err(PortError::Unauthenticated {
+            provider: Provider::GitHub,
+        });
+    }
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(PortError::unavailable(
+            "github",
+            format!("{status}: {}", body.trim()),
+        ));
+    }
+    if !status.is_success() {
+        return Err(PortError::Refused {
+            what: "github".to_owned(),
+            detail: message_of(&body).unwrap_or_else(|| format!("{status}: {}", body.trim())),
+        });
+    }
+
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        PortError::protocol("github", format!("could not read the reply: {error}"))
+    })
 }
 
 fn message_of(body: &str) -> Option<String> {

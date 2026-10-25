@@ -21,7 +21,7 @@ use crate::domain::attention::{
     AttentionItem, IssueRef, MessageRef, PullRequestRef, SourceCategory,
 };
 use crate::domain::credentials::{CredentialKey, Provider, StoredCredential};
-use crate::domain::git::{CommitId, Worktree, WorktreeSpec};
+use crate::domain::git::{BranchName, CommitId, Worktree, WorktreeSpec};
 use crate::domain::ids::{AgentId, SessionId, Slug, SourceId, SpaceId};
 use crate::domain::skill::SkillLibrary;
 use crate::domain::workspace::{Space, SpaceName, TargetKind};
@@ -549,6 +549,8 @@ pub struct FakeWorktreeManager {
     created: Mutex<Vec<WorktreeSpec>>,
     removed: Mutex<Vec<PathBuf>>,
     fetched: Mutex<Vec<(PathBuf, String, String)>>,
+    pushed: Mutex<Vec<(PathBuf, String, String)>>,
+    push_failure: Mutex<Option<PortError>>,
     failure: Mutex<Option<PortError>>,
     fetch_failure: Mutex<Option<PortError>>,
     heads: Mutex<BTreeMap<PathBuf, CommitId>>,
@@ -571,6 +573,17 @@ impl FakeWorktreeManager {
     /// Make every fetch fail, as it would with no remote configured.
     pub fn fail_fetch(&self, error: PortError) {
         *self.fetch_failure.lock().expect("fetch failure lock") = Some(error);
+    }
+
+    /// The branches it was asked to push, with their repository and remote.
+    #[must_use]
+    pub fn pushed(&self) -> Vec<(PathBuf, String, String)> {
+        self.pushed.lock().expect("pushed lock").clone()
+    }
+
+    /// Make the next push fail.
+    pub fn fail_push(&self, error: PortError) {
+        *self.push_failure.lock().expect("push failure lock") = Some(error);
     }
 
     /// The refspecs it was asked to fetch.
@@ -609,6 +622,18 @@ impl WorktreeManager for FakeWorktreeManager {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    async fn push(&self, repo: &Path, remote: &str, branch: &BranchName) -> PortResult<()> {
+        if let Some(error) = self.push_failure.lock().expect("push failure lock").take() {
+            return Err(error);
+        }
+        self.pushed.lock().expect("pushed lock").push((
+            repo.to_path_buf(),
+            remote.to_owned(),
+            branch.to_string(),
+        ));
+        Ok(())
     }
 
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree> {

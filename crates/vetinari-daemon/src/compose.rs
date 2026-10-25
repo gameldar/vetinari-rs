@@ -17,17 +17,16 @@ use vetinari_adapters::autognomus::client::{AuthBearer, HttpGateway};
 use vetinari_adapters::config::{candidate_paths, load_or_default};
 use vetinari_adapters::credentials::KeyringStore;
 use vetinari_adapters::daemon::client::DaemonRuns;
-use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles, SystemRunIds};
+use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles, GitHubPublisher, SystemRunIds};
 use vetinari_adapters::git::GitWorktreeManager;
 use vetinari_adapters::oauth::OidcDeviceCodeFlow;
 use vetinari_adapters::skills::FileSkillStore;
 use vetinari_adapters::{HttpClient, Paths, Runtime};
 use vetinari_core::application::auth::{AuthService, AuthState};
 use vetinari_core::application::config::AutognomusConfig;
-use vetinari_core::application::config::{Config, ParseContext};
+use vetinari_core::application::config::{Config, ParseContext, SourceSettings};
 use vetinari_core::application::devflow::api::ClientApi;
 use vetinari_core::application::devflow::launcher::{Launcher, RunOrigin};
-use vetinari_core::application::devflow::ports::PullRequestPublisher;
 use vetinari_core::application::devflow::ports::{
     RunEvents, RunGateway, RunWorktrees, TaskGateway,
 };
@@ -40,10 +39,8 @@ use vetinari_core::domain::credentials::Provider;
 use vetinari_core::domain::devflow::compile::StepPolicies;
 use vetinari_core::domain::devflow::compile::WorkerQueues;
 use vetinari_core::domain::devflow::ids::{RunId, WorkerName};
-use vetinari_core::domain::devflow::outcome::OpenPrOutcome;
 use vetinari_core::domain::devflow::step::StepConfig;
 use vetinari_core::domain::devflow::template::TemplateKind;
-use vetinari_core::domain::profile::Profile;
 use vetinari_core::domain::profile::ProfileSet;
 
 use crate::gates::{Gates, NoGates};
@@ -321,19 +318,18 @@ pub struct Services {
 /// configurable (design 7.2).
 const MAX_AGENT_STEPS: NonZeroUsize = NonZeroUsize::new(2).expect("non-zero");
 
-/// Stands in for the pull request publisher until its GitHub adapter
-/// exists (slice 15): an `open-pr` step fails, transiently, so a later
-/// daemon can still open it.
-struct NoPublisher;
-
-#[async_trait::async_trait]
-impl PullRequestPublisher for NoPublisher {
-    async fn publish(&self, _config: &StepConfig, _profile: &Profile) -> PortResult<OpenPrOutcome> {
-        Err(PortError::unavailable(
-            "pull request publisher",
-            "this daemon cannot open pull requests yet",
-        ))
-    }
+/// The GitHub API a run's pull request is opened on: the first GitHub
+/// source's, so an enterprise host configured for the queue is used for
+/// pull requests too; github.com without one.
+#[must_use]
+pub fn github_base_url(config: &Config) -> Option<String> {
+    config
+        .sources
+        .iter()
+        .find_map(|source| match &source.settings {
+            SourceSettings::GitHub { base_url, .. } => Some(base_url.clone()),
+            _ => None,
+        })?
 }
 
 /// A run's worktree, removed by the engine that cut it, under the run's
@@ -365,6 +361,7 @@ pub fn claims(
 ) -> Result<(Claims, Arc<dyn RunWorktrees>), DaemonError> {
     let tick = Duration::from_millis(config.general.tick_rate_ms);
     let profiles = config.profiles.clone();
+    let github = github_base_url(&config);
     let runtime = Runtime::build(config, paths.clone())?;
     for problem in &runtime.problems {
         tracing::warn!(%problem, "configuration");
@@ -384,11 +381,16 @@ pub fn claims(
                 &paths.state_dir,
             ))),
             files: Arc::new(FsStepFiles::default()),
-            worktrees,
+            worktrees: worktrees.clone(),
             skills: Arc::new(FileSkillStore::new(FileSkillStore::default_path(
                 &paths.config_dir,
             ))),
-            publisher: Arc::new(NoPublisher),
+            publisher: Arc::new(GitHubPublisher::new(
+                github,
+                HttpClient::new()?,
+                runtime.auth.clone(),
+                worktrees.clone(),
+            )),
             clock: clock.clone(),
         },
         workflows,
@@ -842,6 +844,22 @@ mod tests {
         assert_eq!(
             choose_worker(None, None, Some("host.local")).as_str(),
             "host"
+        );
+    }
+
+    #[test]
+    fn pull_requests_are_opened_on_the_configured_github() {
+        assert_eq!(github_base_url(&configured("")), None);
+        let config = configured(
+            r#"
+            [sources.github]
+            kind = "github"
+            base_url = "https://github.acme.test/api/v3"
+            "#,
+        );
+        assert_eq!(
+            github_base_url(&config).as_deref(),
+            Some("https://github.acme.test/api/v3")
         );
     }
 

@@ -1128,8 +1128,8 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   the journal under `state_dir`, the skill library beside the config. `serve` runs a `Services`,
   which is what the end-to-end test in `tests/worker.rs` builds by hand against a routed local
   gateway, a real git repository and an agent that writes its own result.
-- Deviations: `max_agent_steps` is fixed at 2 until a `[daemon]` section exists, and `OpenPr`
-  fails transiently through a placeholder publisher until slice 15.
+- Deviations: `max_agent_steps` is fixed at 2 until a `[daemon]` section exists. `OpenPr`
+  failed transiently through a placeholder publisher until slice 15 replaced it.
 
 **The popup's methods, as built (slice 12).**
 
@@ -1204,6 +1204,27 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   delegated to the run's item (`vetinarid:<run>`), so it waits until the run needs the developer.
   A refusal, such as `conflict`, is shown on the status line. Dismissing has no key yet; the
   client has `dismiss_run` for it.
+
+**Opening the pull request, as built (slice 15).**
+
+- `GitHubPublisher` (`vetinari-adapters/src/devflow/pull_requests.rs`) is the
+  `PullRequestPublisher`. It pushes the run's branch to `origin` under the same name, through
+  a new `WorktreeManager::push` (`git push <remote> refs/heads/<b>:refs/heads/<b>`, run in the
+  repository, which shares its branches with the worktree). Then it lists the open pull requests
+  from `<owner>:<branch>` and adopts the first, which is what makes a rerun after a lost
+  completion harmless; only when there is none does it open one, titled `<key> <title>`, into
+  the run's `base` or else the repository's `default_branch`, with the ticket's link in its body.
+- A push that fails is `Unavailable`, unlike a failed fetch, which is `Refused`: on `open-pr` it
+  is most often the network or the host, and the step's five attempts bound the retries, whereas
+  a permanent failure would end a run whose work is done. GitHub's own statuses map as the GitHub
+  source maps them (its `send` is now shared): `5xx` and `429` are `Unavailable`, `401` is
+  `Unauthenticated`, a refusal is `Refused`, and a reply with no `number` or `html_url` is
+  `Protocol`.
+- The token is the run's profile's GitHub credential, `AuthService::token(GitHub, account)`, so
+  a daemon opens pull requests with the credential the TUI already stores. The API is the first
+  GitHub source's `base_url`, or github.com (`compose::github_base_url`).
+- Not yet: a `422 "A pull request already exists"`, from one opened by hand between the lookup
+  and the create, is reported as a refusal rather than read back.
 
 ## 11. Testing
 
