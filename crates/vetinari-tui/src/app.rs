@@ -1581,6 +1581,7 @@ impl App {
                 )
             }
             ItemContext::Agent(agent) => bindings.with("session", agent.session.to_string()),
+            ItemContext::Run(summary) => bindings.with("run", summary.run.to_string()),
             ItemContext::None => bindings.with("issues", item.title().single_line()),
         }
     }

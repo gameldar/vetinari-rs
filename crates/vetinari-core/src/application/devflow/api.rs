@@ -10,11 +10,14 @@ use crate::application::ports::PortError;
 use crate::domain::devflow::ids::{RunId, WorkerName};
 use serde_json::Value;
 
+use crate::domain::attention::{AttentionItem, ItemContext, ItemState, SourceCategory};
 use crate::domain::devflow::lanes::{IterationSelection, LaneRow, lanes};
 use crate::domain::devflow::notes::{RunNotes, notes};
 use crate::domain::devflow::run_view::RunGraph;
-use crate::domain::devflow::summary::{LocalSteps, Mark, RunSummary, row_mark};
+use crate::domain::devflow::run_view::RunStatus;
+use crate::domain::devflow::summary::{LocalSteps, Mark, NeedsYou, RunSummary, row_mark};
 use crate::domain::devflow::template::TemplateKind;
+use crate::domain::ids::SourceId;
 use crate::domain::text::NonEmptyText;
 
 /// The protocol this daemon speaks. A client speaking another is told to
@@ -87,6 +90,49 @@ impl RunDetail {
             rows,
             notes: notes(template, outputs),
         }
+    }
+}
+
+impl RunItem {
+    /// The run as a queue item: named by its ticket, in the state that says
+    /// what it wants, with its summary as context for the row's strip.
+    #[must_use]
+    pub fn to_attention(&self, source: &SourceId, now: OffsetDateTime) -> AttentionItem {
+        let summary = &self.summary;
+        let title = match &self.label {
+            Some(label) => format!("{} {}", label.ticket, label.title),
+            None => format!("run {}", summary.run),
+        };
+        let state = match (&summary.needs_you, summary.status) {
+            (Some(NeedsYou::Gate { .. }), _) => ItemState::NeedsDecision,
+            (Some(NeedsYou::Question { .. }), _) => ItemState::AgentWaiting,
+            (None, RunStatus::Active) => ItemState::AgentRunning,
+            (None, RunStatus::Completed) => ItemState::AgentDone,
+            (None, RunStatus::Failed) => ItemState::AgentFailed,
+            (None, RunStatus::Cancelled) => ItemState::Resolved,
+        };
+        let mut builder = AttentionItem::builder(
+            source,
+            summary.run.as_str(),
+            SourceCategory::AgentState,
+            NonEmptyText::parse(&title).unwrap_or_else(|_| {
+                NonEmptyText::parse(summary.run.as_str()).expect("a run id is never blank")
+            }),
+        )
+        .state(state)
+        .occurred_at(self.started_at.unwrap_or(now))
+        .detail("Run", summary.run.as_str())
+        .detail("Progress", summary.strip());
+        match &summary.needs_you {
+            Some(NeedsYou::Gate { instance, .. }) => {
+                builder = builder.detail("Waiting at", instance.to_string());
+            }
+            Some(NeedsYou::Question { question, .. }) => {
+                builder = builder.detail("Question", question.clone());
+            }
+            None => {}
+        }
+        builder.context(ItemContext::Run(summary.clone())).build()
     }
 }
 
@@ -239,7 +285,6 @@ impl ClientApi {
 mod tests {
     use super::*;
     use crate::domain::credentials::Provider;
-    use crate::domain::devflow::run_view::RunStatus;
     use crate::domain::devflow::summary::{Phase, PhaseCell};
 
     fn run(raw: &str) -> RunId {
@@ -357,6 +402,56 @@ mod tests {
         assert_eq!(marks[2], ("ask-info".to_owned(), Mark::NeedsYou));
         assert_eq!(detail.notes.questions[0].as_str(), "Page size?");
         assert_eq!(detail.item, item("r1", Mark::NeedsYou));
+    }
+
+    #[test]
+    fn a_run_item_is_queued_under_its_ticket_with_a_state_for_what_it_needs() {
+        use crate::domain::devflow::ids::NodeInstance;
+        use crate::domain::devflow::step::GateKind;
+
+        let source = SourceId::parse("vetinarid").expect("source");
+        let now = time::macros::datetime!(2026-10-25 10:00 UTC);
+        let running = item("r1", Mark::Elsewhere).to_attention(&source, now);
+        assert_eq!(running.title().as_str(), "ENG-412 Rate-limit retries");
+        assert_eq!(running.state(), ItemState::AgentRunning);
+        assert!(matches!(running.context(), ItemContext::Run(summary) if summary.run == run("r1")));
+
+        let mut gated = item("r1", Mark::NeedsYou);
+        gated.summary.needs_you = Some(NeedsYou::Gate {
+            instance: NodeInstance::parse("ask-info@1").expect("instance"),
+            gate: GateKind::InfoNeeded,
+        });
+        assert_eq!(
+            gated.to_attention(&source, now).state(),
+            ItemState::NeedsDecision
+        );
+
+        let mut asking = item("r1", Mark::NeedsYou);
+        asking.summary.needs_you = Some(NeedsYou::Question {
+            instance: NodeInstance::parse("implement@1").expect("instance"),
+            question: "Which client?".to_owned(),
+        });
+        assert_eq!(
+            asking.to_attention(&source, now).state(),
+            ItemState::AgentWaiting
+        );
+
+        for (status, state) in [
+            (RunStatus::Completed, ItemState::AgentDone),
+            (RunStatus::Failed, ItemState::AgentFailed),
+            (RunStatus::Cancelled, ItemState::Resolved),
+        ] {
+            let mut finished = item("r1", Mark::Done);
+            finished.summary.status = status;
+            assert_eq!(finished.to_attention(&source, now).state(), state);
+        }
+
+        let mut unlabelled = item("r2", Mark::Next);
+        unlabelled.label = None;
+        assert_eq!(
+            unlabelled.to_attention(&source, now).title().as_str(),
+            "run r2"
+        );
     }
 
     #[test]

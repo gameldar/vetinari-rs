@@ -183,6 +183,24 @@ pub struct RunSummary {
     pub needs_you: Option<NeedsYou>,
 }
 
+impl RunSummary {
+    /// The strip as a queue row draws it: `pre✓ impl●2/3 rev○ pr·`.
+    #[must_use]
+    pub fn strip(&self) -> String {
+        self.phases
+            .iter()
+            .map(|cell| {
+                let round = cell
+                    .round
+                    .map(|round| format!("{}/{}", round.iteration, round.bound))
+                    .unwrap_or_default();
+                format!("{}{}{round}", cell.phase.name(), cell.mark.glyph())
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Summarise a run's graph for its queue row.
 #[must_use]
 pub fn summarise(graph: &RunGraph, template: TemplateKind, local: &LocalSteps) -> RunSummary {
@@ -408,18 +426,7 @@ mod tests {
     }
 
     fn strip(summary: &RunSummary) -> String {
-        summary
-            .phases
-            .iter()
-            .map(|cell| {
-                let round = cell
-                    .round
-                    .map(|round| format!("{}/{}", round.iteration, round.bound))
-                    .unwrap_or_default();
-                format!("{}{}{round}", cell.phase.name(), cell.mark.glyph())
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+        summary.strip()
     }
 
     fn summary(instances: Vec<InstanceState>, local: &LocalSteps) -> RunSummary {

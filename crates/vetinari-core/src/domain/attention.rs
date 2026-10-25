@@ -11,6 +11,7 @@ use std::fmt;
 use time::{Duration, OffsetDateTime};
 
 use super::action::Action;
+use super::devflow::summary::RunSummary;
 use super::ids::{ItemId, SessionId, SourceId, SpaceId};
 use super::text::NonEmptyText;
 
@@ -120,6 +121,8 @@ pub enum ItemState {
     AgentDone,
     /// An agent failed.
     AgentFailed,
+    /// A workflow is waiting on the developer's decision at a gate.
+    NeedsDecision,
     /// An event starting at a known time.
     Scheduled {
         /// When it starts.
@@ -146,6 +149,7 @@ impl ItemState {
             ItemState::AgentWaiting => "waiting on you",
             ItemState::AgentDone => "done",
             ItemState::AgentFailed => "failed",
+            ItemState::NeedsDecision => "needs a decision",
             ItemState::Scheduled { .. } => "scheduled",
             ItemState::Resolved => "resolved",
         }
@@ -168,6 +172,7 @@ impl ItemState {
         matches!(
             self,
             ItemState::AgentWaiting
+                | ItemState::NeedsDecision
                 | ItemState::Blocked
                 | ItemState::AgentFailed
                 | ItemState::CiFailed
@@ -178,6 +183,7 @@ impl ItemState {
     const fn base_score(&self) -> u32 {
         match self {
             ItemState::AgentWaiting => 900,
+            ItemState::NeedsDecision => 880,
             ItemState::Blocked => 850,
             ItemState::AgentFailed => 800,
             ItemState::CiFailed => 700,
@@ -278,6 +284,8 @@ pub enum ItemContext {
     Event(EventRef),
     /// An agent task.
     Agent(AgentRef),
+    /// A dev workflow run, as the daemon summarised it.
+    Run(RunSummary),
 }
 
 /// One entry in the attention feed.
@@ -469,6 +477,9 @@ impl AttentionItem {
     /// One line for the feed.
     #[must_use]
     pub fn row_label(&self) -> String {
+        if let ItemContext::Run(summary) = &self.context {
+            return format!("[run] {}  {}", self.title.single_line(), summary.strip());
+        }
         format!(
             "[{}] {} ({})",
             self.category.label(),
@@ -873,5 +884,51 @@ mod tests {
         ] {
             assert!(!state.is_urgent(), "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_decision_needs_you_and_cuts_a_snooze_short() {
+        assert!(ItemState::NeedsDecision.needs_you());
+        assert!(ItemState::NeedsDecision.is_urgent());
+        assert!(ItemState::NeedsDecision.base_score() > ItemState::AgentFailed.base_score());
+        assert_eq!(ItemState::NeedsDecision.label(), "needs a decision");
+    }
+
+    #[test]
+    fn a_run_row_shows_its_strip_rather_than_a_state() {
+        use crate::domain::devflow::ids::RunId;
+        use crate::domain::devflow::run_view::RunStatus;
+        use crate::domain::devflow::summary::{Mark, Phase, PhaseCell, RunSummary};
+
+        let summary = RunSummary {
+            run: RunId::parse("01JB7Z").expect("run"),
+            status: RunStatus::Active,
+            phases: vec![
+                PhaseCell {
+                    phase: Phase::Pre,
+                    mark: Mark::Done,
+                    round: None,
+                },
+                PhaseCell {
+                    phase: Phase::Impl,
+                    mark: Mark::RunningHere,
+                    round: None,
+                },
+            ],
+            needs_you: None,
+        };
+        let item = AttentionItem::builder(
+            &SourceId::parse("vetinarid").expect("source"),
+            "01JB7Z",
+            SourceCategory::AgentState,
+            NonEmptyText::parse("ENG-412 Rate-limit retries").expect("title"),
+        )
+        .state(ItemState::AgentRunning)
+        .context(ItemContext::Run(summary))
+        .build();
+        assert_eq!(
+            item.row_label(),
+            "[run] ENG-412 Rate-limit retries  pre✓ impl●"
+        );
     }
 }
