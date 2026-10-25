@@ -111,7 +111,8 @@ pub struct BranchLabel(String);
 /// What this daemon calls itself in a claim, and the middle of its queue names.
 /// `[a-z0-9][a-z0-9-]{0,48}`, so `vetinari-<worker>-human` is always a valid queue.
 pub struct WorkerName(String);
-/// `vetinari-<template>-<ulid>`. Section 4.4.
+/// `vetinari-<template>-<ulid>`, `<template>` being the template's short name:
+/// `vetinari-feature-<ulid>` for FeatureFromTicket. Section 4.4.
 pub struct DefinitionId(String);
 ```
 
@@ -251,7 +252,7 @@ template needs them.
 `max_review_rounds`, which is the loop's `max_iterations` and therefore structural. A
 template-level definition would have to thread the ticket through every step's output and
 could not vary the round count. So the launcher compiles a definition per run, registers it
-under `vetinari-feature-<ulid>`, and starts a run of it with input `{}`. Every step's `config`
+under `vetinari-<template>-<ulid>` (for this template, `vetinari-feature-<ulid>`), and starts a run of it with input `{}`. Every step's `config`
 carries what it needs.
 
 The definition is deleted when the developer dismisses the finished run. Until then its
