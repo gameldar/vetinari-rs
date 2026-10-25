@@ -9,7 +9,9 @@ use time::{Duration, OffsetDateTime};
 use crate::application::ports::PortResult;
 use crate::domain::devflow::compile::WorkflowGraph;
 use crate::domain::devflow::held::HeldLease;
-use crate::domain::devflow::ids::{DefinitionId, LeaseToken, RunId, TaskId, TaskQueue, WorkerName};
+use crate::domain::devflow::ids::{
+    DefinitionId, LeaseToken, RunId, TaskId, TaskQueue, Ulid, WorkerName,
+};
 use crate::domain::devflow::outcome::OpenPrOutcome;
 use crate::domain::devflow::run_view::{RunEvent, RunGraph, RunHeader};
 use crate::domain::devflow::step::StepConfig;
@@ -117,6 +119,12 @@ pub trait RunGateway: Send + Sync {
 
     /// Every output a run has recorded, keyed by instance string form.
     async fn outputs(&self, run: &RunId) -> PortResult<BTreeMap<String, serde_json::Value>>;
+}
+
+/// Where a run's definition gets the ULID in its id.
+pub trait RunIds: Send + Sync {
+    /// A fresh ULID.
+    fn next(&self) -> Ulid;
 }
 
 /// The engine's stream of every run's events.

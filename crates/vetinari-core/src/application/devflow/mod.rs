@@ -3,6 +3,7 @@
 //! decides when to ask.
 
 pub mod api;
+pub mod launcher;
 pub mod lease;
 pub mod mirror;
 pub mod ports;

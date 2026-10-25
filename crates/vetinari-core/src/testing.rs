@@ -1115,17 +1115,63 @@ impl crate::application::devflow::ports::LeaseJournal for MemoryLeaseJournal {
     }
 }
 
-/// A run gateway whose outputs and graphs are set by the test. Definition
-/// calls are refused until a test needs them.
+/// Run ids that count up from one millisecond, so a test knows each.
+#[derive(Debug, Default)]
+pub struct CountingRunIds(Mutex<u64>);
+
+impl crate::application::devflow::ports::RunIds for CountingRunIds {
+    fn next(&self) -> crate::domain::devflow::ids::Ulid {
+        let mut count = self.0.lock().expect("ids lock");
+        *count += 1;
+        crate::domain::devflow::ids::Ulid::from_parts(*count, 0)
+    }
+}
+
+/// A run gateway whose outputs and graphs are set by the test, and which
+/// records the definitions registered, started and removed. Listing
+/// definitions is refused until a test needs it.
 #[derive(Debug, Default)]
 pub struct FakeRunGateway {
     outputs: Mutex<BTreeMap<String, BTreeMap<String, serde_json::Value>>>,
     graphs: Mutex<BTreeMap<String, crate::domain::devflow::run_view::RunGraph>>,
     fetched: Mutex<Vec<String>>,
     cancelled: Mutex<Vec<String>>,
+    registered: Mutex<Vec<crate::domain::devflow::compile::WorkflowGraph>>,
+    started: Mutex<Vec<(String, serde_json::Value)>>,
+    removed: Mutex<Vec<String>>,
+    register_fails: Mutex<Option<PortError>>,
+    start_fails: Mutex<Option<PortError>>,
 }
 
 impl FakeRunGateway {
+    /// The definitions registered, in order.
+    #[must_use]
+    pub fn registered(&self) -> Vec<crate::domain::devflow::compile::WorkflowGraph> {
+        self.registered.lock().expect("registered lock").clone()
+    }
+
+    /// The definitions started, with their input, in order.
+    #[must_use]
+    pub fn started(&self) -> Vec<(String, serde_json::Value)> {
+        self.started.lock().expect("started lock").clone()
+    }
+
+    /// The definitions removed, in order.
+    #[must_use]
+    pub fn removed(&self) -> Vec<String> {
+        self.removed.lock().expect("removed lock").clone()
+    }
+
+    /// Refuse the next registration with `error`.
+    pub fn fail_register(&self, error: PortError) {
+        *self.register_fails.lock().expect("register lock") = Some(error);
+    }
+
+    /// Refuse the next start with `error`.
+    pub fn fail_start(&self, error: PortError) {
+        *self.start_fails.lock().expect("start lock") = Some(error);
+    }
+
     /// The graph a fetch of its run returns from now on.
     pub fn set_graph(&self, graph: crate::domain::devflow::run_view::RunGraph) {
         self.graphs
@@ -1169,24 +1215,41 @@ impl FakeRunGateway {
 impl crate::application::devflow::ports::RunGateway for FakeRunGateway {
     async fn register(
         &self,
-        _graph: &crate::domain::devflow::compile::WorkflowGraph,
+        graph: &crate::domain::devflow::compile::WorkflowGraph,
     ) -> PortResult<()> {
-        Err(PortError::unsupported("fake run gateway", "register"))
+        if let Some(error) = self.register_fails.lock().expect("register lock").take() {
+            return Err(error);
+        }
+        self.registered
+            .lock()
+            .expect("registered lock")
+            .push(graph.clone());
+        Ok(())
     }
 
     async fn start(
         &self,
-        _definition: &crate::domain::devflow::ids::DefinitionId,
-        _input: &serde_json::Value,
+        definition: &crate::domain::devflow::ids::DefinitionId,
+        input: &serde_json::Value,
     ) -> PortResult<crate::domain::devflow::ids::RunId> {
-        Err(PortError::unsupported("fake run gateway", "start"))
+        if let Some(error) = self.start_fails.lock().expect("start lock").take() {
+            return Err(error);
+        }
+        let mut started = self.started.lock().expect("started lock");
+        started.push((definition.to_string(), input.clone()));
+        crate::domain::devflow::ids::RunId::parse(&format!("run-{}", started.len()))
+            .map_err(|error| PortError::protocol("fake run gateway", error.to_string()))
     }
 
     async fn remove(
         &self,
-        _definition: &crate::domain::devflow::ids::DefinitionId,
+        definition: &crate::domain::devflow::ids::DefinitionId,
     ) -> PortResult<()> {
-        Err(PortError::unsupported("fake run gateway", "remove"))
+        self.removed
+            .lock()
+            .expect("removed lock")
+            .push(definition.to_string());
+        Ok(())
     }
 
     async fn definitions(&self) -> PortResult<Vec<crate::domain::devflow::ids::DefinitionId>> {

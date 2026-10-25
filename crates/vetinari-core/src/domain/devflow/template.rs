@@ -37,6 +37,14 @@ impl TemplateKind {
             TemplateKind::FeatureFromTicket => "feature-from-ticket",
         }
     }
+
+    /// The name its definitions are registered under, `vetinari-<short>-`.
+    #[must_use]
+    pub const fn short_name(&self) -> &'static str {
+        match self {
+            TemplateKind::FeatureFromTicket => "feature",
+        }
+    }
 }
 
 impl FromStr for TemplateKind {

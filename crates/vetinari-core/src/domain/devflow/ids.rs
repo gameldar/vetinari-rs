@@ -8,6 +8,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
+use super::template::TemplateKind;
 use crate::domain::ids::{EmptyId, opaque_id};
 
 opaque_id!(
@@ -425,9 +426,50 @@ pub enum DefinitionIdError {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefinitionId(String);
 
+/// A ULID: 48 bits of milliseconds then 80 random bits, as 26 Crockford
+/// base32 characters, so ids sort by when they were made.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ulid(String);
+
+impl Ulid {
+    const ALPHABET: &'static [u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    /// The ULID of a moment, in milliseconds since the epoch, and 80 bits
+    /// of randomness; higher bits of either are dropped.
+    #[must_use]
+    pub fn from_parts(millis: u64, random: u128) -> Self {
+        let value = (u128::from(millis & ((1 << 48) - 1)) << 80) | (random & ((1 << 80) - 1));
+        let text = (0..26)
+            .rev()
+            .map(|place| {
+                let digit = (value >> (place * 5)) & 0x1f;
+                char::from(Self::ALPHABET[usize::try_from(digit).unwrap_or(0)])
+            })
+            .collect();
+        Self(text)
+    }
+
+    /// Borrow the ULID.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl DefinitionId {
     /// What every vetinari definition id starts with.
     pub const PREFIX: &'static str = "vetinari-";
+
+    /// The id one run's definition is registered under (section 4.4).
+    #[must_use]
+    pub fn for_run(template: TemplateKind, ulid: &Ulid) -> Self {
+        Self(format!(
+            "{}{}-{}",
+            Self::PREFIX,
+            template.short_name(),
+            ulid.as_str()
+        ))
+    }
 
     /// Parse a definition id.
     pub fn parse(raw: &str) -> Result<Self, DefinitionIdError> {
@@ -684,6 +726,28 @@ mod tests {
                 max: WorkerName::MAX_LEN
             })
         );
+    }
+
+    #[test]
+    fn a_ulid_is_its_time_then_its_randomness_in_crockford_base32() {
+        assert_eq!(
+            Ulid::from_parts(1_469_918_176_385, 0).as_str(),
+            "01ARYZ6S410000000000000000"
+        );
+        assert_eq!(
+            Ulid::from_parts(0, (1_u128 << 80) - 1).as_str(),
+            "0000000000ZZZZZZZZZZZZZZZZ"
+        );
+    }
+
+    #[test]
+    fn a_runs_definition_is_named_for_its_template_and_ulid() {
+        let id = DefinitionId::for_run(
+            crate::domain::devflow::template::TemplateKind::FeatureFromTicket,
+            &Ulid::from_parts(1_469_918_176_385, 0),
+        );
+        assert_eq!(id.as_str(), "vetinari-feature-01ARYZ6S410000000000000000");
+        assert_eq!(DefinitionId::parse(id.as_str()), Ok(id));
     }
 
     #[test]
