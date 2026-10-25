@@ -935,3 +935,257 @@ impl crate::application::devflow::ports::StepFiles for FakeStepFiles {
         Ok(())
     }
 }
+
+/// One call a [`FakeTaskGateway`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCall {
+    /// A claim on a queue.
+    Claim(String),
+    /// A heartbeat for a task.
+    Heartbeat(String),
+    /// A completion, with its output.
+    Complete(String, crate::domain::devflow::task::StepOutput),
+    /// A failure.
+    Fail(String, crate::domain::devflow::task::StepFailure),
+}
+
+/// A task gateway that replies from scripts and records every call.
+///
+/// Unscripted calls answer the common case: no task, an extended lease, an
+/// accepted completion or failure.
+#[derive(Debug)]
+pub struct FakeTaskGateway {
+    claims: Mutex<
+        std::collections::VecDeque<PortResult<Option<crate::domain::devflow::task::RawTask>>>,
+    >,
+    heartbeats: Mutex<
+        std::collections::VecDeque<PortResult<crate::application::devflow::ports::LeaseReply>>,
+    >,
+    completes: Mutex<
+        std::collections::VecDeque<PortResult<crate::application::devflow::ports::TaskReply>>,
+    >,
+    fails: Mutex<
+        std::collections::VecDeque<PortResult<crate::application::devflow::ports::TaskReply>>,
+    >,
+    calls: Mutex<Vec<TaskCall>>,
+    extends_to: OffsetDateTime,
+}
+
+impl FakeTaskGateway {
+    /// A gateway whose unscripted heartbeats extend leases to `extends_to`.
+    #[must_use]
+    pub fn new(extends_to: OffsetDateTime) -> Self {
+        Self {
+            claims: Mutex::default(),
+            heartbeats: Mutex::default(),
+            completes: Mutex::default(),
+            fails: Mutex::default(),
+            calls: Mutex::default(),
+            extends_to,
+        }
+    }
+
+    /// Queue a claim reply.
+    pub fn on_claim(&self, reply: PortResult<Option<crate::domain::devflow::task::RawTask>>) {
+        self.claims.lock().expect("claims lock").push_back(reply);
+    }
+
+    /// Queue a heartbeat reply.
+    pub fn on_heartbeat(&self, reply: PortResult<crate::application::devflow::ports::LeaseReply>) {
+        self.heartbeats
+            .lock()
+            .expect("heartbeats lock")
+            .push_back(reply);
+    }
+
+    /// Queue a completion reply.
+    pub fn on_complete(&self, reply: PortResult<crate::application::devflow::ports::TaskReply>) {
+        self.completes
+            .lock()
+            .expect("completes lock")
+            .push_back(reply);
+    }
+
+    /// Queue a failure reply.
+    pub fn on_fail(&self, reply: PortResult<crate::application::devflow::ports::TaskReply>) {
+        self.fails.lock().expect("fails lock").push_back(reply);
+    }
+
+    /// Every call, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<TaskCall> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+
+    fn record(&self, call: TaskCall) {
+        self.calls.lock().expect("calls lock").push(call);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::TaskGateway for FakeTaskGateway {
+    async fn claim(
+        &self,
+        queue: &crate::domain::devflow::ids::TaskQueue,
+        _worker: &crate::domain::devflow::ids::WorkerName,
+        _wait: time::Duration,
+    ) -> PortResult<Option<crate::domain::devflow::task::RawTask>> {
+        self.record(TaskCall::Claim(queue.to_string()));
+        self.claims
+            .lock()
+            .expect("claims lock")
+            .pop_front()
+            .unwrap_or(Ok(None))
+    }
+
+    async fn heartbeat(
+        &self,
+        task: &crate::domain::devflow::ids::TaskId,
+        _lease: &crate::domain::devflow::ids::LeaseToken,
+    ) -> PortResult<crate::application::devflow::ports::LeaseReply> {
+        self.record(TaskCall::Heartbeat(task.to_string()));
+        self.heartbeats
+            .lock()
+            .expect("heartbeats lock")
+            .pop_front()
+            .unwrap_or(Ok(
+                crate::application::devflow::ports::LeaseReply::Extended {
+                    expires_at: self.extends_to,
+                },
+            ))
+    }
+
+    async fn complete(
+        &self,
+        task: &crate::domain::devflow::ids::TaskId,
+        _lease: &crate::domain::devflow::ids::LeaseToken,
+        output: &crate::domain::devflow::task::StepOutput,
+    ) -> PortResult<crate::application::devflow::ports::TaskReply> {
+        self.record(TaskCall::Complete(task.to_string(), output.clone()));
+        self.completes
+            .lock()
+            .expect("completes lock")
+            .pop_front()
+            .unwrap_or(Ok(crate::application::devflow::ports::TaskReply::Accepted))
+    }
+
+    async fn fail(
+        &self,
+        task: &crate::domain::devflow::ids::TaskId,
+        _lease: &crate::domain::devflow::ids::LeaseToken,
+        failure: &crate::domain::devflow::task::StepFailure,
+    ) -> PortResult<crate::application::devflow::ports::TaskReply> {
+        self.record(TaskCall::Fail(task.to_string(), failure.clone()));
+        self.fails
+            .lock()
+            .expect("fails lock")
+            .pop_front()
+            .unwrap_or(Ok(crate::application::devflow::ports::TaskReply::Accepted))
+    }
+}
+
+/// A lease journal held in memory.
+#[derive(Debug, Default)]
+pub struct MemoryLeaseJournal {
+    held: Mutex<Vec<crate::domain::devflow::held::HeldLease>>,
+}
+
+impl MemoryLeaseJournal {
+    /// Start with these leases recorded.
+    pub fn seed(&self, held: Vec<crate::domain::devflow::held::HeldLease>) {
+        *self.held.lock().expect("journal lock") = held;
+    }
+
+    /// What is recorded.
+    #[must_use]
+    pub fn held(&self) -> Vec<crate::domain::devflow::held::HeldLease> {
+        self.held.lock().expect("journal lock").clone()
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::LeaseJournal for MemoryLeaseJournal {
+    async fn load(&self) -> PortResult<Vec<crate::domain::devflow::held::HeldLease>> {
+        Ok(self.held())
+    }
+
+    async fn save(&self, held: &[crate::domain::devflow::held::HeldLease]) -> PortResult<()> {
+        *self.held.lock().expect("journal lock") = held.to_vec();
+        Ok(())
+    }
+}
+
+/// A run gateway whose outputs are set by the test.
+#[derive(Debug, Default)]
+pub struct FakeRunGateway {
+    outputs: Mutex<BTreeMap<String, BTreeMap<String, serde_json::Value>>>,
+}
+
+impl FakeRunGateway {
+    /// Record an output for a run's instance.
+    pub fn set_output(&self, run: &str, instance: &str, output: serde_json::Value) {
+        self.outputs
+            .lock()
+            .expect("outputs lock")
+            .entry(run.to_owned())
+            .or_default()
+            .insert(instance.to_owned(), output);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::RunGateway for FakeRunGateway {
+    async fn outputs(
+        &self,
+        run: &crate::domain::devflow::ids::RunId,
+    ) -> PortResult<BTreeMap<String, serde_json::Value>> {
+        Ok(self
+            .outputs
+            .lock()
+            .expect("outputs lock")
+            .get(run.as_str())
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+/// A pull request publisher that answers from a script.
+#[derive(Debug, Default)]
+pub struct FakePullRequestPublisher {
+    replies: Mutex<
+        std::collections::VecDeque<PortResult<crate::domain::devflow::outcome::OpenPrOutcome>>,
+    >,
+    published: Mutex<Vec<String>>,
+}
+
+impl FakePullRequestPublisher {
+    /// Queue a reply.
+    pub fn on_publish(&self, reply: PortResult<crate::domain::devflow::outcome::OpenPrOutcome>) {
+        self.replies.lock().expect("replies lock").push_back(reply);
+    }
+
+    /// The branches it was asked to publish.
+    #[must_use]
+    pub fn published(&self) -> Vec<String> {
+        self.published.lock().expect("published lock").clone()
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::PullRequestPublisher for FakePullRequestPublisher {
+    async fn publish(
+        &self,
+        config: &crate::domain::devflow::step::StepConfig,
+        _profile: &crate::domain::profile::Profile,
+    ) -> PortResult<crate::domain::devflow::outcome::OpenPrOutcome> {
+        self.published
+            .lock()
+            .expect("published lock")
+            .push(config.branch.to_string());
+        self.replies
+            .lock()
+            .expect("replies lock")
+            .pop_front()
+            .unwrap_or_else(|| Err(PortError::unavailable("publisher", "nothing scripted")))
+    }
+}

@@ -287,13 +287,7 @@ impl WorkflowEngine {
         let skill = library
             .get(skill_id)
             .ok_or_else(|| PortError::not_found("skill", skill_id.as_str()))?;
-        let worktree_root = self.worktree_root(profile, &config.repo.path);
-        let worktree_spec = WorktreeSpec::for_run(
-            config.repo.path.clone(),
-            &worktree_root,
-            &config.branch,
-            config.base.as_ref(),
-        );
+        let worktree_spec = self.run_worktree(config, profile);
         let result = worktree_spec.path().join(StepResult::path_for(
             launch.task.instance(),
             launch.task.attempt(),
@@ -349,6 +343,17 @@ impl WorkflowEngine {
             },
             result,
         })
+    }
+
+    /// Where a run's worktree is, or will be.
+    #[must_use]
+    pub fn run_worktree(&self, config: &StepConfig, profile: &Profile) -> WorktreeSpec {
+        WorktreeSpec::for_run(
+            config.repo.path.clone(),
+            &self.worktree_root(profile, &config.repo.path),
+            &config.branch,
+            config.base.as_ref(),
+        )
     }
 
     /// The run's space: the one already open for its worktree, or a new one.

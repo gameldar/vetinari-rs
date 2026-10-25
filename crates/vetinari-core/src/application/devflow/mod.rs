@@ -4,3 +4,4 @@
 
 pub mod lease;
 pub mod ports;
+pub mod worker;

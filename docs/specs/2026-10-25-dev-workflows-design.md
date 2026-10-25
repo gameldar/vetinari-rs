@@ -579,6 +579,11 @@ it applies, `{{findings}}` or `{{note}}`. `implement-tdd` states the repository'
 failing test first, then the code. Routing uses existing task classes: preflight is
 `IssueSummary`, implement is `DeepCodeChange`, review is `PrReview`.
 
+Under the default routing table `IssueSummary` goes to the `script` engine, which cannot read a
+codebase, so a preflight on an unconfigured machine runs on the wrong agent. Until that is
+settled, a machine running the daemon needs an `IssueSummary` rule (or a pinned `config.agent`).
+Open: give preflight its own task class, or route it as `DeepCodeChange` (16).
+
 ## 7. The step worker
 
 `StepWorker` is an application service. The daemon runtime drives it.
@@ -632,6 +637,11 @@ The agent queue's loop holds a permit from a semaphore of `[daemon] max_agent_st
 2) before it claims. Pull is what makes that limit possible: the daemon never holds a task it
 has no capacity to start, so a busy machine leaves work offered rather than claimed and idle.
 The human queue's loop has no limit, because a gate costs nothing to hold.
+
+In the worker this is `can_claim(queue)`: agent steps that are `Starting` or `Running` count
+against the limit, and one waiting on a completion does not, since its agent is done. `claim`
+with no capacity returns without calling the gateway, so the runtime needs no semaphore of its
+own. The backoff belongs to the runtime's loop (slice 11), not the worker.
 
 On `Unavailable` a loop backs off 1, 2, 4 ... 60 seconds and resumes. On `Unauthenticated` it
 stops and the daemon raises "autognomus needs sign-in" (12).
@@ -692,6 +702,18 @@ reports each status change to the worker.
 `OpenPr` needs no agent. It pushes the branch and opens the pull request through a new
 `PullRequestPublisher` port, implemented with the existing GitHub adapter and credentials. It
 first looks for an open PR from the branch, so a rerun finds the one it made.
+
+The port (`publish(&StepConfig, &Profile) -> OpenPrOutcome`) is added with the worker so that
+step is tested now; its GitHub adapter is still slice 15. A publish error fails the step,
+transient when the port says the error is.
+
+The `{{note}}` for a recheck preflight comes from the run's outputs (`RunGateway::outputs`,
+keyed by instance), read for `ask-info` of the previous iteration: a loop's `previous` is its
+exit node's output, which is preflight's, so the person's note is not in the input.
+
+The shortcut of 6 accepts this attempt's own valid result without a `head` check, since it can
+only have been written by this attempt's agent before a restart; it records `head` then, as on a
+normal finish. An earlier attempt's result still needs its `head` to match.
 
 ### 7.5 Completing and failing
 
@@ -757,6 +779,7 @@ On start, before any claim loop runs, the worker heartbeats every journal entry:
 | `Extended` | `Starting` or `Running` | Start the step again in the same worktree under the same lease and attempt. The agent was the old daemon's child and is gone; the shortcut in 6 catches a result it finished writing |
 | `Extended` | `AwaitingPerson` | Republish the gate to clients |
 | `Extended` | `Completing` | Send the completion again |
+| `Extended` | `Failing` | Send the failure again |
 | `Stale`, `Gone`, `NotFound` | any | Drop the entry, as 7.6 |
 | `Unavailable` | any | Keep the entry and retry, as a running heartbeat would |
 
@@ -1176,6 +1199,9 @@ clean.
 1. **The issuer.** Which OIDC provider fronts the gateway, and does it meet the three assumptions
    of section 12? Slice 13 can be built against `MockServer` either way, but the first live run
    cannot happen until this is known.
+
+2. **Preflight's routing.** `IssueSummary` defaults to the `script` engine (6). Either a new
+   task class or routing preflight as `DeepCodeChange`.
 
 Decided, with the defaults recorded here:
 
