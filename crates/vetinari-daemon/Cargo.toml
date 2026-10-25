@@ -21,6 +21,7 @@ vetinari-adapters.workspace = true
 
 async-trait.workspace = true
 clap.workspace = true
+directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

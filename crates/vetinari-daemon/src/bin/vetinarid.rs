@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
 
+    /// vetinari's configuration file; defaults to the TUI's.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     /// The worker label; defaults to the hostname.
     #[arg(long, value_name = "NAME")]
     worker: Option<String>,
@@ -82,5 +86,6 @@ fn settings(cli: Cli) -> Result<Settings, String> {
         socket: cli.socket.unwrap_or_else(compose::default_socket),
         worker,
         source,
+        config: cli.config,
     })
 }

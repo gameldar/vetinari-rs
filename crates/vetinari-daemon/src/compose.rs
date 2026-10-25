@@ -1,28 +1,43 @@
 //! The daemon's composition root: which adapters serve which ports, as
 //! `vetinari-tui/src/startup.rs` is the TUI's.
 //!
-//! This skeleton serves the run board. It does not yet claim steps: the
-//! worker's claim, heartbeat and agent loops join the runtime with the
-//! configuration and sign-in that slice 13 brings.
+//! A scripted daemon serves the run board only. A gateway daemon also
+//! claims and runs steps, with the profiles, agent engines and workspace
+//! targets of vetinari's own configuration.
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use time::OffsetDateTime;
-use vetinari_adapters::HttpClient;
 use vetinari_adapters::autognomus::client::{HttpGateway, StaticBearer};
+use vetinari_adapters::config::{candidate_paths, load_or_default};
+use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles};
+use vetinari_adapters::git::GitWorktreeManager;
+use vetinari_adapters::skills::FileSkillStore;
+use vetinari_adapters::{HttpClient, Paths, Runtime};
+use vetinari_core::application::config::{Config, ParseContext};
 use vetinari_core::application::devflow::api::ClientApi;
-use vetinari_core::application::devflow::ports::{RunEvents, RunGateway};
-use vetinari_core::application::ports::PortError;
+use vetinari_core::application::devflow::ports::PullRequestPublisher;
+use vetinari_core::application::devflow::ports::{RunEvents, RunGateway, TaskGateway};
+use vetinari_core::application::devflow::worker::{StepWorker, WorkerPorts, WorkerSettings};
+use vetinari_core::application::ports::{Clock, PortError};
+use vetinari_core::application::ports::{PortResult, WorktreeManager};
+use vetinari_core::domain::devflow::compile::StepPolicies;
+use vetinari_core::domain::devflow::compile::WorkerQueues;
 use vetinari_core::domain::devflow::ids::WorkerName;
+use vetinari_core::domain::devflow::outcome::OpenPrOutcome;
+use vetinari_core::domain::devflow::step::StepConfig;
 use vetinari_core::domain::devflow::template::TemplateKind;
+use vetinari_core::domain::profile::Profile;
 
 use crate::hub::Hub;
 use crate::runtime::{Feed, OwnedRun, TokioClock, feed_runs};
 use crate::scripted::{Script, ScriptError};
 use crate::socket;
-use crate::steps::LocalBoard;
+use crate::steps::{LocalBoard, StepParts, claim_loop, spawn_steps};
 
 /// Where the daemon's runs come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +62,8 @@ pub struct Settings {
     pub worker: WorkerName,
     /// Where runs come from.
     pub source: Source,
+    /// vetinari's configuration file, when not the usual one.
+    pub config: Option<PathBuf>,
 }
 
 /// Why the daemon stopped.
@@ -74,6 +91,9 @@ pub enum DaemonError {
     /// The gateway could not be reached or set up.
     #[error(transparent)]
     Gateway(#[from] PortError),
+    /// vetinari's configuration could not be read.
+    #[error("configuration: {0}")]
+    Config(String),
 }
 
 /// `$XDG_RUNTIME_DIR/vetinari/vetinarid.sock`, or under the temporary
@@ -117,59 +137,228 @@ pub async fn discover(runs: &dyn RunGateway) -> Result<Vec<OwnedRun>, PortError>
     Ok(owned)
 }
 
+/// The claiming half of a daemon: the task endpoints, the worker's queues,
+/// and the worker with its agents.
+pub struct Claims {
+    /// The engine's task endpoints.
+    pub tasks: Arc<dyn TaskGateway>,
+    /// The queues to claim from.
+    pub queues: WorkerQueues,
+    /// The worker and what drives it.
+    pub parts: StepParts,
+}
+
+/// Everything a daemon serves from, built by `run` or by a test.
+pub struct Services {
+    /// The run endpoints.
+    pub runs: Arc<dyn RunGateway>,
+    /// The run stream.
+    pub events: Arc<dyn RunEvents>,
+    /// The runs owned at start.
+    pub owned: Vec<OwnedRun>,
+    /// The worker label clients are greeted with.
+    pub worker: WorkerName,
+    /// The application's clock.
+    pub clock: Arc<dyn Clock>,
+    /// The worker, when this daemon claims steps; none for a script.
+    pub claims: Option<Claims>,
+}
+
+/// How many agent steps run at once until `[daemon] max_agent_steps` is
+/// configurable (design 7.2).
+const MAX_AGENT_STEPS: NonZeroUsize = NonZeroUsize::new(2).expect("non-zero");
+
+/// Stands in for the pull request publisher until its GitHub adapter
+/// exists (slice 15): an `open-pr` step fails, transiently, so a later
+/// daemon can still open it.
+struct NoPublisher;
+
+#[async_trait::async_trait]
+impl PullRequestPublisher for NoPublisher {
+    async fn publish(&self, _config: &StepConfig, _profile: &Profile) -> PortResult<OpenPrOutcome> {
+        Err(PortError::unavailable(
+            "pull request publisher",
+            "this daemon cannot open pull requests yet",
+        ))
+    }
+}
+
+/// The worker for a gateway, from vetinari's own configuration: its
+/// profiles, agent engines and workspace targets, as the TUI reads them.
+pub fn claims(
+    config: Config,
+    paths: &Paths,
+    gateway: Arc<HttpGateway>,
+    worker: &WorkerName,
+    clock: Arc<dyn Clock>,
+) -> Result<Claims, DaemonError> {
+    let tick = Duration::from_millis(config.general.tick_rate_ms);
+    let profiles = config.profiles.clone();
+    let runtime = Runtime::build(config, paths.clone())?;
+    for problem in &runtime.problems {
+        tracing::warn!(%problem, "configuration");
+    }
+    let worktrees: Arc<dyn WorktreeManager> = Arc::new(GitWorktreeManager::default());
+    let queues = WorkerQueues::for_worker(worker);
+    let step_worker = StepWorker::new(
+        WorkerPorts {
+            tasks: gateway.clone(),
+            runs: gateway.clone(),
+            journal: Arc::new(FileLeaseJournal::new(FileLeaseJournal::default_path(
+                &paths.state_dir,
+            ))),
+            files: Arc::new(FsStepFiles::default()),
+            worktrees,
+            skills: Arc::new(FileSkillStore::new(FileSkillStore::default_path(
+                &paths.config_dir,
+            ))),
+            publisher: Arc::new(NoPublisher),
+            clock: clock.clone(),
+        },
+        Arc::new(runtime.workflows),
+        profiles,
+        WorkerSettings {
+            name: worker.clone(),
+            queues: queues.clone(),
+            max_agent_steps: MAX_AGENT_STEPS,
+            policies: StepPolicies::default(),
+        },
+    );
+    Ok(Claims {
+        tasks: gateway,
+        queues,
+        parts: StepParts {
+            worker: step_worker,
+            registry: runtime.agents,
+            clock,
+            tick,
+        },
+    })
+}
+
+/// vetinari's configuration and directories, found as the TUI finds them.
+fn load_config(explicit: Option<PathBuf>) -> Result<(Config, Paths), DaemonError> {
+    let dirs = directories::BaseDirs::new();
+    let config_dir = dirs.as_ref().map(|dirs| dirs.config_dir().to_path_buf());
+    let state_dir = dirs.as_ref().map(|dirs| {
+        dirs.state_dir()
+            .unwrap_or_else(|| dirs.data_local_dir())
+            .to_path_buf()
+    });
+    let home = dirs.as_ref().map(|dirs| dirs.home_dir().to_path_buf());
+    let candidates = match explicit {
+        Some(path) => vec![path],
+        None => config_dir
+            .as_deref()
+            .map(candidate_paths)
+            .unwrap_or_default(),
+    };
+    let loaded = load_or_default(&candidates, &ParseContext { home })
+        .map_err(|error| DaemonError::Config(error.to_string()))?;
+    Ok((
+        loaded.config,
+        Paths {
+            config_dir: config_dir.unwrap_or_else(|| PathBuf::from(".")),
+            state_dir: state_dir.unwrap_or_else(|| PathBuf::from(".")),
+        },
+    ))
+}
+
 /// Run the daemon until it is interrupted or its socket fails.
 pub async fn run(settings: Settings) -> Result<(), DaemonError> {
+    let clock: Arc<dyn Clock> = Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc()));
+    let services = match &settings.source {
+        Source::Scripted(path) => {
+            let text = std::fs::read_to_string(path).map_err(|error| DaemonError::ReadScript {
+                path: path.clone(),
+                error,
+            })?;
+            let script = Script::parse(&text)?;
+            let owned = script.runs.clone();
+            let (runs, events) = script.replay();
+            Services {
+                runs,
+                events,
+                owned,
+                worker: settings.worker.clone(),
+                clock,
+                claims: None,
+            }
+        }
+        Source::Gateway { url, token } => {
+            let gateway = Arc::new(HttpGateway::new(
+                url,
+                HttpClient::new()?,
+                Arc::new(StaticBearer::new(token.clone())),
+            ));
+            let owned = discover(gateway.as_ref()).await?;
+            let (config, paths) = load_config(settings.config.clone())?;
+            let claims = claims(
+                config,
+                &paths,
+                gateway.clone(),
+                &settings.worker,
+                clock.clone(),
+            )?;
+            Services {
+                runs: gateway.clone(),
+                events: gateway,
+                owned,
+                worker: settings.worker.clone(),
+                clock,
+                claims: Some(claims),
+            }
+        }
+    };
+    serve(settings.socket, services).await
+}
+
+/// Serve `services` on `socket` until interrupted or the socket fails: the
+/// run board, and the worker's claim loops when there is a worker.
+pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonError> {
     let socket_error = |error| DaemonError::Socket {
-        path: settings.socket.clone(),
+        path: socket.clone(),
         error,
     };
-    let (runs, events, owned): (Arc<dyn RunGateway>, Arc<dyn RunEvents>, Vec<OwnedRun>) =
-        match &settings.source {
-            Source::Scripted(path) => {
-                let text =
-                    std::fs::read_to_string(path).map_err(|error| DaemonError::ReadScript {
-                        path: path.clone(),
-                        error,
-                    })?;
-                let script = Script::parse(&text)?;
-                let owned = script.runs.clone();
-                let (runs, events) = script.replay();
-                (runs, events, owned)
-            }
-            Source::Gateway { url, token } => {
-                let gateway = Arc::new(HttpGateway::new(
-                    url,
-                    HttpClient::new()?,
-                    Arc::new(StaticBearer::new(token.clone())),
-                ));
-                let owned = discover(gateway.as_ref()).await?;
-                (gateway.clone(), gateway, owned)
-            }
-        };
-
-    let listener = socket::bind(&settings.socket).map_err(socket_error)?;
+    let listener = socket::bind(&socket).map_err(socket_error)?;
     let hub = Arc::new(Hub::default());
     let api = Arc::new(ClientApi::new(
         concat!("vetinarid ", env!("CARGO_PKG_VERSION")),
-        settings.worker.clone(),
+        services.worker.clone(),
     ));
     let (local, touched) = LocalBoard::new();
+    let mut tasks = Vec::new();
+    let steps = services.claims.map(|claims| {
+        let (steps, owner) = spawn_steps(claims.parts, local.clone());
+        tasks.push(owner);
+        for queue in [claims.queues.agent, claims.queues.human] {
+            tasks.push(tokio::spawn(claim_loop(
+                claims.tasks.clone(),
+                queue,
+                services.worker.clone(),
+                steps.clone(),
+            )));
+        }
+        steps
+    });
     let feed = Feed {
-        runs,
-        events,
-        clock: Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc())),
+        runs: services.runs,
+        events: services.events,
+        clock: services.clock,
         template: TemplateKind::FeatureFromTicket,
         hub: hub.clone(),
         local,
-        steps: None,
+        steps,
     };
-    let feeding = tokio::spawn(feed_runs(feed, owned, touched));
+    tasks.push(tokio::spawn(feed_runs(feed, services.owned, touched)));
     let served = tokio::select! {
         served = socket::serve(listener, api, hub) => served.map_err(socket_error),
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
-    feeding.abort();
-    let _ = std::fs::remove_file(&settings.socket);
+    for task in tasks {
+        task.abort();
+    }
+    let _ = std::fs::remove_file(&socket);
     served
 }
 
@@ -187,6 +376,8 @@ mod tests {
     use vetinari_core::domain::devflow::compile::WorkflowGraph;
     use vetinari_core::domain::devflow::ids::{DefinitionId, RunId};
     use vetinari_core::domain::devflow::run_view::{RunGraph, RunHeader, RunStatus};
+
+    use vetinari_core::application::config::RawConfig;
 
     use super::*;
 
@@ -226,6 +417,46 @@ mod tests {
         async fn outputs(&self, _run: &RunId) -> PortResult<BTreeMap<String, Value>> {
             unreachable!()
         }
+    }
+
+    #[tokio::test]
+    async fn a_gateway_daemon_claims_from_its_own_queues_at_the_configured_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::parse(RawConfig::default(), &ParseContext::default())
+            .expect("the default config");
+        config.general.tick_rate_ms = 250;
+        let gateway = Arc::new(HttpGateway::new(
+            "http://127.0.0.1:1",
+            HttpClient::new().expect("client"),
+            Arc::new(StaticBearer::new("token")),
+        ));
+        let clock: Arc<dyn Clock> =
+            Arc::new(TokioClock::starting_at(datetime!(2026-10-25 09:00 UTC)));
+
+        let claims = claims(
+            config,
+            &Paths {
+                config_dir: dir.path().join("config"),
+                state_dir: dir.path().join("state"),
+            },
+            gateway,
+            &WorkerName::parse("hex").expect("worker"),
+            clock,
+        )
+        .expect("claims");
+
+        assert_eq!(claims.queues.agent.as_str(), "vetinari-hex-agent");
+        assert_eq!(claims.queues.human.as_str(), "vetinari-hex-human");
+        assert_eq!(claims.parts.tick, Duration::from_millis(250));
+        assert!(
+            claims
+                .parts
+                .registry
+                .engine_ids()
+                .iter()
+                .any(|id| id.as_str() == "claude-code"),
+            "the configured engines are registered"
+        );
     }
 
     #[test]
@@ -280,6 +511,7 @@ mod tests {
             socket: path.clone(),
             worker: WorkerName::parse("hex").expect("worker"),
             source: Source::Scripted(script),
+            config: None,
         }));
         let stream = tokio::time::timeout(Duration::from_secs(5), async {
             loop {

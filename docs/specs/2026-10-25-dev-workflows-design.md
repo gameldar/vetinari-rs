@@ -1076,7 +1076,7 @@ second.
 
 ### 10.5 The skeleton, as built
 
-Slice 11 builds the daemon's run board end to end and nothing that claims work:
+Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
 
 - `ClientApi` (`application/devflow/api.rs`) has `hello` and a `RunBoard` of `RunItem`s (a
   `RunSummary` with an optional `RunLabel { ticket, title }` and start time). Putting an
@@ -1101,9 +1101,35 @@ Slice 11 builds the daemon's run board end to end and nothing that claims work:
   the summary exactly as a live run would. `tests/fixtures/feature-run.script.json` takes one run
   from preflight to an opened pull request.
 
-Not yet composed: the worker's claim, heartbeat and agent loops, `LocalSteps` from the worker
-(every step reads as elsewhere until they are), and `hint_cancelled` from the mirror's `ending`.
-They need the configuration and sign-in of slice 13 to run against a real gateway.
+**The worker, as composed (slice 11c).** A `--gateway` daemon claims and runs steps; a
+`--scripted` one still serves the board only.
+
+- `steps.rs` has one task that owns the `StepWorker` and the `AgentRegistry` (this is the
+  `AgentSupervisor` of 7.4). It runs `recover` before it answers anything, so no claim is made
+  before every journalled lease has been heartbeated (7.7). Then it heartbeats what falls due,
+  polls agent sessions every `[general] tick` and passes each changed status to
+  `agent_changed`.
+- One `claim_loop` per queue. It does not call `StepWorker::claim`, which would hold the worker
+  through a 30 second long-poll and starve the heartbeats: it asks the owner `can_claim`,
+  long-polls `TaskGateway::claim` itself, and hands the task over, waiting until it is started
+  before it asks again, so two claims never race for one permit. Unavailable backs off 1 to 60
+  seconds; any other error (refused, unauthenticated) stops that loop and logs "autognomus needs
+  sign-in" until slice 13 surfaces it. Two claims on one queue start at least a second apart, so
+  a gateway that answers an empty claim at once is not asked in a tight loop.
+- A heartbeat that fails for a reason a retry will not fix pauses heartbeating for five
+  seconds, since the worker leaves such a lease due.
+- After each command, heartbeat or tick, the owner publishes what it holds to a `LocalBoard`:
+  `Running` (with the agent's question, if it is waiting for input) and `AwaitingPerson`, per
+  run. `feed_runs` summarises with it, republishes a run whenever its local steps change, and
+  starts watching a run it did not own at start when this machine claims from it. The mirror's
+  `ending` reaches the owner as `hint_cancelled`.
+- `compose::claims` builds the worker from vetinari's own configuration (`--config`, or the
+  TUI's usual file) through `Runtime::build`: its profiles, agent engines and workspace targets,
+  the journal under `state_dir`, the skill library beside the config. `serve` runs a `Services`,
+  which is what the end-to-end test in `tests/worker.rs` builds by hand against a routed local
+  gateway, a real git repository and an agent that writes its own result.
+- Deviations: `max_agent_steps` is fixed at 2 until a `[daemon]` section exists, and `OpenPr`
+  fails transiently through a placeholder publisher until slice 15.
 
 ## 11. Testing
 
