@@ -1,6 +1,7 @@
 [
-  { "id": "deploy-nightly", "version": 4, "callback": null,
-    "triggers": [{ "type": "schedule", "cron": "0 2 * * *" }], "nodes": [], "edges": [] },
-  { "id": "vetinari-feature-01JB7ZQ3XK", "version": 1, "callback": null,
+  { "id": "deploy-nightly", "version": 4,
+    "triggers": [{ "type": "schedule", "recurrence": { "rrule": "FREQ=DAILY;BYHOUR=2" } }],
+    "nodes": [], "edges": [] },
+  { "id": "vetinari-feature-01JB7ZQ3XK", "version": 1,
     "triggers": [{ "type": "manual" }], "nodes": [], "edges": [] }
 ]

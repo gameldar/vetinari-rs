@@ -1,571 +1,657 @@
 {
- "about": "One feature-from-ticket run from preflight to an opened pull request, for developing the TUI without a gateway. Graphs and events follow the shapes in vetinari-adapters/tests/fixtures/autognomus, which are engine-spec-derived (see sources.txt there).",
- "runs": [
-  {
-   "ticket": "ENG-412",
-   "title": "Rate-limit webhook retries",
-   "started_at": "2026-10-25T09:00:00Z",
-   "graph": {
-    "run": {
-     "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
-     "workflow": "vetinari-feature-01JB7ZQ3XK",
-     "version": 1,
-     "state": "active",
-     "outputs": {},
-     "created_at": "2026-10-25T09:00:00Z",
-     "in_flight": [
-      "preflight@1"
-     ]
+  "about": "One feature-from-ticket run from preflight to an opened pull request, for developing the TUI without a gateway. Graphs and events follow the shapes in vetinari-adapters/tests/fixtures/autognomus, which are engine-spec-derived (see sources.txt there).",
+  "runs": [
+    {
+      "ticket": "ENG-412",
+      "title": "Rate-limit webhook retries",
+      "started_at": "2026-10-25T09:00:00Z",
+      "graph": {
+        "run": {
+          "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
+          "workflow": "vetinari-feature-01JB7ZQ3XK",
+          "version": 1,
+          "state": "active",
+          "outputs": {},
+          "created_at": "2026-10-25T09:00:00Z",
+          "in_flight": [
+            "preflight@1"
+          ]
+        },
+        "seq": 3,
+        "nodes": [
+          {
+            "id": "intake",
+            "kind": "loop",
+            "body": [
+              "preflight",
+              "ask-info"
+            ],
+            "exit": {
+              "node": "preflight",
+              "when": "ready"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "preflight",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "intake"
+          },
+          {
+            "id": "ask-info",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": "intake"
+          },
+          {
+            "id": "rework",
+            "kind": "loop",
+            "body": [
+              "implement",
+              "review"
+            ],
+            "exit": {
+              "node": "review",
+              "when": "approved"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "implement",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review-stuck",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": null
+          },
+          {
+            "id": "open-pr",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": null
+          }
+        ],
+        "edges": [
+          {
+            "from": "preflight",
+            "to": "ask-info",
+            "when": "needs-info"
+          },
+          {
+            "from": "intake",
+            "to": "rework",
+            "when": "done"
+          },
+          {
+            "from": "implement",
+            "to": "review",
+            "when": "implemented"
+          },
+          {
+            "from": "rework",
+            "to": "open-pr",
+            "when": "done"
+          },
+          {
+            "from": "rework",
+            "to": "review-stuck",
+            "when": "exhausted"
+          },
+          {
+            "from": "review-stuck",
+            "to": "open-pr",
+            "when": "open-anyway"
+          }
+        ],
+        "instances": [
+          {
+            "instance": "intake",
+            "iteration": 1,
+            "status": "looping",
+            "attempt": null,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "preflight@1",
+            "worker": "hex",
+            "expires_at": "2026-10-25T10:30:00Z",
+            "attempt": 1,
+            "status": "claimed",
+            "first_ready_at": null,
+            "finished_at": null
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "after_ms": 1500,
+      "event": "node.completed",
+      "data": {
+        "run": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
+        "workflow": "vetinari-feature-01JB7ZQ3XK",
+        "instance": "preflight@1",
+        "attempt": 1,
+        "at": "2026-10-25T09:04:00Z",
+        "seq": 4,
+        "branch": "ready"
+      }
     },
-    "seq": 3,
-    "nodes": [
-     {
-      "id": "intake",
-      "kind": "loop",
-      "body": [
-       "preflight",
-       "ask-info"
-      ],
-      "exit": {
-       "node": "preflight",
-       "when": "ready"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "preflight",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "intake"
-     },
-     {
-      "id": "ask-info",
-      "kind": "external",
-      "queue": "vetinari-hex-human",
-      "scope": "intake"
-     },
-     {
-      "id": "rework",
-      "kind": "loop",
-      "body": [
-       "implement",
-       "review"
-      ],
-      "exit": {
-       "node": "review",
-       "when": "approved"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "implement",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review-stuck",
-      "kind": "external",
-      "queue": "vetinari-hex-human"
-     },
-     {
-      "id": "open-pr",
-      "kind": "external",
-      "queue": "vetinari-hex-agent"
-     }
-    ],
-    "edges": [
-     {
-      "from": "intake",
-      "to": "rework"
-     },
-     {
-      "from": "preflight",
-      "to": "ask-info",
-      "when": "needs-info"
-     },
-     {
-      "from": "implement",
-      "to": "review"
-     },
-     {
-      "from": "rework",
-      "to": "open-pr",
-      "when": "approved"
-     },
-     {
-      "from": "rework",
-      "to": "review-stuck",
-      "when": "exhausted"
-     }
-    ],
-    "instances": [
-     {
-      "instance": "intake",
-      "state": "looping",
-      "iteration": 1
-     },
-     {
-      "instance": "preflight@1",
-      "state": "claimed",
-      "worker": "hex",
-      "expires_at": "2026-10-25T10:30:00Z",
-      "attempt": 1
-     }
-    ]
-   }
-  }
- ],
- "steps": [
-  {
-   "after_ms": 1500,
-   "event": "node.completed",
-   "data": {
-    "run": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
-    "workflow": "vetinari-feature-01JB7ZQ3XK",
-    "instance": "preflight@1",
-    "attempt": 1,
-    "at": "2026-10-25T09:04:00Z",
-    "seq": 4,
-    "branch": "ready"
-   }
-  },
-  {
-   "after_ms": 1500,
-   "graph": {
-    "run": {
-     "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
-     "workflow": "vetinari-feature-01JB7ZQ3XK",
-     "version": 1,
-     "state": "active",
-     "outputs": {},
-     "created_at": "2026-10-25T09:00:00Z",
-     "in_flight": [
-      "implement@1"
-     ]
+    {
+      "after_ms": 1500,
+      "graph": {
+        "run": {
+          "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
+          "workflow": "vetinari-feature-01JB7ZQ3XK",
+          "version": 1,
+          "state": "active",
+          "outputs": {},
+          "created_at": "2026-10-25T09:00:00Z",
+          "in_flight": [
+            "implement@1"
+          ]
+        },
+        "seq": 8,
+        "nodes": [
+          {
+            "id": "intake",
+            "kind": "loop",
+            "body": [
+              "preflight",
+              "ask-info"
+            ],
+            "exit": {
+              "node": "preflight",
+              "when": "ready"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "preflight",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "intake"
+          },
+          {
+            "id": "ask-info",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": "intake"
+          },
+          {
+            "id": "rework",
+            "kind": "loop",
+            "body": [
+              "implement",
+              "review"
+            ],
+            "exit": {
+              "node": "review",
+              "when": "approved"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "implement",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review-stuck",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": null
+          },
+          {
+            "id": "open-pr",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": null
+          }
+        ],
+        "edges": [
+          {
+            "from": "preflight",
+            "to": "ask-info",
+            "when": "needs-info"
+          },
+          {
+            "from": "intake",
+            "to": "rework",
+            "when": "done"
+          },
+          {
+            "from": "implement",
+            "to": "review",
+            "when": "implemented"
+          },
+          {
+            "from": "rework",
+            "to": "open-pr",
+            "when": "done"
+          },
+          {
+            "from": "rework",
+            "to": "review-stuck",
+            "when": "exhausted"
+          },
+          {
+            "from": "review-stuck",
+            "to": "open-pr",
+            "when": "open-anyway"
+          }
+        ],
+        "instances": [
+          {
+            "instance": "intake",
+            "branch": "done",
+            "status": "done",
+            "attempt": 1,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "preflight@1",
+            "branch": "ready",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "rework",
+            "iteration": 1,
+            "status": "looping",
+            "attempt": null,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "implement@1",
+            "worker": "hex",
+            "expires_at": "2026-10-25T10:30:00Z",
+            "attempt": 1,
+            "status": "claimed",
+            "first_ready_at": null,
+            "finished_at": null
+          }
+        ]
+      }
     },
-    "seq": 8,
-    "nodes": [
-     {
-      "id": "intake",
-      "kind": "loop",
-      "body": [
-       "preflight",
-       "ask-info"
-      ],
-      "exit": {
-       "node": "preflight",
-       "when": "ready"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "preflight",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "intake"
-     },
-     {
-      "id": "ask-info",
-      "kind": "external",
-      "queue": "vetinari-hex-human",
-      "scope": "intake"
-     },
-     {
-      "id": "rework",
-      "kind": "loop",
-      "body": [
-       "implement",
-       "review"
-      ],
-      "exit": {
-       "node": "review",
-       "when": "approved"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "implement",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review-stuck",
-      "kind": "external",
-      "queue": "vetinari-hex-human"
-     },
-     {
-      "id": "open-pr",
-      "kind": "external",
-      "queue": "vetinari-hex-agent"
-     }
-    ],
-    "edges": [
-     {
-      "from": "intake",
-      "to": "rework"
-     },
-     {
-      "from": "preflight",
-      "to": "ask-info",
-      "when": "needs-info"
-     },
-     {
-      "from": "implement",
-      "to": "review"
-     },
-     {
-      "from": "rework",
-      "to": "open-pr",
-      "when": "approved"
-     },
-     {
-      "from": "rework",
-      "to": "review-stuck",
-      "when": "exhausted"
-     }
-    ],
-    "instances": [
-     {
-      "instance": "intake",
-      "state": "done",
-      "branch": "ready"
-     },
-     {
-      "instance": "preflight@1",
-      "state": "done",
-      "branch": "ready",
-      "attempt": 1
-     },
-     {
-      "instance": "rework",
-      "state": "looping",
-      "iteration": 1
-     },
-     {
-      "instance": "implement@1",
-      "state": "claimed",
-      "worker": "hex",
-      "expires_at": "2026-10-25T10:30:00Z",
-      "attempt": 1
-     }
-    ]
-   }
-  },
-  {
-   "after_ms": 3000,
-   "graph": {
-    "run": {
-     "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
-     "workflow": "vetinari-feature-01JB7ZQ3XK",
-     "version": 1,
-     "state": "active",
-     "outputs": {},
-     "created_at": "2026-10-25T09:00:00Z",
-     "in_flight": [
-      "implement@2"
-     ]
+    {
+      "after_ms": 3000,
+      "graph": {
+        "run": {
+          "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
+          "workflow": "vetinari-feature-01JB7ZQ3XK",
+          "version": 1,
+          "state": "active",
+          "outputs": {},
+          "created_at": "2026-10-25T09:00:00Z",
+          "in_flight": [
+            "implement@2"
+          ]
+        },
+        "seq": 14,
+        "nodes": [
+          {
+            "id": "intake",
+            "kind": "loop",
+            "body": [
+              "preflight",
+              "ask-info"
+            ],
+            "exit": {
+              "node": "preflight",
+              "when": "ready"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "preflight",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "intake"
+          },
+          {
+            "id": "ask-info",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": "intake"
+          },
+          {
+            "id": "rework",
+            "kind": "loop",
+            "body": [
+              "implement",
+              "review"
+            ],
+            "exit": {
+              "node": "review",
+              "when": "approved"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "implement",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review-stuck",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": null
+          },
+          {
+            "id": "open-pr",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": null
+          }
+        ],
+        "edges": [
+          {
+            "from": "preflight",
+            "to": "ask-info",
+            "when": "needs-info"
+          },
+          {
+            "from": "intake",
+            "to": "rework",
+            "when": "done"
+          },
+          {
+            "from": "implement",
+            "to": "review",
+            "when": "implemented"
+          },
+          {
+            "from": "rework",
+            "to": "open-pr",
+            "when": "done"
+          },
+          {
+            "from": "rework",
+            "to": "review-stuck",
+            "when": "exhausted"
+          },
+          {
+            "from": "review-stuck",
+            "to": "open-pr",
+            "when": "open-anyway"
+          }
+        ],
+        "instances": [
+          {
+            "instance": "intake",
+            "branch": "done",
+            "status": "done",
+            "attempt": 1,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "preflight@1",
+            "branch": "ready",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "rework",
+            "iteration": 2,
+            "status": "looping",
+            "attempt": null,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "implement@1",
+            "branch": "implemented",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "review@1",
+            "branch": "changes-requested",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "implement@2",
+            "worker": "hex",
+            "expires_at": "2026-10-25T10:30:00Z",
+            "attempt": 1,
+            "status": "claimed",
+            "first_ready_at": null,
+            "finished_at": null
+          }
+        ]
+      }
     },
-    "seq": 14,
-    "nodes": [
-     {
-      "id": "intake",
-      "kind": "loop",
-      "body": [
-       "preflight",
-       "ask-info"
-      ],
-      "exit": {
-       "node": "preflight",
-       "when": "ready"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "preflight",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "intake"
-     },
-     {
-      "id": "ask-info",
-      "kind": "external",
-      "queue": "vetinari-hex-human",
-      "scope": "intake"
-     },
-     {
-      "id": "rework",
-      "kind": "loop",
-      "body": [
-       "implement",
-       "review"
-      ],
-      "exit": {
-       "node": "review",
-       "when": "approved"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "implement",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review-stuck",
-      "kind": "external",
-      "queue": "vetinari-hex-human"
-     },
-     {
-      "id": "open-pr",
-      "kind": "external",
-      "queue": "vetinari-hex-agent"
-     }
-    ],
-    "edges": [
-     {
-      "from": "intake",
-      "to": "rework"
-     },
-     {
-      "from": "preflight",
-      "to": "ask-info",
-      "when": "needs-info"
-     },
-     {
-      "from": "implement",
-      "to": "review"
-     },
-     {
-      "from": "rework",
-      "to": "open-pr",
-      "when": "approved"
-     },
-     {
-      "from": "rework",
-      "to": "review-stuck",
-      "when": "exhausted"
-     }
-    ],
-    "instances": [
-     {
-      "instance": "intake",
-      "state": "done",
-      "branch": "ready"
-     },
-     {
-      "instance": "preflight@1",
-      "state": "done",
-      "branch": "ready",
-      "attempt": 1
-     },
-     {
-      "instance": "rework",
-      "state": "looping",
-      "iteration": 2
-     },
-     {
-      "instance": "implement@1",
-      "state": "done",
-      "branch": null,
-      "attempt": 1
-     },
-     {
-      "instance": "review@1",
-      "state": "done",
-      "branch": "changes-requested",
-      "attempt": 1
-     },
-     {
-      "instance": "implement@2",
-      "state": "claimed",
-      "worker": "hex",
-      "expires_at": "2026-10-25T10:30:00Z",
-      "attempt": 1
-     }
-    ]
-   }
-  },
-  {
-   "after_ms": 3000,
-   "graph": {
-    "run": {
-     "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
-     "workflow": "vetinari-feature-01JB7ZQ3XK",
-     "version": 1,
-     "state": "completed",
-     "outputs": {},
-     "created_at": "2026-10-25T09:00:00Z"
-    },
-    "seq": 22,
-    "nodes": [
-     {
-      "id": "intake",
-      "kind": "loop",
-      "body": [
-       "preflight",
-       "ask-info"
-      ],
-      "exit": {
-       "node": "preflight",
-       "when": "ready"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "preflight",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "intake"
-     },
-     {
-      "id": "ask-info",
-      "kind": "external",
-      "queue": "vetinari-hex-human",
-      "scope": "intake"
-     },
-     {
-      "id": "rework",
-      "kind": "loop",
-      "body": [
-       "implement",
-       "review"
-      ],
-      "exit": {
-       "node": "review",
-       "when": "approved"
-      },
-      "max_iterations": 3,
-      "scope": null
-     },
-     {
-      "id": "implement",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review",
-      "kind": "external",
-      "queue": "vetinari-hex-agent",
-      "scope": "rework"
-     },
-     {
-      "id": "review-stuck",
-      "kind": "external",
-      "queue": "vetinari-hex-human"
-     },
-     {
-      "id": "open-pr",
-      "kind": "external",
-      "queue": "vetinari-hex-agent"
-     }
-    ],
-    "edges": [
-     {
-      "from": "intake",
-      "to": "rework"
-     },
-     {
-      "from": "preflight",
-      "to": "ask-info",
-      "when": "needs-info"
-     },
-     {
-      "from": "implement",
-      "to": "review"
-     },
-     {
-      "from": "rework",
-      "to": "open-pr",
-      "when": "approved"
-     },
-     {
-      "from": "rework",
-      "to": "review-stuck",
-      "when": "exhausted"
-     }
-    ],
-    "instances": [
-     {
-      "instance": "intake",
-      "state": "done",
-      "branch": "ready"
-     },
-     {
-      "instance": "preflight@1",
-      "state": "done",
-      "branch": "ready",
-      "attempt": 1
-     },
-     {
-      "instance": "rework",
-      "state": "done",
-      "branch": "approved"
-     },
-     {
-      "instance": "implement@1",
-      "state": "done",
-      "branch": null,
-      "attempt": 1
-     },
-     {
-      "instance": "review@1",
-      "state": "done",
-      "branch": "changes-requested",
-      "attempt": 1
-     },
-     {
-      "instance": "implement@2",
-      "state": "done",
-      "branch": null,
-      "attempt": 1
-     },
-     {
-      "instance": "review@2",
-      "state": "done",
-      "branch": "approved",
-      "attempt": 1
-     },
-     {
-      "instance": "review-stuck",
-      "state": "skipped"
-     },
-     {
-      "instance": "open-pr",
-      "state": "done",
-      "branch": "opened",
-      "attempt": 1
-     }
-    ]
-   }
-  }
- ]
+    {
+      "after_ms": 3000,
+      "graph": {
+        "run": {
+          "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
+          "workflow": "vetinari-feature-01JB7ZQ3XK",
+          "version": 1,
+          "state": "completed",
+          "outputs": {},
+          "created_at": "2026-10-25T09:00:00Z"
+        },
+        "seq": 22,
+        "nodes": [
+          {
+            "id": "intake",
+            "kind": "loop",
+            "body": [
+              "preflight",
+              "ask-info"
+            ],
+            "exit": {
+              "node": "preflight",
+              "when": "ready"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "preflight",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "intake"
+          },
+          {
+            "id": "ask-info",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": "intake"
+          },
+          {
+            "id": "rework",
+            "kind": "loop",
+            "body": [
+              "implement",
+              "review"
+            ],
+            "exit": {
+              "node": "review",
+              "when": "approved"
+            },
+            "max_iterations": 3,
+            "scope": null
+          },
+          {
+            "id": "implement",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": "rework"
+          },
+          {
+            "id": "review-stuck",
+            "kind": "external",
+            "queue": "vetinari-hex-human",
+            "scope": null
+          },
+          {
+            "id": "open-pr",
+            "kind": "external",
+            "queue": "vetinari-hex-agent",
+            "scope": null
+          }
+        ],
+        "edges": [
+          {
+            "from": "preflight",
+            "to": "ask-info",
+            "when": "needs-info"
+          },
+          {
+            "from": "intake",
+            "to": "rework",
+            "when": "done"
+          },
+          {
+            "from": "implement",
+            "to": "review",
+            "when": "implemented"
+          },
+          {
+            "from": "rework",
+            "to": "open-pr",
+            "when": "done"
+          },
+          {
+            "from": "rework",
+            "to": "review-stuck",
+            "when": "exhausted"
+          },
+          {
+            "from": "review-stuck",
+            "to": "open-pr",
+            "when": "open-anyway"
+          }
+        ],
+        "instances": [
+          {
+            "instance": "intake",
+            "branch": "done",
+            "status": "done",
+            "attempt": 1,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "preflight@1",
+            "branch": "ready",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "rework",
+            "branch": "done",
+            "status": "done",
+            "attempt": 1,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "implement@1",
+            "branch": "implemented",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "review@1",
+            "branch": "changes-requested",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "implement@2",
+            "branch": "implemented",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "review@2",
+            "branch": "approved",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "review-stuck",
+            "status": "skipped",
+            "attempt": null,
+            "first_ready_at": null,
+            "finished_at": null
+          },
+          {
+            "instance": "open-pr",
+            "branch": "opened",
+            "attempt": 1,
+            "status": "done",
+            "first_ready_at": null,
+            "finished_at": null
+          }
+        ]
+      }
+    }
+  ]
 }

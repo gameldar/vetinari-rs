@@ -4,45 +4,169 @@
     "workflow": "vetinari-feature-01JB7ZQ3XK",
     "version": 1,
     "state": "active",
-    "in_flight": ["rework", "review@2"],
+    "in_flight": [
+      "rework",
+      "review@2"
+    ],
     "outputs": {},
     "created_at": "2026-10-25T09:00:00Z"
   },
   "seq": 17,
   "nodes": [
-    { "id": "intake", "kind": "loop", "body": ["preflight", "ask-info"],
-      "exit": { "node": "preflight", "when": "ready" }, "max_iterations": 3, "scope": null },
-    { "id": "preflight", "kind": "external", "queue": "vetinari-hex-agent", "scope": "intake" },
-    { "id": "ask-info", "kind": "external", "queue": "vetinari-hex-human", "scope": "intake" },
-    { "id": "rework", "kind": "loop", "body": ["implement", "review"],
-      "exit": { "node": "review", "when": "approved" }, "max_iterations": 3, "scope": null },
-    { "id": "implement", "kind": "external", "queue": "vetinari-hex-agent", "scope": "rework" },
-    { "id": "review", "kind": "external", "queue": "vetinari-hex-agent", "scope": "rework" },
-    { "id": "review-stuck", "kind": "external", "queue": "vetinari-hex-human" },
-    { "id": "open-pr", "kind": "external", "queue": "vetinari-hex-agent" }
+    {
+      "id": "intake",
+      "kind": "loop",
+      "body": [
+        "preflight",
+        "ask-info"
+      ],
+      "exit": {
+        "node": "preflight",
+        "when": "ready"
+      },
+      "max_iterations": 3,
+      "scope": null
+    },
+    {
+      "id": "preflight",
+      "kind": "external",
+      "queue": "vetinari-hex-agent",
+      "scope": "intake"
+    },
+    {
+      "id": "ask-info",
+      "kind": "external",
+      "queue": "vetinari-hex-human",
+      "scope": "intake"
+    },
+    {
+      "id": "rework",
+      "kind": "loop",
+      "body": [
+        "implement",
+        "review"
+      ],
+      "exit": {
+        "node": "review",
+        "when": "approved"
+      },
+      "max_iterations": 3,
+      "scope": null
+    },
+    {
+      "id": "implement",
+      "kind": "external",
+      "queue": "vetinari-hex-agent",
+      "scope": "rework"
+    },
+    {
+      "id": "review",
+      "kind": "external",
+      "queue": "vetinari-hex-agent",
+      "scope": "rework"
+    },
+    {
+      "id": "review-stuck",
+      "kind": "external",
+      "queue": "vetinari-hex-human",
+      "scope": null
+    },
+    {
+      "id": "open-pr",
+      "kind": "external",
+      "queue": "vetinari-hex-agent",
+      "scope": null
+    }
   ],
   "edges": [
-    { "from": "intake", "to": "rework" },
-    { "from": "preflight", "to": "ask-info", "when": "needs-info" },
-    { "from": "implement", "to": "review" },
-    { "from": "rework", "to": "open-pr", "when": "approved" },
-    { "from": "rework", "to": "review-stuck", "when": "exhausted" }
+    {
+      "from": "preflight",
+      "to": "ask-info",
+      "when": "needs-info"
+    },
+    {
+      "from": "intake",
+      "to": "rework",
+      "when": "done"
+    },
+    {
+      "from": "implement",
+      "to": "review",
+      "when": "implemented"
+    },
+    {
+      "from": "rework",
+      "to": "open-pr",
+      "when": "done"
+    },
+    {
+      "from": "rework",
+      "to": "review-stuck",
+      "when": "exhausted"
+    },
+    {
+      "from": "review-stuck",
+      "to": "open-pr",
+      "when": "open-anyway"
+    }
   ],
   "instances": [
-    { "instance": "intake", "state": "done", "branch": "ready", "attempt": null,
-      "first_ready_at": "2026-10-25T09:00:00Z", "finished_at": "2026-10-25T09:04:00Z" },
-    { "instance": "preflight@1", "state": "done", "branch": "ready", "attempt": 1,
-      "first_ready_at": "2026-10-25T09:00:00Z", "finished_at": "2026-10-25T09:04:00Z" },
-    { "instance": "rework", "state": "looping", "iteration": 2, "attempt": null,
-      "first_ready_at": "2026-10-25T09:04:00Z", "finished_at": null },
-    { "instance": "implement@1", "state": "done", "branch": null, "attempt": 1,
-      "first_ready_at": "2026-10-25T09:04:00Z", "finished_at": "2026-10-25T09:42:00Z" },
-    { "instance": "review@1", "state": "done", "branch": "changes-requested", "attempt": 1,
-      "first_ready_at": "2026-10-25T09:42:00Z", "finished_at": "2026-10-25T09:50:00Z" },
-    { "instance": "implement@2", "state": "done", "branch": null, "attempt": 1,
-      "first_ready_at": "2026-10-25T09:50:00Z", "finished_at": "2026-10-25T10:20:00Z" },
-    { "instance": "review@2", "state": "claimed", "worker": "hex",
-      "expires_at": "2026-10-25T10:30:00Z", "attempt": 1,
-      "first_ready_at": "2026-10-25T10:20:00Z", "finished_at": null }
+    {
+      "instance": "intake",
+      "status": "done",
+      "branch": "done",
+      "attempt": 1,
+      "first_ready_at": "2026-10-25T09:00:00Z",
+      "finished_at": "2026-10-25T09:04:00Z"
+    },
+    {
+      "instance": "preflight@1",
+      "status": "done",
+      "branch": "ready",
+      "attempt": 1,
+      "first_ready_at": "2026-10-25T09:00:00Z",
+      "finished_at": "2026-10-25T09:04:00Z"
+    },
+    {
+      "instance": "rework",
+      "status": "looping",
+      "iteration": 2,
+      "attempt": 1,
+      "first_ready_at": "2026-10-25T09:04:00Z",
+      "finished_at": null
+    },
+    {
+      "instance": "implement@1",
+      "status": "done",
+      "branch": "implemented",
+      "attempt": 1,
+      "first_ready_at": "2026-10-25T09:04:00Z",
+      "finished_at": "2026-10-25T09:42:00Z"
+    },
+    {
+      "instance": "review@1",
+      "status": "done",
+      "branch": "changes-requested",
+      "attempt": 1,
+      "first_ready_at": "2026-10-25T09:42:00Z",
+      "finished_at": "2026-10-25T09:50:00Z"
+    },
+    {
+      "instance": "implement@2",
+      "status": "done",
+      "branch": "implemented",
+      "attempt": 1,
+      "first_ready_at": "2026-10-25T09:50:00Z",
+      "finished_at": "2026-10-25T10:20:00Z"
+    },
+    {
+      "instance": "review@2",
+      "status": "claimed",
+      "worker": "hex",
+      "expires_at": "2026-10-25T10:30:00Z",
+      "attempt": 1,
+      "first_ready_at": "2026-10-25T10:20:00Z",
+      "finished_at": null
+    }
   ]
 }

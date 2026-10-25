@@ -459,10 +459,10 @@ pub(crate) mod tests {
                 external("open-pr", None, false),
             ],
             edges: vec![
-                edge("intake", "rework", Some("ready")),
+                edge("intake", "rework", Some("done")),
                 edge("preflight", "ask-info", Some("needs-info")),
                 edge("implement", "review", None),
-                edge("rework", "open-pr", Some("approved")),
+                edge("rework", "open-pr", Some("done")),
                 edge("rework", "review-stuck", Some("exhausted")),
                 edge("review-stuck", "open-pr", Some("open-anyway")),
             ],

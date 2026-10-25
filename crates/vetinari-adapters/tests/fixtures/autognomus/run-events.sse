@@ -1,10 +1,10 @@
 : connected
 
 event: started
-data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK","seq":1,"at":"2026-10-25T09:00:00Z"}
+data: {"seq":1,"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK"}
 
 event: node.ready
-data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK","instance":"preflight@1","attempt":null,"at":"2026-10-25T09:00:00Z","seq":2}
+data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK","instance":"preflight@1","attempt":1,"at":"2026-10-25T09:00:00Z","seq":2}
 
 event: node.dispatched
 data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK","instance":"preflight@1","attempt":1,"at":"2026-10-25T09:00:01Z","seq":3}
@@ -22,7 +22,7 @@ event: node.completed
 data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK","instance":"preflight@1","attempt":1,"at":"2026-10-25T09:04:00Z","seq":7,"branch":"ready"}
 
 event: loop.iteration
-data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","instance":"rework","iteration":2,"seq":8}
+data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK","instance":"rework","at":"2026-10-25T09:50:00Z","seq":8,"iteration":2}
 
 event: node.failed
 data: {"run":"01JB7ZR2M4Q9V8C6T3N5HKD0WX","workflow":"vetinari-feature-01JB7ZQ3XK","instance":"implement@2","attempt":1,"at":"2026-10-25T10:00:00Z","seq":9,"error":"agent crashed","will_retry":true}

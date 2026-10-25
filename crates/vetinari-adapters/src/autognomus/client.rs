@@ -584,7 +584,11 @@ mod tests {
     }
 
     fn conflict(reason: &str) -> (u16, String) {
-        (409, json!({ "reason": reason }).to_string())
+        (
+            409,
+            json!({ "error": { "code": reason, "message": "conflict" }, "reason": reason })
+                .to_string(),
+        )
     }
 
     // Claim
@@ -798,17 +802,19 @@ mod tests {
     // Reaching the gateway
 
     #[tokio::test]
-    async fn an_engine_that_is_down_is_unavailable() {
-        let server = MockServer::start(vec![(
-            503,
-            json!({ "error": { "code": "unavailable", "message": "engine down" } }).to_string(),
-        )])
-        .await;
-        let error = gateway(&server)
-            .heartbeat(&task(), &lease())
-            .await
-            .expect_err("down");
-        assert!(error.is_transient(), "{error:?}");
+    async fn an_engine_that_is_down_or_slow_is_unavailable() {
+        for (status, code) in [(502, "workflow_unavailable"), (504, "workflow_timeout")] {
+            let server = MockServer::start(vec![(
+                status,
+                json!({ "error": { "code": code, "message": "engine down" } }).to_string(),
+            )])
+            .await;
+            let error = gateway(&server)
+                .heartbeat(&task(), &lease())
+                .await
+                .expect_err("down");
+            assert!(error.is_transient(), "{status}: {error:?}");
+        }
     }
 
     #[tokio::test]
@@ -1034,7 +1040,8 @@ mod tests {
             (204, String::new()),
             (
                 409,
-                json!({ "error": { "code": "conflict", "message": "finished" } }).to_string(),
+                json!({ "error": { "code": "gone", "message": "run finished" }, "reason": "gone" })
+                    .to_string(),
             ),
         ])
         .await;
@@ -1130,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_the_gateway_cannot_serve_is_unavailable() {
-        let server = MockServer::start(vec![(503, String::new())]).await;
+        let server = MockServer::start(vec![(502, String::new())]).await;
         let error = gateway(&server)
             .subscribe()
             .await

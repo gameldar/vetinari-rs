@@ -419,7 +419,7 @@ mod tests {
 
     fn second_round() -> Vec<InstanceState> {
         vec![
-            state("intake", done(Some("ready"))),
+            state("intake", done(Some("done"))),
             state("preflight@1", done(Some("ready"))),
             state("rework", InstanceStatus::Looping { iteration: nz(2) }),
             state("implement@1", done(None)),
@@ -487,7 +487,7 @@ mod tests {
     fn a_step_in_flight_but_not_here_is_elsewhere() {
         let summary = summary(
             vec![
-                state("intake", done(Some("ready"))),
+                state("intake", done(Some("done"))),
                 state("preflight@1", done(Some("ready"))),
                 state("rework", InstanceStatus::Looping { iteration: nz(1) }),
                 state(
@@ -537,9 +537,9 @@ mod tests {
     fn a_finished_run_keeps_the_round_a_loop_took_more_than_one_of() {
         let summary = summary(
             vec![
-                state("intake", done(Some("ready"))),
+                state("intake", done(Some("done"))),
                 state("preflight@1", done(Some("ready"))),
-                state("rework", done(Some("approved"))),
+                state("rework", done(Some("done"))),
                 state("implement@1", done(None)),
                 state("review@1", done(Some("changes-requested"))),
                 state("implement@2", done(None)),

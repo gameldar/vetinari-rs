@@ -219,7 +219,7 @@ mod tests {
         feature_graph(
             9,
             vec![
-                state("intake", done(Some("ready"))),
+                state("intake", done(Some("done"))),
                 state("preflight@1", done(Some("ready"))),
                 state("rework", InstanceStatus::Looping { iteration: nz(2) }),
                 state("implement@1", done(None)),

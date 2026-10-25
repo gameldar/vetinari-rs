@@ -314,7 +314,7 @@ pub enum NodeKindReply {
 pub struct InstanceReply {
     /// The instance.
     pub instance: String,
-    /// Where it is, tagged by `state`.
+    /// Where it is, tagged by `status`.
     #[serde(flatten)]
     pub status: InstanceStatusReply,
     /// The current attempt.
@@ -328,9 +328,9 @@ pub struct InstanceReply {
     pub finished_at: Option<OffsetDateTime>,
 }
 
-/// The engine's `InstanceStatus`.
+/// The engine's `InstanceStatus`, tagged by `status` beside the instance.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "state", rename_all = "lowercase")]
+#[serde(tag = "status", rename_all = "lowercase")]
 pub enum InstanceStatusReply {
     /// Ready.
     Ready,
@@ -904,9 +904,9 @@ mod tests {
             graph.nodes[4].scope,
             Some(NodeId::parse("rework").expect("id"))
         );
-        assert_eq!(graph.edges.len(), 5);
+        assert_eq!(graph.edges.len(), 6);
         assert_eq!(
-            graph.edges[1].when,
+            graph.edges[0].when,
             Some(BranchLabel::parse("needs-info").expect("label"))
         );
         let claimed = graph.instances.last().expect("an instance");
@@ -968,8 +968,8 @@ mod tests {
     #[test]
     fn an_instance_with_a_status_this_copy_does_not_know_is_left_out() {
         let graph = graph_with_instances(serde_json::json!([
-            { "instance": "implement@1", "state": "hibernating", "attempt": 1 },
-            { "instance": "review@1", "state": "ready" }
+            { "instance": "implement@1", "status": "hibernating", "attempt": 1 },
+            { "instance": "review@1", "status": "ready" }
         ]));
         assert_eq!(graph.instances.len(), 1);
         assert_eq!(graph.instances[0].instance.to_string(), "review@1");
@@ -1115,7 +1115,12 @@ mod tests {
                     seq: 1,
                     status: RunStatus::Active
                 },
-                node(2, None, datetime!(2026-10-25 09:00 UTC), NodeChange::Ready),
+                node(
+                    2,
+                    Some(1),
+                    datetime!(2026-10-25 09:00 UTC),
+                    NodeChange::Ready
+                ),
                 node(
                     3,
                     Some(1),

@@ -413,10 +413,11 @@ The adapter folds the engine's legacy `running` and `suspended`, and any state i
 into `Active`, so such a run stays watched. An instance whose status it does not know is left out
 of the graph, as if not reached, and logged; the next event or refetch brings it back.
 
-The engine spec gives these types but not their serde shape. The fixtures follow the engine's
-own views (`RunView`, `TaskView`): a status flattened beside its fields and tagged by `state`, a
-node kind flattened and tagged by `kind`, lowercase, timestamps RFC 3339. That is a point to
-settle with the gateway when the graph endpoint lands (13).
+The serde shape is the gateway's own (autognomus b4ea408, `autognomus-workflow-api/src/view.rs`):
+a run's state flattened beside its fields and tagged by `state`, an instance's status flattened
+and tagged by `status`, a node kind flattened and tagged by `kind`, lowercase, timestamps RFC
+3339. A loop instance finishes `done` with branch `done` or `exhausted`, at attempt 1. The
+fixtures were rewritten to it; the earlier guess had instances tagged by `state`.
 
 Three pure functions sit on it:
 
@@ -642,17 +643,20 @@ The HTTP adapter maps statuses onto these, and nothing else does:
 |---|---|
 | `200` claim / `204` claim | `Some(task)` / `None` |
 | `200 { expires_at }` | `Extended` |
-| `409 { reason: stale }` / `409 { reason: gone }` | `Stale` / `Gone` |
+| `409 { error, reason: stale }` / `409 { error, reason: gone }` | `Stale` / `Gone`; `reason` sits beside `error` |
 | `404` | `NotFound` |
 | `422` on complete | `PortError::Protocol`: a bug in vetinari's output, logged, then `fail permanent` |
+| `400` | `PortError::Refused`: a malformed id or queue, a bug on vetinari's side |
 | `401` | refresh the token once and retry; then `PortError::Unauthenticated` |
-| `503`, connect error, timeout | `PortError::Unavailable`, which `is_transient` |
+| `502 workflow_unavailable`, `504 workflow_timeout`, any other `5xx`, connect error, timeout | `PortError::Unavailable`, which `is_transient` |
 
 The adapter takes its token from a small `Bearer` trait of its own (`token(refresh)`), with a
 `StaticBearer` for a local gateway; slice 13 implements it over `AuthService`. Until then
 `Provider::Autognomus` does not exist, so a `401` that survives the refresh is
 `PortError::Refused` rather than `Unauthenticated`; slice 13 changes it, and the claim loop's
-"needs sign-in" waits on that. `429` is treated as `503`. A claim's request timeout is its
+"needs sign-in" waits on that. `429` is treated as a `5xx`. Cancelling a finished run is
+`409 { reason: gone }`, which `cancel` reads as `AlreadyFinished`. Every error body is
+`{"error": {"code", "message"}}` (autognomus `http/error.rs`). A claim's request timeout is its
 `wait` plus the client's usual 20 seconds, since the long-poll outlasts the default.
 
 ### 7.2 Claiming
@@ -894,9 +898,10 @@ once. Runs of other workflows on the same gateway are ignored.
 yields domain `RunEvent`s until it returns `None`; a dropped connection reads as a closed one,
 since either may have lost events and the reopen refetches. `HttpGateway` implements it, beside
 the task and run endpoints, so the token refresh is shared; `sse.rs` holds only the framing.
-The engine spec names the messages `event: <transition>` without saying how run, node and loop
-events are told apart, so the adapter reads the bus subject without `ag.run.` (`node.ready`,
-`loop.iteration`, `completed`) and the fixture says so (13). A message it cannot name, but whose
+The gateway names each message by its bus subject without `ag.run.` (`node.ready`,
+`node.offered`, `loop.iteration`, `completed`, `failed`, `cancelled`), confirmed against
+autognomus b4ea408 `http/run_events.rs`; a stream that falls behind gets `resync` and then ends,
+which the reopen and refetch already cover. Every node event carries a numeric `attempt`. A message it cannot name, but whose
 `run` and `seq` it can read, is `RunEvent::Changed`, which `apply` answers with a refetch; one it
 cannot read at all is skipped and logged, and the `seq` gap it leaves does the same. A `resync`
 counts even with empty data. One connection lasts at most six hours, because the client's 20
@@ -1132,9 +1137,9 @@ ways of doing one thing. The extension it needs is a reply that streams lines wi
 `crates/vetinari-adapters/tests/fixtures/autognomus/` holds the JSON the adapter must read and
 write: the two node variants from engine spec 8.4, a claim reply, a `RunGraphView` for each
 `InstanceStatus`, a node event for each transition, and each `409` body. Each file names the
-autognomus commit it was taken from. When the gateway lands, the fixtures are regenerated from
-its own tests rather than the spec, and any difference is a bug on one side to be settled before
-merging.
+autognomus commit it was taken from. As built they are checked against the gateway's own types
+and tests at autognomus b4ea408 (`sources.txt` names each file), and any difference is a bug on
+one side to be settled before merging.
 
 A live test against a real gateway, run with podman compose under `$AGENTPOD_WORK_HOST`, is
 `#[ignore]` and opt-in by environment variable. It drives one run of a two-step template through

@@ -1,58 +1,61 @@
-Where each fixture came from. Regenerate from the gateway's own tests once
-its External and Loop endpoints land; any difference is a bug on one side.
+Where each fixture came from. All are checked against autognomus
+b4ea408, whose
+autognomus-hub/tests/http_tasks.rs drives the same JSON end to end. Any
+difference from the gateway is a bug on one side.
 
 public-node-external.json
 public-node-loop.json
-    autognomus 786bd8455783af3eaa1abba2357b5900d6afde1f,
-    docs/superpowers/specs/2026-10-25-external-tasks-loops-and-run-visibility-design.md
-    section 8.4, rewritten to the resolved shape: internally tagged by
-    `kind` as `PublicNode` is, and `retry.attempts` as `RetrySpec` is.
+    autognomus-gateway/src/domain/workflow.rs: `PublicNode` (tagged by
+    `kind`, lowercase), `RetrySpec`, `PublicLoopExit`.
 
 feature-from-ticket.workflow.json
     Written by hand from the dev workflows design (4.3, 4.4) as the body
-    vetinari must register for one feature-from-ticket run. `triggers`
-    follows autognomus-gateway/src/http/workflows.rs at the same commit.
+    vetinari registers for one feature-from-ticket run, in the shape of
+    autognomus-gateway/src/domain/workflow.rs (`PublicNode`,
+    `PublicEdge`, `PublicTrigger`).
 
 claim-preflight-first.json
 claim-implement-rework.json
 claim-open-pr.json
-    autognomus 786bd8455783af3eaa1abba2357b5900d6afde1f, engine spec
-    section 5.3 (the `Task` a claim replies with) and 5.4 (the loop
-    envelope and loop output), with `TaskId` in the resolved
-    `<run>~<instance>~<attempt>` form. `config` is the matching node's
-    config from feature-from-ticket.workflow.json.
+    autognomus-workflow-api/src/task.rs (`Task`, `TaskId` as
+    `<run>~<instance>~<attempt>`) and autognomus-workflow/src/run.rs (the
+    loop envelope `{input, iteration, previous?}`). `config` is the
+    matching node's config from feature-from-ticket.workflow.json.
 
 run-graph.json
 instance-statuses.json
-    autognomus 0c95213, engine spec section 6 (`RunGraphView`,
-    `GraphNode`, `InstanceView`, `InstanceStatus`) and the amended
-    `RunStateView` (`Pending | Active { in_flight } | Completed | Failed
-    | Cancelled`). The spec gives the types, not their serde shape; the
-    shape here follows the engine's own views (`RunView`, `TaskView`):
-    a status flattened beside its fields and tagged by `state`, a node
-    kind flattened and tagged by `kind`, lowercase, timestamps RFC 3339.
-    Confirm against the gateway when the graph endpoint lands.
+    autognomus-workflow-api/src/view.rs: `RunGraphView` (`run`, `seq`,
+    `nodes`, `edges`, `instances`), `GraphNode` with `GraphNodeKind`
+    flattened and tagged by `kind`, `InstanceView` with `InstanceStatus`
+    flattened and tagged by `status`, and autognomus-workflow-api/src/
+    graph.rs `Edge`. A loop instance finishes `done` with branch `done`
+    or `exhausted` at attempt 1. Edges are what compile emits.
 
 run-view.json
 workflow-runs.json
-    autognomus 0c95213, autognomus-workflow-api/src/view.rs (`RunView`,
-    outputs keyed by instance) with the amended state, and
+    autognomus-workflow-api/src/view.rs (`RunView`, `RunStateView`
+    flattened and tagged by `state`, outputs keyed by instance) and
     autognomus-gateway/src/http/runs.rs (`GET /v1/runs/{id}`,
     `GET /v1/workflows/{id}/runs` returning `[RunView]`).
 
 workflows.json
-    autognomus 0c95213, autognomus-gateway/src/http/workflows.rs
-    (`GET /v1/workflows` returning `[WorkflowView]`). Only `id` is read.
+    autognomus-gateway/src/domain/workflow.rs (`WorkflowView`, with
+    `callback` left out when unset) and autognomus-gateway/src/http/
+    workflows.rs (`GET /v1/workflows`). Only `id` is read.
 
 run-events.sse
-    autognomus 0c95213, engine spec sections 7.1 (node transitions and
-    their extra fields; every node event carries run, workflow, instance,
-    attempt, at and seq; `loop.iteration` carries run, instance,
-    iteration and seq), 7.3 (`seq`) and 8.2 (`event: <transition>` with
-    the event's JSON as data, and `event: resync`). The spec does not name
-    the SSE events beyond `<transition>`; the names here are the bus
-    subjects without `ag.run.` (`node.ready`, `loop.iteration`,
-    `completed`), which also tells run events from node events. Run
-    events follow autognomus-gateway/src/outbound/runs.rs (`run`,
-    `workflow`) with `seq` added. Confirm when gateway task 9 serves the
-    stream.
+    autognomus-gateway/src/http/run_events.rs (`event:` is the subject
+    without `ag.run.`, the data is the event's payload, and `resync` ends
+    the stream) and autognomus-workflow/src/service/events.rs,
+    service/external.rs and service.rs (every node event carries run,
+    workflow, instance, at, seq and a numeric attempt, plus its extras;
+    `loop.iteration` carries run, workflow, instance, at, seq and
+    iteration). Run events carry run, workflow and seq; `cancelled` adds
+    `at`, `failed` adds `node` and `error`.
+
+Error bodies
+    autognomus-gateway/src/http/error.rs: `{"error":{"code","message"}}`,
+    with `reason` beside `error` on a 409 (`stale`, `gone`). An engine
+    that is down is 502 `workflow_unavailable`, one that is slow 504
+    `workflow_timeout`; 400 is a malformed id or queue, 422 an output
+    that is not an object.
