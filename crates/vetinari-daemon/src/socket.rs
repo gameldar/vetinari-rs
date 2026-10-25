@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use vetinari_adapters::daemon::protocol::{
-    MAX_FRAME, Outbound, Request, change_event, detail_event, gate_result, hello_result,
-    parse_request, snapshot_event, stream_opened,
+    MAX_FRAME, Outbound, Request, auth_event, auth_status_result, challenge_event, change_event,
+    detail_event, gate_result, hello_result, parse_request, sign_in_ended_event, snapshot_event,
+    stream_opened,
 };
 use vetinari_core::application::devflow::api::{
     ApiError, BoardChange, ClientApi, RunDetail, RunItem,
@@ -27,7 +28,9 @@ use vetinari_core::domain::devflow::template::TemplateKind;
 
 use crate::gates::Gates;
 use crate::hub::Hub;
+use crate::signin::{SignIn, SignInOutcome};
 use crate::steps::LocalBoard;
+use vetinari_core::application::auth::AuthState;
 
 /// Bind the socket at `path`, in a directory only this user can enter. A
 /// socket file left by a daemon that is no longer running is replaced; one
@@ -61,6 +64,8 @@ pub struct Backend {
     pub local: Arc<LocalBoard>,
     /// The template every run is of.
     pub template: TemplateKind,
+    /// How the daemon signs in to its gateway; none for a script.
+    pub sign_in: Option<Arc<SignIn>>,
 }
 
 /// Serve every connection until the listener fails.
@@ -151,7 +156,15 @@ async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>, back
                 if outbox.send(opened).await.is_err() {
                     break;
                 }
-                let forwarding = forward(stream, snapshot, changes, hub.clone(), outbox.clone());
+                let sign_in = backend.sign_in.as_ref().map(|sign_in| sign_in.changes());
+                let forwarding = forward(
+                    stream,
+                    snapshot,
+                    changes,
+                    sign_in,
+                    hub.clone(),
+                    outbox.clone(),
+                );
                 streams.insert(stream, tokio::spawn(forwarding));
                 continue;
             }
@@ -209,6 +222,62 @@ async fn connection(stream: UnixStream, api: Arc<ClientApi>, hub: Arc<Hub>, back
                 Err(error) => Outbound::Error {
                     id: Some(id),
                     error: error.into(),
+                },
+            },
+            Ok((id, Request::AuthStatus)) => {
+                let state = match &backend.sign_in {
+                    Some(sign_in) => sign_in.state().await,
+                    None => AuthState::Valid,
+                };
+                Outbound::Reply {
+                    id,
+                    result: auth_status_result(state),
+                }
+            }
+            Ok((id, Request::AuthBegin)) => match &backend.sign_in {
+                None => Outbound::Error {
+                    id: Some(id),
+                    error: ApiError::Invalid(
+                        "this daemon replays a script and signs in to nothing".to_owned(),
+                    ),
+                },
+                Some(sign_in) => match sign_in.begin().await {
+                    Err(error) => Outbound::Error {
+                        id: Some(id),
+                        error: error.into(),
+                    },
+                    Ok((challenge, ended)) => {
+                        let stream = next_stream;
+                        next_stream += 1;
+                        let opened = Outbound::Reply {
+                            id,
+                            result: stream_opened(stream),
+                        };
+                        if outbox.send(opened).await.is_err() {
+                            break;
+                        }
+                        let outbox = outbox.clone();
+                        let forwarding = tokio::spawn(async move {
+                            let event = challenge_event(&challenge);
+                            if outbox
+                                .send(Outbound::Event { stream, event })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let event = match ended.await {
+                                Ok(SignInOutcome::Granted) => sign_in_ended_event(None),
+                                Ok(SignInOutcome::Rejected(reason)) => {
+                                    sign_in_ended_event(Some(&reason))
+                                }
+                                Err(_) => sign_in_ended_event(Some("the sign-in was abandoned")),
+                            };
+                            let _ = outbox.send(Outbound::Event { stream, event }).await;
+                        });
+                        streams.insert(stream, forwarding);
+                        continue;
+                    }
                 },
             },
             Ok((id, Request::StreamClose { stream })) => match streams.remove(&stream) {
@@ -290,34 +359,54 @@ impl Watching {
     }
 }
 
-/// A `runs.watch` stream: the snapshot, then each change. A watcher too slow
-/// to keep up is sent a fresh snapshot rather than a gap.
+/// A `runs.watch` stream: the snapshot, then each change, and whether the
+/// daemon needs a sign-in whenever that changes. A watcher too slow to keep
+/// up is sent a fresh snapshot rather than a gap.
 async fn forward(
     stream: u64,
     snapshot: Vec<RunItem>,
     mut changes: broadcast::Receiver<BoardChange>,
+    mut sign_in: Option<watch::Receiver<bool>>,
     hub: Arc<Hub>,
     outbox: mpsc::Sender<Outbound>,
 ) {
-    let mut event = snapshot_event(&snapshot);
-    loop {
-        if outbox
-            .send(Outbound::Event { stream, event })
-            .await
-            .is_err()
-        {
+    let send = |event| outbox.send(Outbound::Event { stream, event });
+    if send(snapshot_event(&snapshot)).await.is_err() {
+        return;
+    }
+    if let Some(needed) = sign_in.as_mut() {
+        let now = *needed.borrow_and_update();
+        if send(auth_event(now)).await.is_err() {
             return;
         }
-        event = match changes.recv().await {
-            Ok(change) => change_event(&change),
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                let (snapshot, fresh) = hub.watch();
-                changes = fresh;
-                snapshot_event(&snapshot)
-            }
-            Err(broadcast::error::RecvError::Closed) => return,
-        };
     }
+    loop {
+        let event = tokio::select! {
+            change = changes.recv() => match change {
+                Ok(change) => change_event(&change),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let (snapshot, fresh) = hub.watch();
+                    changes = fresh;
+                    snapshot_event(&snapshot)
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            Some(needed) = signed_in_change(sign_in.as_mut()) => auth_event(needed),
+        };
+        if send(event).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The next sign-in state, or never when the daemon signs in to nothing.
+async fn signed_in_change(sign_in: Option<&mut watch::Receiver<bool>>) -> Option<bool> {
+    if let Some(needed) = sign_in
+        && needed.changed().await.is_ok()
+    {
+        return Some(*needed.borrow_and_update());
+    }
+    std::future::pending().await
 }
 
 #[cfg(test)]
@@ -371,6 +460,10 @@ mod tests {
     }
 
     async fn server() -> Server {
+        server_with(None).await
+    }
+
+    async fn server_with(sign_in: Option<Arc<SignIn>>) -> Server {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vetinari").join("vetinarid.sock");
         let listener = bind(&path).expect("bind");
@@ -386,6 +479,7 @@ mod tests {
             gates: gates.clone(),
             local: LocalBoard::new().0,
             template: TemplateKind::FeatureFromTicket,
+            sign_in,
         });
         tokio::spawn(serve(listener, api, hub.clone(), backend));
         Server {
@@ -440,6 +534,82 @@ mod tests {
             .put_graph(graph("r1", InstanceStatus::Done { branch: None }));
         let second = client.frame().await;
         assert_eq!(second["event"]["rows"][0]["status"], json!("done"));
+    }
+
+    fn signing_in() -> (
+        Arc<SignIn>,
+        Arc<vetinari_core::testing::MemoryCredentialStore>,
+    ) {
+        use time::macros::datetime;
+        use vetinari_core::application::auth::AuthService;
+        use vetinari_core::testing::{FakeDeviceCodeFlow, FixedClock, MemoryCredentialStore};
+
+        let store = Arc::new(MemoryCredentialStore::default());
+        let auth = AuthService::new(
+            store.clone(),
+            Arc::new(FakeDeviceCodeFlow::new(0, datetime!(2026-10-25 10:00 UTC))),
+            Arc::new(FixedClock::new(datetime!(2026-10-25 09:00 UTC))),
+        );
+        (SignIn::new(Arc::new(auth)), store)
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_signs_in_to_nothing_is_signed_in_and_begins_nothing() {
+        let server = server().await;
+        let mut client = Client::connect(&server).await;
+        client.send(r#"{"id":1,"method":"auth.status"}"#).await;
+        assert_eq!(client.frame().await["result"]["state"], json!("valid"));
+        client.send(r#"{"id":2,"method":"auth.begin"}"#).await;
+        assert_eq!(client.frame().await["error"]["code"], json!("invalid"));
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_streams_its_challenge_then_its_end() {
+        let (sign_in, _store) = signing_in();
+        let server = server_with(Some(sign_in)).await;
+        let mut client = Client::connect(&server).await;
+        client.send(r#"{"id":1,"method":"auth.status"}"#).await;
+        assert_eq!(client.frame().await["result"]["state"], json!("missing"));
+
+        client.send(r#"{"id":2,"method":"auth.begin"}"#).await;
+        let stream = client.frame().await["result"]["stream"].clone();
+        let challenge = client.frame().await;
+        assert_eq!(challenge["stream"], stream);
+        assert_eq!(challenge["event"]["type"], json!("challenge"));
+        assert_eq!(challenge["event"]["user_code"], json!("WXYZ-1234"));
+        assert_eq!(client.frame().await["event"]["type"], json!("granted"));
+
+        client.send(r#"{"id":3,"method":"auth.status"}"#).await;
+        assert_eq!(client.frame().await["result"]["state"], json!("valid"));
+    }
+
+    #[tokio::test]
+    async fn a_board_watch_says_when_the_daemon_needs_a_sign_in() {
+        use vetinari_core::domain::credentials::{
+            CredentialKey, Provider, Secret, StoredCredential,
+        };
+
+        let (sign_in, store) = signing_in();
+        sign_in.lost();
+        let server = server_with(Some(sign_in.clone())).await;
+        let mut client = Client::connect(&server).await;
+        client.send(r#"{"id":1,"method":"runs.watch"}"#).await;
+        client.frame().await;
+        assert_eq!(client.frame().await["event"]["type"], json!("snapshot"));
+        assert_eq!(
+            client.frame().await["event"],
+            json!({ "type": "auth", "needs_sign_in": true })
+        );
+
+        store.seed(
+            &CredentialKey::new(Provider::Autognomus, None),
+            StoredCredential::oauth(Secret::new("jwt"), Some(Secret::new("r")), None),
+        );
+        sign_in.check().await;
+        assert_eq!(
+            client.frame().await["event"],
+            json!({ "type": "auth", "needs_sign_in": false })
+        );
     }
 
     #[tokio::test]

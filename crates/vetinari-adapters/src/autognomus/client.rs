@@ -31,6 +31,8 @@ use super::wire::{
     run_event,
 };
 use crate::HttpClient;
+use vetinari_core::application::auth::AuthService;
+use vetinari_core::domain::credentials::Provider;
 
 /// How errors from this backend name it.
 const WHAT: &str = "autognomus";
@@ -59,6 +61,31 @@ impl StaticBearer {
 impl Bearer for StaticBearer {
     async fn token(&self, _refresh: bool) -> PortResult<String> {
         Ok(self.0.clone())
+    }
+}
+
+/// The token vetinarid signed in for, renewed near its expiry and when
+/// the gateway refuses it. Only the daemon holds one: refresh tokens rotate
+/// on use.
+pub struct AuthBearer {
+    auth: Arc<AuthService>,
+}
+
+impl AuthBearer {
+    /// Read the autognomus credential through `auth`.
+    #[must_use]
+    pub const fn new(auth: Arc<AuthService>) -> Self {
+        Self { auth }
+    }
+}
+
+#[async_trait]
+impl Bearer for AuthBearer {
+    async fn token(&self, refresh: bool) -> PortResult<String> {
+        self.auth
+            .renewed_token(Provider::Autognomus, None, refresh)
+            .await
+            .map(|token| token.expose().to_owned())
     }
 }
 
@@ -100,9 +127,8 @@ impl HttpGateway {
         }
         let second = self.attempt(&method, path, body, timeout, true).await?;
         if second.status == StatusCode::UNAUTHORIZED {
-            return Err(PortError::Refused {
-                what: WHAT.to_owned(),
-                detail: "the gateway refused the token after a refresh".to_owned(),
+            return Err(PortError::Unauthenticated {
+                provider: Provider::Autognomus,
             });
         }
         Ok(second)
@@ -857,8 +883,52 @@ mod tests {
             .heartbeat(&task(), &lease())
             .await
             .expect_err("refused");
-        assert!(matches!(error, PortError::Refused { .. }), "{error:?}");
+        assert_eq!(
+            error,
+            PortError::Unauthenticated {
+                provider: Provider::Autognomus
+            }
+        );
         assert!(!error.is_transient());
+    }
+
+    #[tokio::test]
+    async fn the_signed_in_token_is_sent_renewed_when_refused() {
+        let server = MockServer::start(vec![
+            (401, String::new()),
+            (200, r#"{"expires_at":"2026-10-25T10:00:00Z"}"#.to_owned()),
+        ])
+        .await;
+        let store = Arc::new(vetinari_core::testing::MemoryCredentialStore::default());
+        store.seed(
+            &vetinari_core::domain::credentials::CredentialKey::new(Provider::Autognomus, None),
+            vetinari_core::domain::credentials::StoredCredential::oauth(
+                vetinari_core::domain::credentials::Secret::new("refused"),
+                Some(vetinari_core::domain::credentials::Secret::new("refresh")),
+                None,
+            ),
+        );
+        let clock = Arc::new(vetinari_core::testing::FixedClock::new(
+            time::macros::datetime!(2026-10-25 09:00 UTC),
+        ));
+        let auth = Arc::new(vetinari_core::application::auth::AuthService::new(
+            store,
+            Arc::new(vetinari_core::testing::FakeDeviceCodeFlow::new(
+                1,
+                time::macros::datetime!(2026-10-25 10:00 UTC),
+            )),
+            clock,
+        ));
+        gateway_with(&server.base_url, Arc::new(AuthBearer::new(auth)))
+            .heartbeat(&task(), &lease())
+            .await
+            .expect("extended");
+        let requests = server.requests();
+        assert_eq!(requests[0].header("authorization"), Some("Bearer refused"));
+        assert_eq!(
+            requests[1].header("authorization"),
+            Some("Bearer refreshed-access")
+        );
     }
 
     // Definitions and runs

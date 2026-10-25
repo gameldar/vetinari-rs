@@ -194,6 +194,13 @@ async fn auth(cli: Cli, provider: Option<String>, device: bool, forget: bool) ->
         return Ok(());
     };
     let provider: Provider = name.parse()?;
+    if provider.signs_in_through_the_daemon() {
+        return Err(format!(
+            "vetinarid holds the {} credential; run `vetinarid login`",
+            provider.display_name()
+        )
+        .into());
+    }
 
     if forget {
         let removed = runtime.auth.forget(provider, account).await?;

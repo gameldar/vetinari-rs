@@ -10,5 +10,6 @@ pub mod gates;
 pub mod hub;
 pub mod runtime;
 pub mod scripted;
+pub mod signin;
 pub mod socket;
 pub mod steps;

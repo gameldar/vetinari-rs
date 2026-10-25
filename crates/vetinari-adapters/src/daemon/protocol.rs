@@ -10,10 +10,12 @@ use std::num::NonZeroU32;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use vetinari_core::application::auth::AuthState;
 use vetinari_core::application::devflow::api::{
     ApiError, BoardChange, DetailRow, Hello, RunDetail, RunItem, RunLabel,
 };
 use vetinari_core::application::devflow::worker::GateReply;
+use vetinari_core::application::ports::DeviceCodeChallenge;
 use vetinari_core::domain::devflow::ids::{BranchLabel, NodeId, NodeInstance, RunId, TaskQueue};
 use vetinari_core::domain::devflow::lanes::{IterationSelection, Lane, LaneRow, RowKind};
 use vetinari_core::domain::devflow::notes::{ReviewFindings, RunNotes};
@@ -78,6 +80,10 @@ pub enum Request {
         /// The run.
         run: RunId,
     },
+    /// `auth.status`: whether the daemon is signed in to the gateway.
+    AuthStatus,
+    /// `auth.begin`: a stream of one sign-in, its challenge then its end.
+    AuthBegin,
 }
 
 /// A line that is not a request: its id when one could be read, so the
@@ -190,6 +196,8 @@ pub fn parse_request(line: &str) -> Result<(u64, Request), BadFrame> {
                 run: run_id(&run).map_err(invalid)?,
             }
         }
+        "auth.status" => Request::AuthStatus,
+        "auth.begin" => Request::AuthBegin,
         other => return Err(invalid(format!("no method {other:?}"))),
     };
     Ok((frame.id, request))
@@ -287,6 +295,87 @@ pub fn gate_result(reply: GateReply) -> Value {
         GateReply::Queued => json!({ "sent": false, "queued": true }),
         GateReply::NotOpen => json!({ "sent": false, "queued": false }),
     }
+}
+
+const fn auth_state_name(state: AuthState) -> &'static str {
+    match state {
+        AuthState::Missing => "missing",
+        AuthState::Valid => "valid",
+        AuthState::NearingExpiry => "nearing-expiry",
+        AuthState::Expired => "expired",
+        AuthState::Corrupt => "corrupt",
+    }
+}
+
+/// `auth.status`'s result: the state of the daemon's gateway credential.
+#[must_use]
+pub fn auth_status_result(state: AuthState) -> Value {
+    json!({ "state": auth_state_name(state) })
+}
+
+/// Read `auth.status`'s result.
+pub fn read_auth_status(value: &Value) -> Result<AuthState, String> {
+    let name = value["state"].as_str().unwrap_or_default();
+    [
+        AuthState::Missing,
+        AuthState::Valid,
+        AuthState::NearingExpiry,
+        AuthState::Expired,
+        AuthState::Corrupt,
+    ]
+    .into_iter()
+    .find(|state| auth_state_name(*state) == name)
+    .ok_or_else(|| format!("no sign-in state {name:?}"))
+}
+
+/// The first event of an `auth.begin` stream. The device code stays in the
+/// daemon, which polls with it.
+#[must_use]
+pub fn challenge_event(challenge: &DeviceCodeChallenge) -> Value {
+    json!({
+        "type": "challenge",
+        "user_code": challenge.user_code,
+        "verification_uri": challenge.verification_uri,
+        "interval": challenge.interval_secs,
+        "expires_at": time_value(challenge.expires_at),
+    })
+}
+
+/// Read a challenge event. Its device code is empty: only the daemon
+/// polls.
+pub fn read_challenge(value: &Value) -> Result<DeviceCodeChallenge, String> {
+    #[derive(Deserialize)]
+    struct Wire {
+        user_code: String,
+        verification_uri: String,
+        interval: u64,
+        #[serde(with = "time::serde::rfc3339")]
+        expires_at: time::OffsetDateTime,
+    }
+    let wire: Wire = serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    Ok(DeviceCodeChallenge {
+        user_code: wire.user_code,
+        verification_uri: wire.verification_uri,
+        device_code: String::new(),
+        interval_secs: wire.interval,
+        expires_at: wire.expires_at,
+    })
+}
+
+/// The last event of an `auth.begin` stream: granted, or why not.
+#[must_use]
+pub fn sign_in_ended_event(rejected: Option<&str>) -> Value {
+    match rejected {
+        None => json!({ "type": "granted" }),
+        Some(reason) => json!({ "type": "rejected", "reason": reason }),
+    }
+}
+
+/// A `runs.watch` event saying whether the daemon needs a sign-in before it
+/// can reach the gateway.
+#[must_use]
+pub fn auth_event(needs_sign_in: bool) -> Value {
+    json!({ "type": "auth", "needs_sign_in": needs_sign_in })
 }
 
 /// An event of a `run.watch` stream.
@@ -1191,5 +1280,63 @@ mod tests {
             },
         };
         assert_eq!(read_detail(&detail_event(&detail)), Ok(detail));
+    }
+
+    #[test]
+    fn sign_in_is_asked_about_and_begun_by_name() {
+        assert_eq!(
+            parse_request(r#"{"id":7,"method":"auth.status"}"#),
+            Ok((7, Request::AuthStatus))
+        );
+        assert_eq!(
+            parse_request(r#"{"id":8,"method":"auth.begin","params":{}}"#),
+            Ok((8, Request::AuthBegin))
+        );
+    }
+
+    #[test]
+    fn a_client_reads_back_the_sign_in_state_and_challenge() {
+        use vetinari_core::application::ports::DeviceCodeChallenge;
+
+        for state in [
+            AuthState::Missing,
+            AuthState::Valid,
+            AuthState::NearingExpiry,
+            AuthState::Expired,
+            AuthState::Corrupt,
+        ] {
+            assert_eq!(read_auth_status(&auth_status_result(state)), Ok(state));
+        }
+        let challenge = DeviceCodeChallenge {
+            user_code: "BDWP-HQPK".to_owned(),
+            verification_uri: "https://id.example.net/device".to_owned(),
+            device_code: "held by the daemon".to_owned(),
+            interval_secs: 5,
+            expires_at: datetime!(2026-10-25 09:10 UTC),
+        };
+        let event = challenge_event(&challenge);
+        assert_eq!(event["type"], "challenge");
+        assert!(
+            event.get("device_code").is_none(),
+            "the device code stays in the daemon"
+        );
+        let read = read_challenge(&event).expect("challenge");
+        assert_eq!(read.user_code, "BDWP-HQPK");
+        assert_eq!(read.verification_uri, "https://id.example.net/device");
+        assert_eq!(read.interval_secs, 5);
+        assert_eq!(read.expires_at, datetime!(2026-10-25 09:10 UTC));
+    }
+
+    #[test]
+    fn a_board_says_when_the_daemon_needs_a_sign_in() {
+        assert_eq!(
+            auth_event(true),
+            json!({ "type": "auth", "needs_sign_in": true })
+        );
+        assert_eq!(sign_in_ended_event(None), json!({ "type": "granted" }));
+        assert_eq!(
+            sign_in_ended_event(Some("declined")),
+            json!({ "type": "rejected", "reason": "declined" })
+        );
     }
 }

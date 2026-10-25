@@ -212,10 +212,44 @@ impl AuthService {
         Ok(refreshed.token().clone())
     }
 
+    /// A token for a call that may run long, renewed first when it is
+    /// near its expiry, or whatever its expiry when `rejected` says the
+    /// service refused it. Only the credential's one holder calls this:
+    /// a renewal rotates the refresh token.
+    pub async fn renewed_token(
+        &self,
+        provider: Provider,
+        account: Option<Slug>,
+        rejected: bool,
+    ) -> PortResult<Secret> {
+        let key = Self::key(provider, account);
+        let credential = self
+            .store
+            .get(&key)
+            .await?
+            .ok_or(PortError::Unauthenticated { provider })?;
+        let due = rejected || credential.status(self.clock.now()) != CredentialStatus::Valid;
+        if !due {
+            return Ok(credential.token().clone());
+        }
+        if credential.refresh_token().is_none() {
+            return if rejected || credential.status(self.clock.now()) == CredentialStatus::Expired {
+                Err(PortError::Unauthenticated { provider })
+            } else {
+                Ok(credential.token().clone())
+            };
+        }
+        let refreshed = self.flow.refresh(provider, &credential).await?;
+        self.store.set(&key, &refreshed).await?;
+        Ok(refreshed.token().clone())
+    }
+
     /// Begin a device-code flow, for providers that use one.
     pub async fn begin_device_flow(&self, provider: Provider) -> PortResult<DeviceCodeChallenge> {
         match provider.auth_spec().method {
-            AuthMethod::OAuthDeviceCode { .. } => self.flow.start(provider).await,
+            AuthMethod::OAuthDeviceCode { .. } | AuthMethod::OidcDeviceCode => {
+                self.flow.start(provider).await
+            }
             AuthMethod::ApiToken { .. } => Err(PortError::unsupported(
                 provider.name(),
                 "device-code authentication; paste an API token instead",
@@ -385,6 +419,86 @@ mod tests {
             stored.token().expose(),
             "refreshed-access",
             "the refreshed credential is written back so the next call is cheap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_nearing_expiry_is_renewed_before_a_long_call() {
+        let (service, store, _) = service();
+        let key = CredentialKey::new(Provider::Autognomus, None);
+        store.seed(
+            &key,
+            StoredCredential::oauth(
+                Secret::new("soon"),
+                Some(Secret::new("refresh")),
+                Some(NOW + Duration::minutes(2)),
+            ),
+        );
+        assert_eq!(
+            service
+                .token(Provider::Autognomus, None)
+                .await
+                .expect("token")
+                .expose(),
+            "soon",
+            "token() still hands out a usable one as it is"
+        );
+        assert_eq!(
+            service
+                .renewed_token(Provider::Autognomus, None, false)
+                .await
+                .expect("renewed")
+                .expose(),
+            "refreshed-access"
+        );
+        assert_eq!(
+            store
+                .get(&key)
+                .await
+                .expect("get")
+                .expect("stored")
+                .token()
+                .expose(),
+            "refreshed-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_renewed_however_long_it_has_left() {
+        let (service, store, _) = service();
+        store.seed(
+            &CredentialKey::new(Provider::Autognomus, None),
+            StoredCredential::oauth(
+                Secret::new("valid-but-refused"),
+                Some(Secret::new("refresh")),
+                Some(NOW + Duration::hours(1)),
+            ),
+        );
+        assert_eq!(
+            service
+                .renewed_token(Provider::Autognomus, None, true)
+                .await
+                .expect("renewed")
+                .expose(),
+            "refreshed-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_that_cannot_be_renewed_needs_a_sign_in() {
+        let (service, store, _) = service();
+        store.seed(
+            &CredentialKey::new(Provider::Autognomus, None),
+            StoredCredential::oauth(Secret::new("refused"), None, Some(NOW + Duration::hours(1))),
+        );
+        assert_eq!(
+            service
+                .renewed_token(Provider::Autognomus, None, true)
+                .await
+                .expect_err("no refresh token"),
+            PortError::Unauthenticated {
+                provider: Provider::Autognomus
+            }
         );
     }
 

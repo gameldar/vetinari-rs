@@ -9,6 +9,7 @@ use std::sync::Arc;
 use vetinari_adapters::Runtime;
 use vetinari_adapters::daemon::client::DaemonRuns;
 use vetinari_core::application::attention::Polled;
+use vetinari_core::application::auth::AuthState;
 use vetinari_core::application::devflow::worker::GateReply;
 use vetinari_core::application::observed::ObservedAgents;
 use vetinari_core::application::ports::AttentionSource;
@@ -451,6 +452,20 @@ impl Controller {
                 }
             }
 
+            Task::BeginDeviceFlow(provider) if provider.signs_in_through_the_daemon() => {
+                let begun = match self.daemon() {
+                    Ok(daemon) => daemon.begin_sign_in().await,
+                    Err(error) => Err(error),
+                };
+                match begun {
+                    Ok(challenge) => vec![Update::DeviceCode(provider, challenge)],
+                    Err(error) => vec![Update::Status(describe_failure(
+                        &format!("signing vetinarid in to {}", provider.display_name()),
+                        &error,
+                    ))],
+                }
+            }
+
             Task::BeginDeviceFlow(provider) => {
                 match self.runtime.auth.begin_device_flow(provider).await {
                     Ok(challenge) => vec![Update::DeviceCode(provider, challenge)],
@@ -470,6 +485,9 @@ impl Controller {
         challenge: &DeviceCodeChallenge,
         profile: &Profile,
     ) -> Vec<Update> {
+        if provider.signs_in_through_the_daemon() {
+            return self.poll_daemon_sign_in(provider, challenge).await;
+        }
         let account = profile.account().cloned();
         match self
             .runtime
@@ -550,6 +568,41 @@ impl Controller {
                 updates
             }
             Err(error) => vec![Update::Status(describe_failure(what, &error))],
+        }
+    }
+
+    /// The daemon polls the issuer; the TUI only asks whether it is done.
+    async fn poll_daemon_sign_in(
+        &self,
+        provider: Provider,
+        challenge: &DeviceCodeChallenge,
+    ) -> Vec<Update> {
+        let state = match self.daemon() {
+            Ok(daemon) => daemon.sign_in_state().await,
+            Err(error) => Err(error),
+        };
+        match state {
+            Ok(AuthState::Valid | AuthState::NearingExpiry) => vec![
+                Update::CloseOverlay,
+                Update::Status(StatusMessage::info(format!(
+                    "vetinarid is signed in to {}",
+                    provider.display_name()
+                ))),
+            ],
+            Ok(_) if self.runtime.clock.now() >= challenge.expires_at => vec![
+                Update::CloseOverlay,
+                Update::Status(StatusMessage::warn(format!(
+                    "{} was not authorised before the code expired",
+                    provider.display_name()
+                ))),
+            ],
+            Ok(_) => vec![Update::DeviceCodeMessage(
+                "Waiting for approval...".to_owned(),
+            )],
+            Err(error) => vec![Update::Status(describe_failure(
+                &format!("signing vetinarid in to {}", provider.display_name()),
+                &error,
+            ))],
         }
     }
 
@@ -1419,9 +1472,22 @@ mod tests {
                             .unwrap_or_default();
                         let method = field(&line, "method");
                         seen.lock().expect("lock").push(method.clone());
-                        let result = if method == "gate.answer" { gate } else { "{}" };
+                        let result = match method.as_str() {
+                            "gate.answer" => gate,
+                            "auth.status" => r#"{"state":"valid"}"#,
+                            "auth.begin" => r#"{"stream":1}"#,
+                            _ => "{}",
+                        };
                         let reply = format!(r#"{{"id":{id},"result":{result}}}"#);
                         let _ = write_half.write_all(format!("{reply}\n").as_bytes()).await;
+                        if method == "auth.begin" {
+                            let event = concat!(
+                                r#"{"stream":1,"event":{"type":"challenge","user_code":"BDWP-HQPK","#,
+                                r#""verification_uri":"https://id.example.net/device","interval":5,"#,
+                                r#""expires_at":"2999-01-01T00:00:00Z"}}"#
+                            );
+                            let _ = write_half.write_all(format!("{event}\n").as_bytes()).await;
+                        }
                     }
                 });
             }
@@ -1514,5 +1580,47 @@ mod tests {
         assert_eq!(polled.len(), 1);
         assert_eq!(polled[0].source.as_str(), "vetinarid");
         assert!(polled[0].outcome.as_ref().is_ok_and(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn the_daemon_signs_itself_in_and_the_tui_only_shows_the_code() {
+        let mut h = harness("");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("vetinarid.sock");
+        let asked = fake_vetinarid(socket.clone(), "{}");
+        h.controller
+            .attach_daemon(vetinari_adapters::daemon::client::DaemonRuns::new(
+                socket, "test",
+            ));
+
+        let updates = h
+            .controller
+            .run(Task::BeginDeviceFlow(Provider::Autognomus), &h.profile)
+            .await;
+        let Some(Update::DeviceCode(provider, challenge)) = updates.into_iter().next() else {
+            panic!("expected a device-code challenge");
+        };
+        assert_eq!(provider, Provider::Autognomus);
+        assert_eq!(challenge.user_code, "BDWP-HQPK");
+
+        let polled = h
+            .controller
+            .poll_device_flow(provider, &challenge, &h.profile)
+            .await;
+        assert!(polled.iter().any(|u| matches!(u, Update::CloseOverlay)));
+        assert!(
+            status_of(&polled).text.contains("signed in"),
+            "{:?}",
+            status_of(&polled)
+        );
+        assert_eq!(
+            h.store.len(),
+            0,
+            "the TUI never holds the gateway credential"
+        );
+        assert_eq!(
+            *asked.lock().expect("lock"),
+            ["hello", "auth.begin", "hello", "auth.status"]
+        );
     }
 }

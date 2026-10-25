@@ -651,10 +651,8 @@ The HTTP adapter maps statuses onto these, and nothing else does:
 | `502 workflow_unavailable`, `504 workflow_timeout`, any other `5xx`, connect error, timeout | `PortError::Unavailable`, which `is_transient` |
 
 The adapter takes its token from a small `Bearer` trait of its own (`token(refresh)`), with a
-`StaticBearer` for a local gateway; slice 13 implements it over `AuthService`. Until then
-`Provider::Autognomus` does not exist, so a `401` that survives the refresh is
-`PortError::Refused` rather than `Unauthenticated`; slice 13 changes it, and the claim loop's
-"needs sign-in" waits on that. `429` is treated as a `5xx`. Cancelling a finished run is
+`StaticBearer` for a local gateway and `AuthBearer` over `AuthService` (slice 13). A `401` that
+survives the refresh is `PortError::Unauthenticated { provider: Autognomus }`. `429` is treated as a `5xx`. Cancelling a finished run is
 `409 { reason: gone }`, which `cancel` reads as `AlreadyFinished`. Every error body is
 `{"error": {"code", "message"}}` (autognomus `http/error.rs`). A claim's request timeout is its
 `wait` plus the client's usual 20 seconds, since the long-poll outlasts the default.
@@ -1091,8 +1089,10 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   as the mirror asks, reopen a closed stream after a second (failed opens back off 1 to 60
   seconds), and remove a run whose graph is `NotFound`. Its clock, `TokioClock`, reads tokio's
   time, which is what lets its tests run with time paused.
-- `compose.rs` reads runs from a script (`--scripted <file>`) or a gateway (`--gateway <url>`,
-  with a fixed token from `VETINARI_AUTOGNOMUS_TOKEN` until slice 13). A gateway's runs are found
+- `compose.rs` reads runs from a script (`--scripted <file>`) or, without one, from the gateway
+  `[autognomus]` names, signed in as section 12 says (slice 13 replaced the
+  `--gateway <url>` flag and its `VETINARI_AUTOGNOMUS_TOKEN` stopgap; no environment override
+  is kept, since the design names none). A gateway's runs are found
   with `definitions` and `runs` and have no label yet: reading the ticket from a definition's
   node config is left to the launcher slice, which also records labels for the runs it starts.
 - A script names runs with their starting graph and lists steps; a step waits `after_ms`, may
@@ -1101,7 +1101,7 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   the summary exactly as a live run would. `tests/fixtures/feature-run.script.json` takes one run
   from preflight to an opened pull request.
 
-**The worker, as composed (slice 11c).** A `--gateway` daemon claims and runs steps; a
+**The worker, as composed (slice 11c).** A gateway daemon claims and runs steps; a
 `--scripted` one still serves the board only.
 
 - `steps.rs` has one task that owns the `StepWorker` and the `AgentRegistry` (this is the
@@ -1113,8 +1113,8 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   through a 30 second long-poll and starve the heartbeats: it asks the owner `can_claim`,
   long-polls `TaskGateway::claim` itself, and hands the task over, waiting until it is started
   before it asks again, so two claims never race for one permit. Unavailable backs off 1 to 60
-  seconds; any other error (refused, unauthenticated) stops that loop and logs "autognomus needs
-  sign-in" until slice 13 surfaces it. Two claims on one queue start at least a second apart, so
+  seconds. `Unauthenticated` marks the daemon as needing a sign-in and waits for one, then
+  claims again (slice 13); any other error (refused) stops that loop. Two claims on one queue start at least a second apart, so
   a gateway that answers an empty claim at once is not asked in a tight loop.
 - A heartbeat that fails for a reason a retry will not fix pauses heartbeating for five
   seconds, since the worker leaves such a lease due.
@@ -1248,6 +1248,33 @@ challenge to the TUI, which shows it in the existing auth wizard. `vetinarid log
 on stdout for a first run before any client exists. A daemon with no usable token keeps its
 socket up, reports `unauthenticated`, and surfaces an "autognomus needs sign-in" item through
 `runs.watch`.
+
+**As built (slice 13).**
+
+- `[autognomus]` is parsed into `AutognomusConfig { gateway_url, oidc: OidcClient { issuer,
+  client_id, audience, scopes }, worker }`, URLs as `HttpUrl`. `scopes` defaults to
+  `openid offline_access`. `vetinarid` without `--scripted` needs the table; `--gateway` is gone.
+  The worker label is `--worker`, else `[autognomus] worker`, else the hostname.
+- `OidcDeviceCodeFlow` (`vetinari-adapters/src/oauth/oidc.rs`) reads discovery once (a failed
+  read is retried on the next call) and sends `client_id`, `scope` and `audience` when set; an
+  issuer whose discovery has no `device_authorization_endpoint` is `Unsupported`. Both it and
+  `HttpDeviceCodeFlow` make their requests through one `Exchange`.
+- `AuthService::renewed_token(provider, account, rejected)` renews at `NearingExpiry` and on
+  `rejected`; `AuthBearer` is the gateway's `Bearer` over it.
+- `SignIn` (`vetinari-daemon/src/signin.rs`) tracks whether a sign-in is needed. `begin` returns
+  the challenge and polls in a task of its own, so a client that hangs up does not abandon the
+  flow. A daemon that starts unauthenticated serves anyway, and lists the gateway's runs once
+  signed in.
+- `runs.watch` sends `{ type: auth, needs_sign_in }` after its snapshot and on every change;
+  `DaemonRuns` turns it into one "autognomus needs sign-in" item, and `RET` on it begins the
+  sign-in. `auth.begin` streams `challenge` (without the device code, which stays in the
+  daemon) then `granted` or `rejected { reason }`. The TUI shows the challenge in its device-code
+  overlay and polls `auth.status` rather than the issuer. `auth.status` is
+  `{ state: missing | valid | nearing-expiry | expired | corrupt }`; a scripted daemon says
+  `valid` and refuses `auth.begin`.
+- `vetinarid login` asks a running daemon to sign itself in, so only one process ever refreshes
+  the credential; with none running it signs in itself and stores the credential for the next
+  start. `vetinari auth autognomus` refuses and points at it.
 
 **Assumptions, flagged.** Each of these is a property of the deployed issuer, not of vetinari or
 the gateway, and none has been verified:

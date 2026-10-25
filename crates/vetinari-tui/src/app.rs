@@ -911,14 +911,20 @@ impl App {
                 Outcome::Nothing
             }
             Action::Select => {
-                if let Some(item) = self.selected_item()
-                    && let ItemContext::Run(summary) = item.context()
-                {
-                    self.overlay = Some(Overlay::Run(RunView::new(
-                        summary.run.clone(),
-                        item.title().single_line(),
-                    )));
-                    return Outcome::Nothing;
+                if let Some(item) = self.selected_item() {
+                    match item.context() {
+                        ItemContext::Run(summary) => {
+                            self.overlay = Some(Overlay::Run(RunView::new(
+                                summary.run.clone(),
+                                item.title().single_line(),
+                            )));
+                            return Outcome::Nothing;
+                        }
+                        ItemContext::SignIn(provider) => {
+                            return Outcome::Task(Task::BeginDeviceFlow(*provider));
+                        }
+                        _ => {}
+                    }
                 }
                 if self.selected().is_some() {
                     self.overlay = Some(Overlay::Details);
@@ -1374,7 +1380,7 @@ impl App {
                         );
                         Outcome::Nothing
                     }
-                    AuthMethod::OAuthDeviceCode { .. } => {
+                    AuthMethod::OAuthDeviceCode { .. } | AuthMethod::OidcDeviceCode => {
                         Outcome::Task(Task::BeginDeviceFlow(provider))
                     }
                 }
@@ -1591,6 +1597,7 @@ impl App {
                 detail: match provider.auth_spec().method {
                     AuthMethod::ApiToken { .. } => "token".to_owned(),
                     AuthMethod::OAuthDeviceCode { .. } => "device code".to_owned(),
+                    AuthMethod::OidcDeviceCode => "device code, held by vetinarid".to_owned(),
                 },
                 target: MenuTarget::Provider(*provider),
             })
@@ -1687,7 +1694,9 @@ impl App {
             }
             ItemContext::Agent(agent) => bindings.with("session", agent.session.to_string()),
             ItemContext::Run(summary) => bindings.with("run", summary.run.to_string()),
-            ItemContext::None => bindings.with("issues", item.title().single_line()),
+            ItemContext::SignIn(_) | ItemContext::None => {
+                bindings.with("issues", item.title().single_line())
+            }
         }
     }
 
@@ -3342,6 +3351,31 @@ mod tests {
                     NonZeroU32::new(2).expect("two")
                 ))
             );
+        }
+
+        #[test]
+        fn ret_on_a_sign_in_item_begins_the_daemons_sign_in() {
+            let mut app = app();
+            let source = SourceId::parse("vetinarid").expect("source");
+            let item = AttentionItem::builder(
+                &source,
+                "sign-in",
+                SourceCategory::AgentState,
+                NonEmptyText::parse("autognomus needs sign-in").expect("title"),
+            )
+            .state(ItemState::NeedsDecision)
+            .occurred_at(NOW)
+            .context(ItemContext::SignIn(Provider::Autognomus))
+            .build();
+            app.apply(Update::Polled(vec![Polled {
+                source,
+                outcome: Ok(vec![item]),
+            }]));
+            select_row(&mut app, "autognomus needs sign-in");
+            assert!(matches!(
+                press(&mut app, "RET"),
+                Outcome::Task(Task::BeginDeviceFlow(Provider::Autognomus))
+            ));
         }
     }
 }

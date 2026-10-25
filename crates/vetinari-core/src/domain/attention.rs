@@ -11,6 +11,7 @@ use std::fmt;
 use time::{Duration, OffsetDateTime};
 
 use super::action::Action;
+use super::credentials::Provider;
 use super::devflow::summary::RunSummary;
 use super::ids::{ItemId, SessionId, SourceId, SpaceId};
 use super::text::NonEmptyText;
@@ -286,6 +287,8 @@ pub enum ItemContext {
     Agent(AgentRef),
     /// A dev workflow run, as the daemon summarised it.
     Run(RunSummary),
+    /// A credential only vetinarid holds needs signing in again.
+    SignIn(Provider),
 }
 
 /// One entry in the attention feed.

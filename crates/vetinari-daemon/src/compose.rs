@@ -13,19 +13,26 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
-use vetinari_adapters::autognomus::client::{HttpGateway, StaticBearer};
+use vetinari_adapters::autognomus::client::{AuthBearer, HttpGateway};
 use vetinari_adapters::config::{candidate_paths, load_or_default};
+use vetinari_adapters::credentials::KeyringStore;
+use vetinari_adapters::daemon::client::DaemonRuns;
 use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles};
 use vetinari_adapters::git::GitWorktreeManager;
+use vetinari_adapters::oauth::OidcDeviceCodeFlow;
 use vetinari_adapters::skills::FileSkillStore;
 use vetinari_adapters::{HttpClient, Paths, Runtime};
+use vetinari_core::application::auth::{AuthService, AuthState};
+use vetinari_core::application::config::AutognomusConfig;
 use vetinari_core::application::config::{Config, ParseContext};
 use vetinari_core::application::devflow::api::ClientApi;
 use vetinari_core::application::devflow::ports::PullRequestPublisher;
 use vetinari_core::application::devflow::ports::{RunEvents, RunGateway, TaskGateway};
 use vetinari_core::application::devflow::worker::{StepWorker, WorkerPorts, WorkerSettings};
+use vetinari_core::application::ports::DeviceCodeChallenge;
 use vetinari_core::application::ports::{Clock, PortError};
 use vetinari_core::application::ports::{PortResult, WorktreeManager};
+use vetinari_core::domain::credentials::Provider;
 use vetinari_core::domain::devflow::compile::StepPolicies;
 use vetinari_core::domain::devflow::compile::WorkerQueues;
 use vetinari_core::domain::devflow::ids::{RunId, WorkerName};
@@ -38,6 +45,7 @@ use crate::gates::{Gates, NoGates};
 use crate::hub::Hub;
 use crate::runtime::{Feed, OwnedRun, TokioClock, feed_runs};
 use crate::scripted::{Script, ScriptError};
+use crate::signin::{SignIn, SignInOutcome};
 use crate::socket::{self, Backend};
 use crate::steps::{LocalBoard, StepParts, claim_loop, spawn_steps};
 
@@ -46,13 +54,8 @@ use crate::steps::{LocalBoard, StepParts, claim_loop, spawn_steps};
 pub enum Source {
     /// Replay a script.
     Scripted(PathBuf),
-    /// A gateway, with a fixed bearer token until sign-in exists.
-    Gateway {
-        /// The gateway's base URL.
-        url: String,
-        /// The bearer token.
-        token: String,
-    },
+    /// The gateway `[autognomus]` names, signed in to its issuer.
+    Gateway,
 }
 
 /// How the daemon is to run.
@@ -60,8 +63,9 @@ pub enum Source {
 pub struct Settings {
     /// The socket to serve.
     pub socket: PathBuf,
-    /// The worker label.
-    pub worker: WorkerName,
+    /// The worker label, when given; otherwise `[autognomus] worker`, then
+    /// the hostname.
+    pub worker: Option<WorkerName>,
     /// Where runs come from.
     pub source: Source,
     /// vetinari's configuration file, when not the usual one.
@@ -96,6 +100,9 @@ pub enum DaemonError {
     /// vetinari's configuration could not be read.
     #[error("configuration: {0}")]
     Config(String),
+    /// Signing in did not finish.
+    #[error("sign-in: {0}")]
+    SignIn(String),
 }
 
 /// The socket the daemon listens on and the TUI reads, unless told
@@ -110,6 +117,114 @@ pub fn worker_from_hostname(hostname: Option<&str>) -> WorkerName {
         .and_then(|name| name.trim().split('.').next())
         .and_then(|name| WorkerName::parse(name).ok())
         .unwrap_or_else(|| WorkerName::parse("vetinari").expect("a valid worker name"))
+}
+
+/// The worker label: the one asked for, else the configured one, else
+/// the hostname's.
+#[must_use]
+pub fn choose_worker(
+    explicit: Option<WorkerName>,
+    configured: Option<WorkerName>,
+    hostname: Option<&str>,
+) -> WorkerName {
+    explicit
+        .or(configured)
+        .unwrap_or_else(|| worker_from_hostname(hostname))
+}
+
+fn hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+}
+
+/// The gateway a daemon works for, which only `[autognomus]` names.
+pub fn gateway_config(config: &Config) -> Result<&AutognomusConfig, DaemonError> {
+    config.autognomus.as_ref().ok_or_else(|| {
+        DaemonError::Config(
+            "no gateway is configured: add [autognomus] with gateway_url, issuer and client_id"
+                .to_owned(),
+        )
+    })
+}
+
+/// The credential service for the gateway's issuer. Only the daemon builds
+/// one: refresh tokens rotate on use.
+fn gateway_auth(
+    autognomus: &AutognomusConfig,
+    http: HttpClient,
+    clock: Arc<dyn Clock>,
+) -> Arc<AuthService> {
+    Arc::new(AuthService::new(
+        Arc::new(KeyringStore),
+        Arc::new(OidcDeviceCodeFlow::new(
+            Provider::Autognomus,
+            autognomus.oidc.clone(),
+            http,
+            clock.clone(),
+        )),
+        clock,
+    ))
+}
+
+/// Find the gateway's runs once the daemon is signed in, for a daemon that
+/// started without a usable token.
+async fn discover_once_signed_in(
+    runs: Arc<dyn RunGateway>,
+    sign_in: Arc<SignIn>,
+    local: Arc<LocalBoard>,
+) {
+    sign_in.signed_in().await;
+    match discover(runs.as_ref()).await {
+        Ok(owned) => {
+            for run in owned {
+                local.adopt(run.run);
+            }
+        }
+        Err(error) => tracing::warn!(%error, "cannot list the gateway's runs after signing in"),
+    }
+}
+
+/// Sign the daemon in on stdout (design 12). A running daemon is asked to
+/// sign itself in, since it holds the credential; with none running the
+/// flow runs here and stores what it is granted for the next start.
+pub async fn login(socket: PathBuf, config: Option<PathBuf>) -> Result<(), DaemonError> {
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        let daemon = DaemonRuns::new(socket, "vetinarid login");
+        let challenge = daemon.begin_sign_in().await?;
+        print_challenge(&challenge);
+        loop {
+            tokio::time::sleep(Duration::from_secs(challenge.interval_secs.max(1))).await;
+            match daemon.sign_in_state().await? {
+                AuthState::Valid | AuthState::NearingExpiry => break,
+                _ if OffsetDateTime::now_utc() >= challenge.expires_at => {
+                    return Err(DaemonError::SignIn("the code expired".to_owned()));
+                }
+                _ => {}
+            }
+        }
+    } else {
+        let (config, _) = load_config(config)?;
+        let autognomus = gateway_config(&config)?.clone();
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc()));
+        let sign_in = SignIn::new(gateway_auth(&autognomus, HttpClient::new()?, clock));
+        let (challenge, ended) = sign_in.begin().await?;
+        print_challenge(&challenge);
+        match ended.await {
+            Ok(SignInOutcome::Granted) => {}
+            Ok(SignInOutcome::Rejected(reason)) => return Err(DaemonError::SignIn(reason)),
+            Err(_) => return Err(DaemonError::SignIn("the sign-in was abandoned".to_owned())),
+        }
+    }
+    println!("vetinarid is signed in to autognomus");
+    Ok(())
+}
+
+fn print_challenge(challenge: &DeviceCodeChallenge) {
+    println!(
+        "Visit {} and enter {}",
+        challenge.verification_uri, challenge.user_code
+    );
 }
 
 /// The runs a gateway holds for vetinari: every run of every live
@@ -158,6 +273,9 @@ pub struct Services {
     pub gates: Arc<dyn Gates>,
     /// This machine's steps, and the receiver that hears which changed.
     pub local: (Arc<LocalBoard>, mpsc::UnboundedReceiver<RunId>),
+    /// How the daemon signs in to its gateway; none for a script or a
+    /// fixed token.
+    pub sign_in: Option<Arc<SignIn>>,
 }
 
 /// How many agent steps run at once until `[daemon] max_agent_steps` is
@@ -277,37 +395,57 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
                 runs,
                 events,
                 owned,
-                worker: settings.worker.clone(),
+                worker: choose_worker(settings.worker.clone(), None, hostname().as_deref()),
                 clock,
                 claims: None,
                 gates,
                 local,
+                sign_in: None,
             }
         }
-        Source::Gateway { url, token } => {
-            let gateway = Arc::new(HttpGateway::new(
-                url,
-                HttpClient::new()?,
-                Arc::new(StaticBearer::new(token.clone())),
-            ));
-            let owned = discover(gateway.as_ref()).await?;
+        Source::Gateway => {
             let (config, paths) = load_config(settings.config.clone())?;
-            let claims = claims(
-                config,
-                &paths,
-                gateway.clone(),
-                &settings.worker,
-                clock.clone(),
-            )?;
+            let autognomus = gateway_config(&config)?.clone();
+            let worker = choose_worker(
+                settings.worker.clone(),
+                autognomus.worker.clone(),
+                hostname().as_deref(),
+            );
+            let http = HttpClient::new()?;
+            let auth = gateway_auth(&autognomus, http.clone(), clock.clone());
+            let sign_in = SignIn::new(auth.clone());
+            sign_in.check().await;
+            let gateway = Arc::new(HttpGateway::new(
+                autognomus.gateway_url.as_str(),
+                http,
+                Arc::new(AuthBearer::new(auth)),
+            ));
+            let local = LocalBoard::new();
+            let owned = match discover(gateway.as_ref()).await {
+                Ok(owned) => owned,
+                Err(PortError::Unauthenticated { .. }) => {
+                    tracing::warn!("autognomus needs a sign-in; serving until it has one");
+                    sign_in.lost();
+                    tokio::spawn(discover_once_signed_in(
+                        gateway.clone(),
+                        sign_in.clone(),
+                        local.0.clone(),
+                    ));
+                    Vec::new()
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let claims = claims(config, &paths, gateway.clone(), &worker, clock.clone())?;
             Services {
                 runs: gateway.clone(),
                 events: gateway,
                 owned,
-                worker: settings.worker.clone(),
+                worker,
                 clock,
                 claims: Some(claims),
                 gates: Arc::new(NoGates),
-                local: LocalBoard::new(),
+                local,
+                sign_in: Some(sign_in),
             }
         }
     };
@@ -338,6 +476,7 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
                 queue,
                 services.worker.clone(),
                 steps.clone(),
+                services.sign_in.clone(),
             )));
         }
         steps
@@ -351,6 +490,7 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
         gates,
         local: local.clone(),
         template: TemplateKind::FeatureFromTicket,
+        sign_in: services.sign_in.clone(),
     });
     let feed = Feed {
         runs: services.runs,
@@ -439,7 +579,9 @@ mod tests {
         let gateway = Arc::new(HttpGateway::new(
             "http://127.0.0.1:1",
             HttpClient::new().expect("client"),
-            Arc::new(StaticBearer::new("token")),
+            Arc::new(vetinari_adapters::autognomus::client::StaticBearer::new(
+                "token",
+            )),
         ));
         let clock: Arc<dyn Clock> =
             Arc::new(TokioClock::starting_at(datetime!(2026-10-25 09:00 UTC)));
@@ -520,7 +662,7 @@ mod tests {
         let path = dir.path().join("vetinari").join("vetinarid.sock");
         let daemon = tokio::spawn(run(Settings {
             socket: path.clone(),
-            worker: WorkerName::parse("hex").expect("worker"),
+            worker: Some(WorkerName::parse("hex").expect("worker")),
             source: Source::Scripted(script),
             config: None,
         }));
@@ -558,5 +700,43 @@ mod tests {
         }
         assert_eq!(runs[0]["ticket"], json!("ENG-412"));
         assert_eq!(runs[0]["phases"][0]["glyph"], json!("◐"));
+    }
+
+    fn configured(toml_text: &str) -> Config {
+        let raw: RawConfig = toml::from_str(toml_text).expect("TOML");
+        Config::parse(raw, &ParseContext::default()).expect("config")
+    }
+
+    #[test]
+    fn the_worker_label_is_the_flags_then_the_configs_then_the_hostnames() {
+        let flag = WorkerName::parse("flag").expect("worker");
+        let file = WorkerName::parse("file").expect("worker");
+        assert_eq!(
+            choose_worker(Some(flag.clone()), Some(file.clone()), Some("host")),
+            flag
+        );
+        assert_eq!(choose_worker(None, Some(file.clone()), Some("host")), file);
+        assert_eq!(
+            choose_worker(None, None, Some("host.local")).as_str(),
+            "host"
+        );
+    }
+
+    #[test]
+    fn a_gateway_daemon_needs_the_autognomus_table() {
+        let error = gateway_config(&configured("")).expect_err("no table");
+        assert!(error.to_string().contains("[autognomus]"), "{error}");
+        let config = configured(
+            r#"
+            [autognomus]
+            gateway_url = "https://autognomus.example.net"
+            issuer = "https://id.example.net"
+            client_id = "vetinari"
+            "#,
+        );
+        assert_eq!(
+            gateway_config(&config).expect("table").gateway_url.as_str(),
+            "https://autognomus.example.net"
+        );
     }
 }

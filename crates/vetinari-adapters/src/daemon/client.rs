@@ -19,16 +19,20 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use vetinari_core::application::auth::AuthState;
 use vetinari_core::application::devflow::api::{PROTOCOL, RunDetail, RunItem};
 use vetinari_core::application::devflow::worker::GateReply;
+use vetinari_core::application::ports::DeviceCodeChallenge;
 use vetinari_core::application::ports::{AttentionSource, PortError, PortResult};
-use vetinari_core::domain::attention::{AttentionItem, SourceCategory};
+use vetinari_core::domain::attention::{AttentionItem, ItemContext, ItemState, SourceCategory};
+use vetinari_core::domain::credentials::Provider;
 use vetinari_core::domain::devflow::ids::{NodeInstance, RunId};
 use vetinari_core::domain::devflow::lanes::IterationSelection;
 use vetinari_core::domain::devflow::outcome::GateAnswer;
 use vetinari_core::domain::ids::{Slug, SourceId};
+use vetinari_core::domain::text::NonEmptyText;
 
-use super::protocol::{read_detail, read_run_item};
+use super::protocol::{read_auth_status, read_challenge, read_detail, read_run_item};
 
 const WHAT: &str = "vetinarid";
 
@@ -53,7 +57,14 @@ pub fn default_socket() -> PathBuf {
 enum Board {
     Never,
     Down(String),
-    Up(BTreeMap<RunId, RunItem>),
+    Up(Seen),
+}
+
+/// The daemon's runs, and whether it waits on a sign-in to reach them.
+#[derive(Clone, Default)]
+struct Seen {
+    runs: BTreeMap<RunId, RunItem>,
+    needs_sign_in: bool,
 }
 
 /// The daemon's runs, as an attention source.
@@ -180,15 +191,54 @@ impl DaemonRuns {
         Ok(())
     }
 
+    /// Begin signing the daemon in: the challenge to show. The daemon polls
+    /// the issuer itself; ask `sign_in_state` to learn whether it was
+    /// granted.
+    pub async fn begin_sign_in(&self) -> PortResult<DeviceCodeChallenge> {
+        let mut connection = Connection::open(&self.socket, &self.client).await?;
+        connection.request("auth.begin", json!({})).await?;
+        let event = connection
+            .event()
+            .await?
+            .ok_or_else(|| PortError::unavailable(WHAT, "the daemon hung up"))?;
+        read_challenge(&event).map_err(protocol)
+    }
+
+    /// Whether the daemon is signed in to its gateway.
+    pub async fn sign_in_state(&self) -> PortResult<AuthState> {
+        let result = Connection::open(&self.socket, &self.client)
+            .await?
+            .request("auth.status", json!({}))
+            .await?;
+        read_auth_status(&result).map_err(protocol)
+    }
+
+    fn sign_in_item(&self, now: OffsetDateTime) -> AttentionItem {
+        AttentionItem::builder(
+            &self.id,
+            "sign-in",
+            SourceCategory::AgentState,
+            NonEmptyText::parse("autognomus needs sign-in").expect("a non-empty title"),
+        )
+        .state(ItemState::NeedsDecision)
+        .occurred_at(now)
+        .context(ItemContext::SignIn(Provider::Autognomus))
+        .build()
+    }
+
     async fn watch_board(&self) -> PortResult<()> {
         let mut connection = Connection::open(&self.socket, &self.client).await?;
         connection.request("runs.watch", json!({})).await?;
         while let Some(event) = connection.event().await? {
-            let mut board = match &*self.board.lock().expect("board lock") {
-                Board::Up(runs) => runs.clone(),
-                Board::Never | Board::Down(_) => BTreeMap::new(),
+            let mut seen = match &*self.board.lock().expect("board lock") {
+                Board::Up(seen) => seen.clone(),
+                Board::Never | Board::Down(_) => Seen::default(),
             };
+            let board = &mut seen.runs;
             match event["type"].as_str() {
+                Some("auth") => {
+                    seen.needs_sign_in = event["needs_sign_in"].as_bool().unwrap_or(false);
+                }
                 Some("snapshot") => {
                     board.clear();
                     for entry in event["runs"].as_array().into_iter().flatten() {
@@ -208,7 +258,7 @@ impl DaemonRuns {
                 }
                 _ => continue,
             }
-            self.set(Board::Up(board));
+            self.set(Board::Up(seen));
         }
         Ok(())
     }
@@ -236,10 +286,17 @@ impl AttentionSource for DaemonRuns {
     async fn fetch(&self, _account: Option<&Slug>) -> PortResult<Vec<AttentionItem>> {
         let now = OffsetDateTime::now_utc();
         match &*self.board.lock().expect("board lock") {
-            Board::Up(runs) => Ok(runs
-                .values()
-                .map(|item| item.to_attention(&self.id, now))
-                .collect()),
+            Board::Up(seen) => {
+                let mut items: Vec<AttentionItem> = seen
+                    .runs
+                    .values()
+                    .map(|item| item.to_attention(&self.id, now))
+                    .collect();
+                if seen.needs_sign_in {
+                    items.push(self.sign_in_item(now));
+                }
+                Ok(items)
+            }
             Board::Never => Ok(Vec::new()),
             Board::Down(reason) => Err(PortError::unavailable(WHAT, reason.clone())),
         }
@@ -345,7 +402,10 @@ fn daemon_error(error: &Value) -> PortError {
             what: WHAT.to_owned(),
             detail: message,
         },
-        Some("unavailable" | "unauthenticated") => PortError::unavailable(WHAT, message),
+        Some("unauthenticated") => PortError::Unauthenticated {
+            provider: Provider::Autognomus,
+        },
+        Some("unavailable") => PortError::unavailable(WHAT, message),
         _ => protocol(message),
     }
 }
@@ -354,7 +414,6 @@ fn daemon_error(error: &Value) -> PortError {
 mod tests {
     use tokio::net::UnixListener;
     use tokio::sync::mpsc;
-    use vetinari_core::domain::attention::ItemState;
     use vetinari_core::domain::devflow::outcome::Line;
 
     use super::*;
@@ -586,5 +645,69 @@ mod tests {
         let detail = watching.await.expect("join").expect("detail").expect("one");
         assert_eq!(detail.rows[0].row.node.as_str(), "open-pr");
         assert_eq!(detail.notes.questions[0].as_str(), "Page size?");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_needs_a_sign_in_queues_one_item_saying_so() {
+        let mut daemon = FakeDaemon::start();
+        let runs = DaemonRuns::new(daemon.socket.clone(), "vetinari test");
+        let mut changes = runs.changes();
+        let _task = runs.start();
+        let mut peer = daemon.accept().await;
+        peer.greet().await;
+        peer.answer("runs.watch", json!({ "stream": 1 })).await;
+        peer.send(json!({ "stream": 1, "event": { "type": "snapshot", "runs": [] } }))
+            .await;
+        until_changed(&mut changes).await;
+        peer.send(json!({ "stream": 1, "event": { "type": "auth", "needs_sign_in": true } }))
+            .await;
+        until_changed(&mut changes).await;
+
+        let items = runs.fetch(None).await.expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title().as_str(), "autognomus needs sign-in");
+        assert_eq!(items[0].state(), ItemState::NeedsDecision);
+        assert_eq!(
+            items[0].context(),
+            &vetinari_core::domain::attention::ItemContext::SignIn(Provider::Autognomus)
+        );
+
+        peer.send(json!({ "stream": 1, "event": { "type": "auth", "needs_sign_in": false } }))
+            .await;
+        until_changed(&mut changes).await;
+        assert!(runs.fetch(None).await.expect("items").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_is_begun_in_the_daemon_and_its_state_asked_after() {
+        let mut daemon = FakeDaemon::start();
+        let runs = DaemonRuns::new(daemon.socket.clone(), "vetinari test");
+        let asking = tokio::spawn({
+            let runs = runs.clone();
+            async move { runs.begin_sign_in().await }
+        });
+        let mut peer = daemon.accept().await;
+        peer.greet().await;
+        peer.answer("auth.begin", json!({ "stream": 1 })).await;
+        peer.send(json!({ "stream": 1, "event": {
+            "type": "challenge", "user_code": "BDWP-HQPK",
+            "verification_uri": "https://id.example.net/device", "interval": 5,
+            "expires_at": "2026-10-25T09:10:00Z" } }))
+            .await;
+        let challenge = asking.await.expect("joined").expect("challenge");
+        assert_eq!(challenge.user_code, "BDWP-HQPK");
+
+        let asking = tokio::spawn({
+            let runs = runs.clone();
+            async move { runs.sign_in_state().await }
+        });
+        let mut peer = daemon.accept().await;
+        peer.greet().await;
+        peer.answer("auth.status", json!({ "state": "valid" }))
+            .await;
+        assert_eq!(
+            asking.await.expect("joined").expect("state"),
+            vetinari_core::application::auth::AuthState::Valid
+        );
     }
 }

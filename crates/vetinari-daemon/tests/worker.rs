@@ -14,25 +14,32 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use vetinari_adapters::HttpClient;
-use vetinari_adapters::autognomus::client::{HttpGateway, StaticBearer};
+use vetinari_adapters::autognomus::client::{AuthBearer, HttpGateway, StaticBearer};
+use vetinari_adapters::daemon::client::DaemonRuns;
 use vetinari_adapters::devflow::{FileLeaseJournal, FsStepFiles};
 use vetinari_adapters::git::GitWorktreeManager;
 use vetinari_core::application::agents::AgentRegistry;
+use vetinari_core::application::auth::AuthService;
 use vetinari_core::application::devflow::worker::{StepWorker, WorkerPorts, WorkerSettings};
+use vetinari_core::application::ports::AttentionSource;
 use vetinari_core::application::ports::{AgentEngine, Clock, PortResult};
 use vetinari_core::application::workflows::WorkflowEngine;
 use vetinari_core::application::workspaces::WorkspaceDirectory;
 use vetinari_core::domain::agent::{AgentSession, AgentStatus, TaskSpec};
+use vetinari_core::domain::credentials::{CredentialKey, Provider, Secret, StoredCredential};
 use vetinari_core::domain::devflow::compile::{StepPolicies, WorkerQueues};
 use vetinari_core::domain::devflow::ids::WorkerName;
 use vetinari_core::domain::ids::{AgentId, ProfileId, SessionId};
 use vetinari_core::domain::profile::{Profile, ProfileSet};
 use vetinari_core::domain::text::NonEmptyText;
 use vetinari_core::domain::workspace::TargetKind;
-use vetinari_core::testing::{FakePullRequestPublisher, MemorySkillStore};
+use vetinari_core::testing::{
+    FakeDeviceCodeFlow, FakePullRequestPublisher, MemoryCredentialStore, MemorySkillStore,
+};
 use vetinari_daemon::compose::{Claims, Services, serve};
 use vetinari_daemon::gates::NoGates;
 use vetinari_daemon::runtime::TokioClock;
+use vetinari_daemon::signin::SignIn;
 use vetinari_daemon::steps::{LocalBoard, StepParts};
 
 use gateway::Gateway;
@@ -127,36 +134,27 @@ fn claim(repo: &Path) -> Value {
     claim
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let repo = repository(dir.path());
-    let gateway = Gateway::start(claim(&repo)).await;
-
-    let clock: Arc<dyn Clock> = Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc()));
-    let http = Arc::new(HttpGateway::new(
-        &gateway.base_url,
-        HttpClient::new().expect("client"),
-        Arc::new(StaticBearer::new("token")),
-    ));
+/// The claiming half of a daemon for `repo`'s gateway, whose one agent
+/// writes `result` at once.
+fn claims(dir: &Path, http: Arc<HttpGateway>, clock: Arc<dyn Clock>, result: Value) -> Claims {
     let worktrees = Arc::new(GitWorktreeManager::default());
     let worker_name = WorkerName::parse("hex").expect("worker");
     let mut registry = AgentRegistry::new(clock.clone());
     registry.register(Arc::new(WritesItsResult {
         id: AgentId::parse("claude-code").expect("id"),
-        result: json!({ "schema": 1, "outcome": "ready", "summary": "Retry with backoff" }),
+        result,
     }));
     let profile = Profile::new(
         ProfileId::parse("work").expect("id"),
         NonEmptyText::parse("Work").expect("name"),
         TargetKind::Herdr,
     )
-    .with_worktree_root(dir.path().join("trees"));
+    .with_worktree_root(dir.join("trees"));
     let worker = StepWorker::new(
         WorkerPorts {
             tasks: http.clone(),
             runs: http.clone(),
-            journal: Arc::new(FileLeaseJournal::new(dir.path().join("leases.json"))),
+            journal: Arc::new(FileLeaseJournal::new(dir.join("leases.json"))),
             files: Arc::new(FsStepFiles::default()),
             worktrees: worktrees.clone(),
             skills: Arc::new(MemorySkillStore::default()),
@@ -175,6 +173,30 @@ async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
             policies: StepPolicies::default(),
         },
     );
+    Claims {
+        tasks: http,
+        queues: WorkerQueues::for_worker(&worker_name),
+        parts: StepParts {
+            worker,
+            registry,
+            clock,
+            tick: Duration::from_millis(100),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = repository(dir.path());
+    let gateway = Gateway::start(claim(&repo)).await;
+
+    let clock: Arc<dyn Clock> = Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc()));
+    let http = Arc::new(HttpGateway::new(
+        &gateway.base_url,
+        HttpClient::new().expect("client"),
+        Arc::new(StaticBearer::new("token")),
+    ));
     let socket = dir.path().join("vetinarid.sock");
     let daemon = tokio::spawn(serve(
         socket,
@@ -182,20 +204,17 @@ async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
             runs: http.clone(),
             events: http.clone(),
             owned: Vec::new(),
-            worker: worker_name.clone(),
+            worker: WorkerName::parse("hex").expect("worker"),
             clock: clock.clone(),
             gates: Arc::new(NoGates),
             local: LocalBoard::new(),
-            claims: Some(Claims {
-                tasks: http,
-                queues: WorkerQueues::for_worker(&worker_name),
-                parts: StepParts {
-                    worker,
-                    registry,
-                    clock,
-                    tick: Duration::from_millis(100),
-                },
-            }),
+            sign_in: None,
+            claims: Some(claims(
+                dir.path(),
+                http,
+                clock,
+                json!({ "schema": 1, "outcome": "ready", "summary": "Retry with backoff" }),
+            )),
         },
     ));
 
@@ -223,4 +242,61 @@ async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
             .is_dir(),
         "the step ran in the run's worktree"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_whose_token_is_refused_keeps_serving_and_asks_for_a_sign_in() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gateway = Gateway::refusing().await;
+    let clock: Arc<dyn Clock> = Arc::new(TokioClock::starting_at(OffsetDateTime::now_utc()));
+    let store = Arc::new(MemoryCredentialStore::default());
+    store.seed(
+        &CredentialKey::new(Provider::Autognomus, None),
+        StoredCredential::oauth(Secret::new("revoked"), None, None),
+    );
+    let auth = Arc::new(AuthService::new(
+        store,
+        Arc::new(FakeDeviceCodeFlow::new(0, OffsetDateTime::now_utc())),
+        clock.clone(),
+    ));
+    let sign_in = SignIn::new(auth.clone());
+    let http = Arc::new(HttpGateway::new(
+        &gateway.base_url,
+        HttpClient::new().expect("client"),
+        Arc::new(AuthBearer::new(auth)),
+    ));
+    let socket = dir.path().join("vetinarid.sock");
+    let daemon = tokio::spawn(serve(
+        socket.clone(),
+        Services {
+            runs: http.clone(),
+            events: http.clone(),
+            owned: Vec::new(),
+            worker: WorkerName::parse("hex").expect("worker"),
+            clock: clock.clone(),
+            gates: Arc::new(NoGates),
+            local: LocalBoard::new(),
+            sign_in: Some(sign_in),
+            claims: Some(claims(dir.path(), http, clock, json!({}))),
+        },
+    ));
+
+    let runs = DaemonRuns::new(socket, "vetinari test");
+    let _watching = runs.start();
+    let mut changes = runs.changes();
+    let asked = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let items = runs.fetch(None).await.unwrap_or_default();
+            if items
+                .iter()
+                .any(|item| item.title().as_str() == "autognomus needs sign-in")
+            {
+                return;
+            }
+            let _ = changes.changed().await;
+        }
+    })
+    .await;
+    daemon.abort();
+    asked.expect("the board asks for a sign-in within twenty seconds");
 }

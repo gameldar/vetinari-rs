@@ -31,17 +31,28 @@ pub struct Gateway {
 }
 
 struct State {
+    refuse: bool,
     claim: Mutex<Option<Value>>,
     completed: mpsc::UnboundedSender<Request>,
 }
 
 impl Gateway {
     pub async fn start(claim: Value) -> Self {
+        Self::serving(Some(claim), false).await
+    }
+
+    /// A gateway that refuses every token it is sent.
+    pub async fn refusing() -> Self {
+        Self::serving(None, true).await
+    }
+
+    async fn serving(claim: Option<Value>, refuse: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let (completed, receiver) = mpsc::unbounded_channel();
         let state = Arc::new(State {
-            claim: Mutex::new(Some(claim)),
+            refuse,
+            claim: Mutex::new(claim),
             completed,
         });
         tokio::spawn(async move {
@@ -77,6 +88,15 @@ async fn answer(mut stream: TcpStream, state: Arc<State>) {
         .next()
         .unwrap_or_default()
         .to_owned();
+    if state.refuse {
+        reply(
+            &mut stream,
+            401,
+            r#"{"error":{"code":"unauthenticated","message":"bad token"}}"#,
+        )
+        .await;
+        return;
+    }
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/v1/runs/events") => {
             let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\r\n: connected\n\n";
@@ -122,6 +142,7 @@ async fn reply(stream: &mut TcpStream, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
+        401 => "Unauthorized",
         _ => "Not Found",
     };
     let response = format!(

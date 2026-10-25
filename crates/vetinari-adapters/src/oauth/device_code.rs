@@ -3,7 +3,9 @@
 //! Chosen over a redirect flow because Vetinari lives in a terminal: it can
 //! show a code and a URL, but it cannot usefully be a web server waiting for
 //! a browser to come back. The provider's own endpoints come from the domain's
-//! auth spec, so adding a provider does not mean touching this file.
+//! auth spec, so adding a provider does not mean touching this file; an OIDC
+//! issuer's come from its discovery document (`oidc.rs`), and both make the
+//! same requests through [`Exchange`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,79 +21,131 @@ use vetinari_core::domain::credentials::{AuthMethod, Provider, Secret, StoredCre
 
 use crate::HttpClient;
 
-/// Runs device-code flows over HTTP.
-pub struct HttpDeviceCodeFlow {
+/// The requests of a device-code flow, at whichever endpoints.
+pub(crate) struct Exchange {
     http: HttpClient,
-    clients: BTreeMap<Provider, OAuthClientConfig>,
     clock: Arc<dyn Clock>,
-    base_url_override: Option<String>,
 }
 
-impl HttpDeviceCodeFlow {
-    /// Build a flow with the configured OAuth clients.
-    #[must_use]
-    pub fn new(http: HttpClient, clients: Vec<OAuthClientConfig>, clock: Arc<dyn Clock>) -> Self {
-        Self {
-            http,
-            clients: clients
-                .into_iter()
-                .map(|client| (client.provider, client))
-                .collect(),
-            clock,
-            base_url_override: None,
+impl Exchange {
+    pub(crate) const fn new(http: HttpClient, clock: Arc<dyn Clock>) -> Self {
+        Self { http, clock }
+    }
+
+    pub(crate) fn http(&self) -> &HttpClient {
+        &self.http
+    }
+
+    /// Ask for a device and user code. `fallback_page` is the verification
+    /// page to show when the reply names none.
+    pub(crate) async fn challenge(
+        &self,
+        provider: Provider,
+        url: &str,
+        form: &[(&str, &str)],
+        fallback_page: Option<&str>,
+    ) -> PortResult<DeviceCodeChallenge> {
+        let reply = self.post_form(url, form).await?;
+
+        if let Some(error) = reply.get("error").and_then(Value::as_str) {
+            return Err(PortError::Refused {
+                what: format!("{} device authorisation", provider.name()),
+                detail: error.to_owned(),
+            });
         }
-    }
 
-    /// Send every request to one host instead of the provider's, for testing.
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url_override = Some(base_url.into());
-        self
-    }
+        let device_code = reply
+            .get("device_code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PortError::protocol("oauth", "the reply carried no device code".to_owned())
+            })?
+            .to_owned();
+        let user_code = reply
+            .get("user_code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PortError::protocol("oauth", "the reply carried no user code".to_owned())
+            })?
+            .to_owned();
+        let verification_uri = reply
+            .get("verification_url")
+            .or_else(|| reply.get("verification_uri"))
+            .and_then(Value::as_str)
+            .or(fallback_page)
+            .ok_or_else(|| {
+                PortError::protocol("oauth", "the reply named no verification page".to_owned())
+            })?
+            .to_owned();
+        let interval_secs = reply
+            .get("interval")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .max(1);
+        let expires_in = reply
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .unwrap_or(600);
 
-    fn client(&self, provider: Provider) -> PortResult<&OAuthClientConfig> {
-        self.clients.get(&provider).ok_or_else(|| {
-            PortError::not_configured(
-                provider.name(),
-                format!(
-                    "no OAuth client is configured; add [oauth.{}] with a client_id",
-                    provider.name()
-                ),
-            )
+        Ok(DeviceCodeChallenge {
+            user_code,
+            verification_uri,
+            device_code,
+            interval_secs,
+            expires_at: self.clock.now() + Duration::seconds(expires_in),
         })
     }
 
-    fn endpoints(provider: Provider) -> PortResult<(&'static str, &'static str, Vec<String>)> {
-        match provider.auth_spec().method {
-            AuthMethod::OAuthDeviceCode {
-                device_authorization_url,
-                token_url,
-                scopes,
-                ..
-            } => Ok((
-                device_authorization_url,
-                token_url,
-                scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-            )),
-            AuthMethod::ApiToken { .. } => Err(PortError::unsupported(
-                provider.name(),
-                "device-code authentication; paste an API token instead",
-            )),
+    /// Poll the token endpoint once.
+    pub(crate) async fn poll(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+    ) -> PortResult<DeviceCodePoll> {
+        let reply = self.post_form(url, form).await?;
+
+        if let Some(error) = reply.get("error").and_then(Value::as_str) {
+            return Ok(match error {
+                "authorization_pending" | "slow_down" => DeviceCodePoll::Pending,
+                "access_denied" => DeviceCodePoll::Rejected {
+                    reason: "the request was declined".to_owned(),
+                },
+                "expired_token" => DeviceCodePoll::Rejected {
+                    reason: "the code expired before it was approved".to_owned(),
+                },
+                other => DeviceCodePoll::Rejected {
+                    reason: other.to_owned(),
+                },
+            });
         }
+
+        Ok(DeviceCodePoll::Granted(self.credential_from(&reply)?))
     }
 
-    /// Rewrite a provider URL onto the override host, keeping its path.
-    fn url(&self, provider_url: &str) -> String {
-        match &self.base_url_override {
-            None => provider_url.to_owned(),
-            Some(base) => {
-                let path = provider_url
-                    .split_once("://")
-                    .and_then(|(_, rest)| rest.split_once('/'))
-                    .map_or_else(String::new, |(_, path)| format!("/{path}"));
-                format!("{}{path}", base.trim_end_matches('/'))
-            }
+    /// Exchange `refresh` for a fresh credential.
+    pub(crate) async fn refresh(
+        &self,
+        provider: Provider,
+        url: &str,
+        form: &[(&str, &str)],
+        refresh: &Secret,
+    ) -> PortResult<StoredCredential> {
+        let reply = self.post_form(url, form).await?;
+        if reply.get("error").and_then(Value::as_str).is_some() {
+            return Err(PortError::Unauthenticated { provider });
         }
+
+        let refreshed = self.credential_from(&reply)?;
+        // Providers often omit the refresh token on a refresh; keep the one
+        // that still works rather than losing the ability to renew again.
+        Ok(match refreshed.refresh_token() {
+            Some(_) => refreshed,
+            None => StoredCredential::oauth(
+                refreshed.token().clone(),
+                Some(refresh.clone()),
+                refreshed.expires_at(),
+            ),
+        })
     }
 
     async fn post_form(&self, url: &str, form: &[(&str, &str)]) -> PortResult<Value> {
@@ -150,64 +204,98 @@ impl HttpDeviceCodeFlow {
     }
 }
 
+/// Runs device-code flows over HTTP.
+pub struct HttpDeviceCodeFlow {
+    exchange: Exchange,
+    clients: BTreeMap<Provider, OAuthClientConfig>,
+    base_url_override: Option<String>,
+}
+
+impl HttpDeviceCodeFlow {
+    /// Build a flow with the configured OAuth clients.
+    #[must_use]
+    pub fn new(http: HttpClient, clients: Vec<OAuthClientConfig>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            exchange: Exchange::new(http, clock),
+            clients: clients
+                .into_iter()
+                .map(|client| (client.provider, client))
+                .collect(),
+            base_url_override: None,
+        }
+    }
+
+    /// Send every request to one host instead of the provider's, for testing.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url_override = Some(base_url.into());
+        self
+    }
+
+    fn client(&self, provider: Provider) -> PortResult<&OAuthClientConfig> {
+        self.clients.get(&provider).ok_or_else(|| {
+            PortError::not_configured(
+                provider.name(),
+                format!(
+                    "no OAuth client is configured; add [oauth.{}] with a client_id",
+                    provider.name()
+                ),
+            )
+        })
+    }
+
+    fn endpoints(provider: Provider) -> PortResult<(&'static str, &'static str, Vec<String>)> {
+        match provider.auth_spec().method {
+            AuthMethod::OAuthDeviceCode {
+                device_authorization_url,
+                token_url,
+                scopes,
+                ..
+            } => Ok((
+                device_authorization_url,
+                token_url,
+                scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            )),
+            AuthMethod::ApiToken { .. } => Err(PortError::unsupported(
+                provider.name(),
+                "device-code authentication; paste an API token instead",
+            )),
+            AuthMethod::OidcDeviceCode => Err(PortError::unsupported(
+                provider.name(),
+                "signing in here; vetinarid holds this credential",
+            )),
+        }
+    }
+
+    /// Rewrite a provider URL onto the override host, keeping its path.
+    fn url(&self, provider_url: &str) -> String {
+        match &self.base_url_override {
+            None => provider_url.to_owned(),
+            Some(base) => {
+                let path = provider_url
+                    .split_once("://")
+                    .and_then(|(_, rest)| rest.split_once('/'))
+                    .map_or_else(String::new, |(_, path)| format!("/{path}"));
+                format!("{}{path}", base.trim_end_matches('/'))
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl DeviceCodeFlow for HttpDeviceCodeFlow {
     async fn start(&self, provider: Provider) -> PortResult<DeviceCodeChallenge> {
         let client = self.client(provider)?;
         let (device_url, _, scopes) = Self::endpoints(provider)?;
         let scope = scopes.join(" ");
-
-        let reply = self
-            .post_form(
+        self.exchange
+            .challenge(
+                provider,
                 &self.url(device_url),
                 &[("client_id", client.client_id.as_str()), ("scope", &scope)],
+                Some("https://www.google.com/device"),
             )
-            .await?;
-
-        if let Some(error) = reply.get("error").and_then(Value::as_str) {
-            return Err(PortError::Refused {
-                what: format!("{} device authorisation", provider.name()),
-                detail: error.to_owned(),
-            });
-        }
-
-        let device_code = reply
-            .get("device_code")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                PortError::protocol("oauth", "the reply carried no device code".to_owned())
-            })?
-            .to_owned();
-        let user_code = reply
-            .get("user_code")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                PortError::protocol("oauth", "the reply carried no user code".to_owned())
-            })?
-            .to_owned();
-        let verification_uri = reply
-            .get("verification_url")
-            .or_else(|| reply.get("verification_uri"))
-            .and_then(Value::as_str)
-            .unwrap_or("https://www.google.com/device")
-            .to_owned();
-        let interval_secs = reply
-            .get("interval")
-            .and_then(Value::as_u64)
-            .unwrap_or(5)
-            .max(1);
-        let expires_in = reply
-            .get("expires_in")
-            .and_then(Value::as_i64)
-            .unwrap_or(600);
-
-        Ok(DeviceCodeChallenge {
-            user_code,
-            verification_uri,
-            device_code,
-            interval_secs,
-            expires_at: self.clock.now() + Duration::seconds(expires_in),
-        })
+            .await
     }
 
     async fn poll(
@@ -226,25 +314,7 @@ impl DeviceCodeFlow for HttpDeviceCodeFlow {
         if let Some(secret) = &client.client_secret {
             form.push(("client_secret", secret.as_str()));
         }
-
-        let reply = self.post_form(&self.url(token_url), &form).await?;
-
-        if let Some(error) = reply.get("error").and_then(Value::as_str) {
-            return Ok(match error {
-                "authorization_pending" | "slow_down" => DeviceCodePoll::Pending,
-                "access_denied" => DeviceCodePoll::Rejected {
-                    reason: "the request was declined".to_owned(),
-                },
-                "expired_token" => DeviceCodePoll::Rejected {
-                    reason: "the code expired before it was approved".to_owned(),
-                },
-                other => DeviceCodePoll::Rejected {
-                    reason: other.to_owned(),
-                },
-            });
-        }
-
-        Ok(DeviceCodePoll::Granted(self.credential_from(&reply)?))
+        self.exchange.poll(&self.url(token_url), &form).await
     }
 
     async fn refresh(
@@ -266,23 +336,9 @@ impl DeviceCodeFlow for HttpDeviceCodeFlow {
         if let Some(secret) = &client.client_secret {
             form.push(("client_secret", secret.as_str()));
         }
-
-        let reply = self.post_form(&self.url(token_url), &form).await?;
-        if reply.get("error").and_then(Value::as_str).is_some() {
-            return Err(PortError::Unauthenticated { provider });
-        }
-
-        let refreshed = self.credential_from(&reply)?;
-        // Providers often omit the refresh token on a refresh; keep the one
-        // that still works rather than losing the ability to renew again.
-        Ok(match refreshed.refresh_token() {
-            Some(_) => refreshed,
-            None => StoredCredential::oauth(
-                refreshed.token().clone(),
-                Some(refresh.clone()),
-                refreshed.expires_at(),
-            ),
-        })
+        self.exchange
+            .refresh(provider, &self.url(token_url), &form, refresh)
+            .await
     }
 }
 

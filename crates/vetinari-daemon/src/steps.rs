@@ -17,7 +17,7 @@ use vetinari_core::application::agents::AgentRegistry;
 use vetinari_core::application::devflow::api::ApiError;
 use vetinari_core::application::devflow::ports::TaskGateway;
 use vetinari_core::application::devflow::worker::{CLAIM_WAIT, GateReply, StepWorker};
-use vetinari_core::application::ports::{Clock, PortResult};
+use vetinari_core::application::ports::{Clock, PortError, PortResult};
 use vetinari_core::domain::agent::AgentStatus;
 use vetinari_core::domain::devflow::held::HeldState;
 use vetinari_core::domain::devflow::ids::{NodeInstance, RunId, TaskQueue, WorkerName};
@@ -27,6 +27,7 @@ use vetinari_core::domain::devflow::task::RawTask;
 use vetinari_core::domain::ids::SessionId;
 
 use crate::gates::Gates;
+use crate::signin::SignIn;
 
 /// What the owner of the worker is asked to do.
 pub(crate) enum Command {
@@ -141,6 +142,12 @@ impl LocalBoard {
             .get(run)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Have the receiver watch `run`, though nothing here changed: a run
+    /// found on the gateway after the daemon started.
+    pub(crate) fn adopt(&self, run: RunId) {
+        let _ = self.touched.send(run);
     }
 
     /// Replace every run's steps, telling the receiver of each run that
@@ -308,13 +315,15 @@ const MAX_BACKOFF: StdDuration = StdDuration::from_secs(60);
 
 /// Claim from one queue for as long as the owner runs: ask for capacity,
 /// long-poll, hand over what comes. An unreachable gateway backs off 1, 2,
-/// 4 ... 60 seconds; a refused or unauthenticated one stops the loop, since
-/// asking again will not change the answer until someone signs in.
+/// 4 ... 60 seconds. A token the gateway refuses even renewed asks for a
+/// sign-in and waits for it when the daemon can sign in; any other refusal
+/// stops the loop, since asking again will not change the answer.
 pub async fn claim_loop(
     tasks: Arc<dyn TaskGateway>,
     queue: TaskQueue,
     worker: WorkerName,
     steps: Steps,
+    sign_in: Option<Arc<SignIn>>,
 ) {
     let mut backoff = CLAIM_PAUSE;
     loop {
@@ -343,10 +352,18 @@ pub async fn claim_loop(
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-            Err(error) => {
-                tracing::error!(%error, %queue, "claiming stopped; autognomus needs sign-in");
-                return;
-            }
+            Err(error) => match (&error, &sign_in) {
+                (PortError::Unauthenticated { .. }, Some(sign_in)) => {
+                    tracing::warn!(%queue, "autognomus needs a sign-in; claiming waits for it");
+                    sign_in.lost();
+                    sign_in.signed_in().await;
+                    backoff = CLAIM_PAUSE;
+                }
+                _ => {
+                    tracing::error!(%error, %queue, "claiming stopped");
+                    return;
+                }
+            },
         }
     }
 }
@@ -484,6 +501,7 @@ mod tests {
             queue,
             worker(),
             h.steps.clone(),
+            None,
         ));
     }
 
@@ -596,6 +614,44 @@ mod tests {
         claim_on(&h, queues().human);
         settle(StdDuration::from_secs(120)).await;
         assert_eq!(claims(&h), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_refused_for_its_token_waits_for_a_sign_in_then_claims_again() {
+        use vetinari_core::application::auth::AuthService;
+        use vetinari_core::domain::credentials::{
+            CredentialKey, Provider, Secret, StoredCredential,
+        };
+        use vetinari_core::testing::{FakeDeviceCodeFlow, FixedClock, MemoryCredentialStore};
+
+        let h = harness();
+        let store = Arc::new(MemoryCredentialStore::default());
+        let sign_in = crate::signin::SignIn::new(Arc::new(AuthService::new(
+            store.clone(),
+            Arc::new(FakeDeviceCodeFlow::new(1, datetime!(2026-10-25 11:00 UTC))),
+            Arc::new(FixedClock::new(datetime!(2026-10-25 10:00 UTC))),
+        )));
+        h.tasks.on_claim(Err(PortError::Unauthenticated {
+            provider: Provider::Autognomus,
+        }));
+        tokio::spawn(claim_loop(
+            h.tasks.clone(),
+            queues().human,
+            worker(),
+            h.steps.clone(),
+            Some(sign_in.clone()),
+        ));
+        settle(StdDuration::from_secs(120)).await;
+        assert_eq!(claims(&h), 1);
+        assert!(sign_in.needed(), "the daemon asks for a sign-in");
+
+        store.seed(
+            &CredentialKey::new(Provider::Autognomus, None),
+            StoredCredential::oauth(Secret::new("jwt"), Some(Secret::new("r")), None),
+        );
+        sign_in.check().await;
+        settle(StdDuration::from_millis(100)).await;
+        assert_eq!(claims(&h), 2, "claiming resumes once signed in");
     }
 
     #[tokio::test(start_paused = true)]
