@@ -14,6 +14,7 @@ use vetinari_core::domain::devflow::ids::{NodeInstance, RunId};
 use vetinari_core::domain::devflow::lanes::{IterationSelection, RowKind};
 use vetinari_core::domain::devflow::step::GateKind;
 use vetinari_core::domain::devflow::summary::NeedsYou;
+use vetinari_core::domain::devflow::template::TicketRef;
 use vetinari_core::domain::ids::{ItemId, ProfileId, SessionId, SkillId, SourceId, SpaceId};
 use vetinari_core::domain::skill::Skill;
 
@@ -58,6 +59,13 @@ pub enum PromptKind {
     },
     /// An API token for a provider.
     ApiToken(Provider),
+    /// The repository a ticket's run is to work in, as `owner/name`.
+    FeatureRepo {
+        /// The ticket's item, which waits on the run once it starts.
+        item: ItemId,
+        /// The ticket.
+        ticket: TicketRef,
+    },
     /// A note for a recheck, answering a run's info-needed gate.
     GateNote {
         /// The run.

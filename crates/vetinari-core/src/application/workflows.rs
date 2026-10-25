@@ -144,7 +144,7 @@ impl WorkflowEngine {
         registry: &mut AgentRegistry,
     ) -> PortResult<WorkflowOutcome> {
         let skill = require_skill(library, skills::PR_REVIEW)?;
-        let repo = resolve_repo(profile, &pr.repo);
+        let repo = profile.repo_path(&pr.repo);
         let bindings = Bindings::new()
             .with("number", pr.number.to_string())
             .with("repo", pr.repo.clone())
@@ -508,14 +508,6 @@ fn render(skill: &Skill, bindings: &Bindings, working_dir: &Path) -> PortResult<
                 format!("the skill could not be rendered: {error}"),
             )
         })
-}
-
-fn resolve_repo(profile: &Profile, repo_slug: &str) -> PathBuf {
-    let name = repo_slug.rsplit('/').next().unwrap_or(repo_slug);
-    match profile.repo_roots().first() {
-        Some(root) => root.join(name),
-        None => PathBuf::from(name),
-    }
 }
 
 #[cfg(test)]

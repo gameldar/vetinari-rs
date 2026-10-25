@@ -29,10 +29,14 @@ use vetinari_core::domain::credentials::Provider;
 use vetinari_core::domain::devflow::ids::{NodeInstance, RunId};
 use vetinari_core::domain::devflow::lanes::IterationSelection;
 use vetinari_core::domain::devflow::outcome::GateAnswer;
+use vetinari_core::domain::devflow::template::DevWorkflow;
 use vetinari_core::domain::ids::{Slug, SourceId};
 use vetinari_core::domain::text::NonEmptyText;
 
-use super::protocol::{read_auth_status, read_challenge, read_detail, read_run_item};
+use super::protocol::{
+    read_auth_status, read_challenge, read_detail, read_run_item, read_run_started,
+    run_start_params,
+};
 
 const WHAT: &str = "vetinarid";
 
@@ -187,6 +191,27 @@ impl DaemonRuns {
         Connection::open(&self.socket, &self.client)
             .await?
             .request("run.cancel", json!({ "run": run.as_str() }))
+            .await?;
+        Ok(())
+    }
+
+    /// Start a run; the daemon refuses a ticket that already has one.
+    pub async fn start_run(&self, workflow: &DevWorkflow) -> PortResult<RunId> {
+        let result = Connection::open(&self.socket, &self.client)
+            .await?
+            .request("run.start", run_start_params(workflow))
+            .await?;
+        read_run_started(&result).map_err(protocol)
+    }
+
+    /// Take a finished run off the queue, and its worktree when asked.
+    pub async fn dismiss_run(&self, run: &RunId, remove_worktree: bool) -> PortResult<()> {
+        Connection::open(&self.socket, &self.client)
+            .await?
+            .request(
+                "run.dismiss",
+                json!({ "run": run.as_str(), "remove_worktree": remove_worktree }),
+            )
             .await?;
         Ok(())
     }
@@ -613,6 +638,86 @@ mod tests {
             cancelling.await.expect("join"),
             Err(PortError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_start_names_its_run_and_a_refusal_says_why() {
+        use vetinari_core::domain::devflow::ids::Rounds;
+        use vetinari_core::domain::devflow::template::{FeatureFromTicket, RepoTarget, TicketRef};
+        use vetinari_core::domain::ids::ProfileId;
+
+        let mut daemon = FakeDaemon::start();
+        let runs = DaemonRuns::new(daemon.socket.clone(), "vetinari test");
+        let workflow = DevWorkflow::FeatureFromTicket(FeatureFromTicket {
+            ticket: TicketRef {
+                source: SourceId::parse("jira").expect("source"),
+                key: NonEmptyText::parse("ENG-412").expect("key"),
+                title: NonEmptyText::parse("Rate-limit retries").expect("title"),
+                url: None,
+            },
+            repo: RepoTarget {
+                path: PathBuf::from("/work/repos/web"),
+                remote: NonEmptyText::parse("acme/web").expect("remote"),
+            },
+            profile: ProfileId::parse("work").expect("profile"),
+            base: None,
+            max_review_rounds: Rounds::DEFAULT,
+            max_intake_rounds: Rounds::DEFAULT,
+            agent: None,
+        });
+
+        let starting = tokio::spawn({
+            let runs = runs.clone();
+            let workflow = workflow.clone();
+            async move { runs.start_run(&workflow).await }
+        });
+        let mut peer = daemon.accept().await;
+        peer.greet().await;
+        let request = peer.answer("run.start", json!({ "run": "01JB80" })).await;
+        assert_eq!(
+            request["params"],
+            super::super::protocol::run_start_params(&workflow)
+        );
+        assert_eq!(
+            starting.await.expect("join"),
+            Ok(RunId::parse("01JB80").expect("run"))
+        );
+
+        let refused = tokio::spawn({
+            let runs = runs.clone();
+            async move { runs.start_run(&workflow).await }
+        });
+        let mut peer = daemon.accept().await;
+        peer.greet().await;
+        let request = peer.read().await;
+        peer.send(json!({ "id": request["id"],
+            "error": { "code": "conflict", "message": "ENG-412 already has a run" } }))
+            .await;
+        assert!(matches!(
+            refused.await.expect("join"),
+            Err(PortError::Refused { detail, .. }) if detail.contains("already has a run")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_dismissal_says_whether_the_worktree_goes_too() {
+        let mut daemon = FakeDaemon::start();
+        let runs = DaemonRuns::new(daemon.socket.clone(), "vetinari test");
+        let dismissing = tokio::spawn({
+            let runs = runs.clone();
+            async move {
+                runs.dismiss_run(&RunId::parse("r1").expect("run"), true)
+                    .await
+            }
+        });
+        let mut peer = daemon.accept().await;
+        peer.greet().await;
+        let request = peer.answer("run.dismiss", json!({})).await;
+        assert_eq!(
+            request["params"],
+            json!({ "run": "r1", "remove_worktree": true })
+        );
+        assert_eq!(dismissing.await.expect("join"), Ok(()));
     }
 
     #[tokio::test]

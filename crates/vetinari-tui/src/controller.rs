@@ -16,6 +16,7 @@ use vetinari_core::application::ports::AttentionSource;
 use vetinari_core::application::ports::{DeviceCodeChallenge, DeviceCodePoll, PortResult};
 use vetinari_core::application::workflows::WorkflowOutcome;
 use vetinari_core::domain::credentials::Provider;
+use vetinari_core::domain::devflow::template::DevWorkflow;
 use vetinari_core::domain::ids::{ItemId, SourceId};
 use vetinari_core::domain::profile::Profile;
 use vetinari_core::domain::skill::SkillLibrary;
@@ -447,6 +448,25 @@ impl Controller {
                     Ok(()) => vec![
                         Update::CloseOverlay,
                         Update::Status(StatusMessage::info(format!("{what}: done"))),
+                    ],
+                    Err(error) => vec![Update::Status(describe_failure(&what, &error))],
+                }
+            }
+
+            Task::StartRun { item, workflow } => {
+                let DevWorkflow::FeatureFromTicket(feature) = workflow.as_ref();
+                let what = format!("running {} to a pull request", feature.ticket.key);
+                let daemon = match self.daemon() {
+                    Ok(daemon) => daemon,
+                    Err(error) => return vec![Update::Status(describe_failure(&what, &error))],
+                };
+                match daemon.start_run(&workflow).await {
+                    Ok(run) => vec![
+                        Update::RunStarted {
+                            item,
+                            run: ItemId::from_parts(daemon.id(), run.as_str()),
+                        },
+                        Update::Status(StatusMessage::info(format!("{what}: started run {run}"))),
                     ],
                     Err(error) => vec![Update::Status(describe_failure(&what, &error))],
                 }
@@ -1474,6 +1494,7 @@ mod tests {
                         seen.lock().expect("lock").push(method.clone());
                         let result = match method.as_str() {
                             "gate.answer" => gate,
+                            "run.start" => r#"{"run":"01JB80A1B2C3D4E5F6G7H8J9K0"}"#,
                             "auth.status" => r#"{"state":"valid"}"#,
                             "auth.begin" => r#"{"stream":1}"#,
                             _ => "{}",
@@ -1553,6 +1574,67 @@ mod tests {
         assert!(status_of(&updates).text.contains("cancelling"));
         assert!(updates.iter().any(|u| matches!(u, Update::CloseOverlay)));
         assert_eq!(*asked.lock().expect("lock"), ["hello", "run.cancel"]);
+    }
+
+    #[tokio::test]
+    async fn starting_a_run_asks_the_daemon_and_holds_the_ticket_on_the_run() {
+        use vetinari_core::domain::devflow::ids::Rounds;
+        use vetinari_core::domain::devflow::template::{
+            DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
+        };
+        use vetinari_core::domain::ids::{ItemId, SourceId};
+        use vetinari_core::domain::text::NonEmptyText;
+
+        let mut h = harness("");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("vetinarid.sock");
+        let asked = fake_vetinarid(socket.clone(), "{}");
+        h.controller
+            .attach_daemon(vetinari_adapters::daemon::client::DaemonRuns::new(
+                socket, "test",
+            ));
+        let jira = SourceId::parse("jira").expect("source");
+        let ticket_item = ItemId::from_parts(&jira, "ENG-412");
+        let workflow = DevWorkflow::FeatureFromTicket(FeatureFromTicket {
+            ticket: TicketRef {
+                source: jira,
+                key: NonEmptyText::parse("ENG-412").expect("key"),
+                title: NonEmptyText::parse("Rate-limit retries").expect("title"),
+                url: None,
+            },
+            repo: RepoTarget::named("acme/web", &h.profile).expect("repo"),
+            profile: h.profile.id().clone(),
+            base: None,
+            max_review_rounds: Rounds::DEFAULT,
+            max_intake_rounds: Rounds::DEFAULT,
+            agent: None,
+        });
+
+        let updates = h
+            .controller
+            .run(
+                Task::StartRun {
+                    item: ticket_item.clone(),
+                    workflow: Box::new(workflow),
+                },
+                &h.profile,
+            )
+            .await;
+        assert_eq!(*asked.lock().expect("lock"), ["hello", "run.start"]);
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::RunStarted { item, run }
+                if *item == ticket_item
+                    && *run == ItemId::from_parts(
+                        &SourceId::parse("vetinarid").expect("source"),
+                        a_run().as_str(),
+                    )
+        )));
+        assert!(
+            status_of(&updates).text.contains("ENG-412"),
+            "{:?}",
+            status_of(&updates)
+        );
     }
 
     #[tokio::test]

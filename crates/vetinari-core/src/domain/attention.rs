@@ -66,6 +66,7 @@ impl SourceCategory {
                 Action::Select,
             ],
             SourceCategory::IssueTracking => &[
+                Action::RunFeatureFromTicket,
                 Action::IssueUpdateStatus,
                 Action::IssueAssign,
                 Action::IssueStandupSummary,
@@ -776,6 +777,18 @@ mod tests {
         );
         assert!(pr.available_actions().contains(&Action::PrReviewSpawn));
         assert!(pr.available_actions().contains(&Action::PrApprove));
+
+        let issue = item(
+            "jira",
+            "ENG-412",
+            SourceCategory::IssueTracking,
+            ItemState::Assigned,
+        );
+        assert!(
+            issue
+                .available_actions()
+                .contains(&Action::RunFeatureFromTicket)
+        );
 
         let event = item(
             "google-calendar",

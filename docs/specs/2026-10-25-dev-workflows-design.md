@@ -1196,6 +1196,14 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
   ticket cannot both pass the check. It tells `feed_runs` through a `RunChange` channel
   (`Owned`, `Dismissed`), which replaced `LocalBoard::adopt`. A `--scripted` daemon answers both
   methods `invalid`, as it does `auth.begin`.
+- In the TUI, `SPC w f` (`run-feature-from-ticket`, offered on every issue item) asks which
+  repository the run works in, as `owner/name`, since an issue does not say. A GitHub issue's key
+  (`owner/name#n`) fills it in. `RepoTarget::named` parses it and finds the clone where the
+  active profile keeps its repositories (`Profile::repo_path`, the rule a PR review already used).
+  The run is for the active profile. Once the daemon answers `{ run }`, the ticket item is
+  delegated to the run's item (`vetinarid:<run>`), so it waits until the run needs the developer.
+  A refusal, such as `conflict`, is shown on the status line. Dismissing has no key yet; the
+  client has `dismiss_run` for it.
 
 ## 11. Testing
 

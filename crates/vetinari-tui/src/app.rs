@@ -23,10 +23,14 @@ use vetinari_core::domain::attention::{
     AttentionItem, EventRef, IssueRef, ItemContext, ItemState, MessageRef, PullRequestRef, humanize,
 };
 use vetinari_core::domain::credentials::{AuthMethod, Provider, Secret};
+use vetinari_core::domain::devflow::ids::Rounds;
 use vetinari_core::domain::devflow::ids::{NodeInstance, RunId};
 use vetinari_core::domain::devflow::lanes::IterationSelection;
 use vetinari_core::domain::devflow::outcome::{GateAnswer, Line};
 use vetinari_core::domain::devflow::step::GateKind;
+use vetinari_core::domain::devflow::template::{
+    DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
+};
 use vetinari_core::domain::feedback::{CapturedContext, FeedbackRequest, FeedbackTarget};
 use vetinari_core::domain::ids::{ItemId, SessionId, SkillId, SourceId, SpaceId};
 use vetinari_core::domain::keymap::{Keymap, Mode};
@@ -315,6 +319,13 @@ pub enum Task {
         /// The run.
         run: RunId,
     },
+    /// Start a dev workflow run for an item.
+    StartRun {
+        /// The item the run is for, which waits on it.
+        item: ItemId,
+        /// The run to start. Boxed: it is large and most tasks are small.
+        workflow: Box<DevWorkflow>,
+    },
 }
 
 /// What a keypress led to.
@@ -333,6 +344,13 @@ pub enum Outcome {
 pub enum Update {
     /// Every source's answer to a poll.
     Polled(Vec<Polled>),
+    /// The daemon started a run for an item.
+    RunStarted {
+        /// The item.
+        item: ItemId,
+        /// The run's own queue item.
+        run: ItemId,
+    },
     /// A workflow started an agent on an item.
     AgentStarted {
         /// The item.
@@ -762,6 +780,9 @@ impl App {
                 let agent = AgentRegistry::item_id(&session);
                 self.decide(Decision::Delegate { item, agent });
             }
+            Update::RunStarted { item, run } => {
+                self.decide(Decision::Delegate { item, agent: run });
+            }
             Update::CloseOverlay => self.close_overlay(),
             Update::RunDetail(detail) => {
                 if let Some(Overlay::Run(view)) = self.overlay.as_mut()
@@ -988,6 +1009,13 @@ impl App {
                         "Assign issue",
                         "account id or username",
                     );
+                    Outcome::Nothing
+                }
+                None => self.warn("select an issue row first"),
+            },
+            Action::RunFeatureFromTicket => match self.selected_ticket() {
+                Some((item, ticket, repo)) => {
+                    self.overlay = Some(Overlay::Prompt(Self::repo_prompt(item, ticket, &repo)));
                     Outcome::Nothing
                 }
                 None => self.warn("select an issue row first"),
@@ -1219,6 +1247,28 @@ impl App {
             }),
             PromptKind::ApiToken(provider) => {
                 Outcome::Task(Task::SaveToken(provider, Secret::new(text.trim())))
+            }
+            PromptKind::FeatureRepo { item, ticket } => {
+                match RepoTarget::named(&text, self.profiles.active()) {
+                    Ok(repo) => Outcome::Task(Task::StartRun {
+                        item,
+                        workflow: Box::new(DevWorkflow::FeatureFromTicket(FeatureFromTicket {
+                            ticket,
+                            repo,
+                            profile: self.profiles.active().id().clone(),
+                            base: None,
+                            max_review_rounds: Rounds::DEFAULT,
+                            max_intake_rounds: Rounds::DEFAULT,
+                            agent: None,
+                        })),
+                    }),
+                    Err(error) => {
+                        let outcome = self.warn(error.to_string());
+                        self.overlay =
+                            Some(Overlay::Prompt(Self::repo_prompt(item, ticket, &text)));
+                        outcome
+                    }
+                }
             }
             PromptKind::GateNote { run, instance } => match Line::parse(text.trim()) {
                 Ok(note) => Outcome::Task(Task::AnswerGate {
@@ -1725,6 +1775,39 @@ impl App {
             ItemContext::Issue(issue) => Some((item.source().clone(), issue.clone())),
             _ => None,
         }
+    }
+
+    /// The selected issue as a ticket to run, and the repository its key
+    /// names, if any: a GitHub issue's key is `owner/name#n`.
+    fn selected_ticket(&self) -> Option<(ItemId, TicketRef, String)> {
+        let item = self.selected_item()?;
+        let ItemContext::Issue(issue) = item.context() else {
+            return None;
+        };
+        let ticket = TicketRef {
+            source: item.source().clone(),
+            key: NonEmptyText::parse(&issue.key).ok()?,
+            title: item.title().clone(),
+            url: item.url().map(str::to_owned),
+        };
+        let repo = issue
+            .key
+            .split_once('#')
+            .map(|(repo, _)| repo.to_owned())
+            .unwrap_or_default();
+        Some((item.id().clone(), ticket, repo))
+    }
+
+    /// Ask which repository a ticket's run works in.
+    fn repo_prompt(item: ItemId, ticket: TicketRef, repo: &str) -> Prompt {
+        let title = format!("Run {} to a pull request", ticket.key);
+        let mut prompt = Prompt::line(
+            PromptKind::FeatureRepo { item, ticket },
+            title,
+            "the repository, as owner/name; RET starts the run",
+        );
+        prompt.input = crate::text_input::TextInput::single_line().with_value(repo);
+        prompt
     }
 
     fn selected_message(&self) -> Option<(SourceId, MessageRef)> {
@@ -2287,6 +2370,109 @@ mod tests {
         );
         assert!(
             position_of(&app, "Fix memory leak in auth parser")
+                .contains(&format!("{:?}", Lifecycle::Waiting(WaitingOn::Agent)))
+        );
+    }
+
+    fn github_issue_item() -> AttentionItem {
+        AttentionItem::builder(
+            &source("github"),
+            "acme/web#17",
+            SourceCategory::IssueTracking,
+            NonEmptyText::parse("Retry on 503").expect("title"),
+        )
+        .state(ItemState::Assigned)
+        .url("https://github.test/acme/web/issues/17")
+        .occurred_at(NOW)
+        .context(ItemContext::Issue(IssueRef {
+            key: "acme/web#17".to_owned(),
+            status: "open".to_owned(),
+            transitions: Vec::new(),
+        }))
+        .build()
+    }
+
+    fn start_run(
+        outcome: Outcome,
+    ) -> (
+        ItemId,
+        vetinari_core::domain::devflow::template::FeatureFromTicket,
+    ) {
+        let Outcome::Task(Task::StartRun { item, workflow }) = outcome else {
+            panic!("expected a run to start, got {outcome:?}");
+        };
+        let DevWorkflow::FeatureFromTicket(feature) = *workflow;
+        (item, feature)
+    }
+
+    #[test]
+    fn a_ticket_is_run_to_a_pull_request_in_the_repository_named() {
+        let mut app = app();
+        select_row(&mut app, "Review spec");
+
+        press(&mut app, "SPC w f");
+        let Some(Overlay::Prompt(prompt)) = app.overlay() else {
+            panic!("expected the repository prompt");
+        };
+        assert!(matches!(prompt.kind, PromptKind::FeatureRepo { .. }));
+        type_text(&mut app, "acme/web");
+        let (item, feature) = start_run(press(&mut app, "RET"));
+
+        assert_eq!(item, issue_item().id().clone());
+        assert_eq!(feature.ticket.source.as_str(), "jira");
+        assert_eq!(feature.ticket.key.as_str(), "DEV-891");
+        assert_eq!(feature.ticket.title.as_str(), "Review spec");
+        assert_eq!(feature.repo.remote.as_str(), "acme/web");
+        assert_eq!(feature.repo.path, app.profile().repo_path("acme/web"));
+        assert_eq!(&feature.profile, app.profile().id());
+    }
+
+    #[test]
+    fn a_github_issue_offers_its_own_repository() {
+        let mut app = empty_app();
+        app.apply(Update::Polled(polled(vec![github_issue_item()])));
+        select_row(&mut app, "Retry on 503");
+
+        press(&mut app, "SPC w f");
+        let (_, feature) = start_run(press(&mut app, "RET"));
+        assert_eq!(feature.repo.remote.as_str(), "acme/web");
+        assert_eq!(
+            feature.ticket.url.as_deref(),
+            Some("https://github.test/acme/web/issues/17")
+        );
+    }
+
+    #[test]
+    fn a_repository_that_is_not_owner_and_name_is_asked_for_again() {
+        let mut app = app();
+        select_row(&mut app, "Review spec");
+        press(&mut app, "SPC w f");
+        type_text(&mut app, "web");
+
+        assert!(matches!(press(&mut app, "RET"), Outcome::Nothing));
+        assert_eq!(app.status().expect("a status").level, Level::Warn);
+        assert!(matches!(app.overlay(), Some(Overlay::Prompt(_))));
+    }
+
+    #[test]
+    fn running_a_ticket_needs_an_issue_row() {
+        let mut app = app();
+        select_row(&mut app, "Fix memory leak in auth parser");
+        assert!(matches!(press(&mut app, "SPC w f"), Outcome::Nothing));
+        assert_eq!(app.status().expect("a status").level, Level::Warn);
+        assert!(app.overlay().is_none());
+    }
+
+    #[test]
+    fn a_started_run_holds_its_ticket_until_the_run_needs_you() {
+        let mut app = app();
+        app.apply(Update::RunStarted {
+            item: issue_item().id().clone(),
+            run: ItemId::from_parts(&source("vetinarid"), "01JB80"),
+        });
+        assert_eq!(lane_of(&app, "Review spec"), Lane::Waiting);
+        assert!(
+            position_of(&app, "Review spec")
                 .contains(&format!("{:?}", Lifecycle::Waiting(WaitingOn::Agent)))
         );
     }

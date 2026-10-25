@@ -11,6 +11,7 @@ use std::str::FromStr;
 use super::ids::Rounds;
 use crate::domain::git::BranchName;
 use crate::domain::ids::{AgentId, ProfileId, SourceId};
+use crate::domain::profile::Profile;
 use crate::domain::text::NonEmptyText;
 use crate::domain::workspace::SpaceName;
 
@@ -86,6 +87,33 @@ pub struct RepoTarget {
     pub path: PathBuf,
     /// `owner/name` on the host, for opening the pull request.
     pub remote: NonEmptyText,
+}
+
+/// A repository was not named as `owner/name`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{found:?} is not a repository: name it owner/name")]
+pub struct NotARepository {
+    /// What was given.
+    pub found: String,
+}
+
+impl RepoTarget {
+    /// The repository `owner/name`, cloned where `profile` keeps it.
+    pub fn named(slug: &str, profile: &Profile) -> Result<Self, NotARepository> {
+        let slug = slug.trim();
+        let named = slug.split_once('/').is_some_and(|(owner, name)| {
+            !owner.is_empty() && !name.is_empty() && !name.contains('/')
+        });
+        match NonEmptyText::parse(slug) {
+            Ok(remote) if named => Ok(Self {
+                path: profile.repo_path(slug),
+                remote,
+            }),
+            _ => Err(NotARepository {
+                found: slug.to_owned(),
+            }),
+        }
+    }
 }
 
 /// A dev workflow, with everything a run of it needs.
@@ -167,6 +195,26 @@ mod tests {
             Ok(TemplateKind::FeatureFromTicket)
         );
         assert!("deploy".parse::<TemplateKind>().is_err());
+    }
+
+    #[test]
+    fn a_repository_is_named_owner_slash_name_and_found_under_the_profile() {
+        let profile = Profile::new(
+            ProfileId::parse("work").expect("id"),
+            NonEmptyText::parse("Work").expect("name"),
+            crate::domain::workspace::TargetKind::Tmux,
+        )
+        .with_repo_root(PathBuf::from("/work/repos"));
+        assert_eq!(
+            RepoTarget::named(" acme/web ", &profile),
+            Ok(RepoTarget {
+                path: PathBuf::from("/work/repos/web"),
+                remote: NonEmptyText::parse("acme/web").expect("remote"),
+            })
+        );
+        for bad in ["web", "acme/", "/web", "acme/web/extra", ""] {
+            assert!(RepoTarget::named(bad, &profile).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
