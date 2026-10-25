@@ -1,0 +1,64 @@
+[
+  {
+    "instance": "implement@1",
+    "status": "ready",
+    "attempt": null
+  },
+  {
+    "instance": "implement@1",
+    "status": "running",
+    "attempt": 1
+  },
+  {
+    "instance": "implement@1",
+    "status": "waiting",
+    "until": "2026-10-25T10:01:00Z",
+    "attempt": 1
+  },
+  {
+    "instance": "implement@1",
+    "status": "offered",
+    "queue": "vetinari-hex-agent",
+    "attempt": 1
+  },
+  {
+    "instance": "implement@1",
+    "status": "claimed",
+    "worker": "ci-runner.07",
+    "expires_at": "2026-10-25T10:05:00Z",
+    "attempt": 2
+  },
+  {
+    "instance": "rework",
+    "status": "looping",
+    "iteration": 2
+  },
+  {
+    "instance": "review@1",
+    "status": "done",
+    "branch": "approved",
+    "attempt": 1,
+    "first_ready_at": "2026-10-25T09:42:00Z",
+    "finished_at": "2026-10-25T09:50:00Z"
+  },
+  {
+    "instance": "implement@1",
+    "status": "done",
+    "attempt": 1
+  },
+  {
+    "instance": "implement@1",
+    "status": "failed",
+    "error": "agent crashed",
+    "attempt": 3
+  },
+  {
+    "instance": "open-pr",
+    "status": "skipped"
+  },
+  {
+    "instance": "implement@1",
+    "status": "cancelled",
+    "attempt": 1
+  }
+]

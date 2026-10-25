@@ -45,28 +45,61 @@ pub struct MockServer {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
+/// One reply the server gives.
+#[derive(Debug, Clone)]
+pub enum Reply {
+    /// A status and a JSON body with its length.
+    Json(u16, String),
+    /// A `200` event stream with no length: each chunk is written and
+    /// flushed in turn, then the connection is closed.
+    Stream(Vec<String>),
+}
+
 impl MockServer {
     /// Start a server that answers each queued `(status, body)` in turn.
     pub async fn start(replies: Vec<(u16, String)>) -> Self {
+        Self::replying(
+            replies
+                .into_iter()
+                .map(|(status, body)| Reply::Json(status, body))
+                .collect(),
+        )
+        .await
+    }
+
+    /// Start a server that gives each queued reply in turn.
+    pub async fn replying(replies: Vec<Reply>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
 
         tokio::spawn(async move {
-            for (status, body) in replies {
+            for reply in replies {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 if let Some(request) = read_request(&mut stream).await {
                     recorded.lock().expect("lock").push(request);
                 }
-                let response = format!(
-                    "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    reason(status),
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
+                match reply {
+                    Reply::Json(status, body) => {
+                        let response = format!(
+                            "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            reason(status),
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    Reply::Stream(chunks) => {
+                        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        for chunk in chunks {
+                            let _ = stream.flush().await;
+                            let _ = stream.write_all(chunk.as_bytes()).await;
+                        }
+                    }
+                }
                 let _ = stream.flush().await;
                 let _ = stream.shutdown().await;
             }
@@ -112,8 +145,10 @@ const fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         422 => "Unprocessable Entity",
         429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Error",
     }
 }

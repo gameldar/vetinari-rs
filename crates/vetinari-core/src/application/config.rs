@@ -20,6 +20,7 @@ use crate::domain::action::Action;
 use crate::domain::agent::TaskClass;
 use crate::domain::attention::SourceCategory;
 use crate::domain::credentials::{AuthMethod, Provider};
+use crate::domain::devflow::ids::WorkerName;
 use crate::domain::ids::{AgentId, ProfileId, Slug, SourceId};
 use crate::domain::keymap::{Keymap, Mode};
 use crate::domain::keys::KeySequence;
@@ -224,6 +225,79 @@ pub struct OAuthClientConfig {
     pub client_secret: Option<String>,
 }
 
+/// An absolute `http` or `https` URL, without a trailing slash so paths
+/// can be appended to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpUrl(String);
+
+impl HttpUrl {
+    /// Read a URL, or say why it is not one.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim().trim_end_matches('/');
+        let rest = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+            .ok_or_else(|| format!("{raw:?} is not an http(s) URL"))?;
+        if rest.is_empty() || rest.starts_with('/') {
+            return Err(format!("{raw:?} names no host"));
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    /// The URL.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HttpUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An OIDC client: where its issuer is and what to ask it for. The
+/// endpoints come from the issuer's discovery document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcClient {
+    /// The issuer, as the tokens name it.
+    pub issuer: HttpUrl,
+    /// The client id registered with it.
+    pub client_id: String,
+    /// The audience to request, for issuers that take one on the request.
+    pub audience: Option<String>,
+    /// The scopes to request.
+    pub scopes: Vec<String>,
+}
+
+/// The autognomus gateway vetinarid works for (design 12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutognomusConfig {
+    /// The gateway's base URL.
+    pub gateway_url: HttpUrl,
+    /// Where vetinarid's token for it comes from.
+    pub credential: GatewayCredential,
+    /// The worker label, when not the hostname.
+    pub worker: Option<WorkerName>,
+}
+
+/// Where vetinarid's gateway token comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayCredential {
+    /// Signed in at an OIDC issuer by device code, kept in the keyring.
+    SignIn(OidcClient),
+    /// Read from a file someone else keeps current: for a machine with no
+    /// keyring, or an issuer with no device code endpoint.
+    TokenFile(PathBuf),
+}
+
+impl AutognomusConfig {
+    /// The scopes asked for when the file names none: an id token, and a
+    /// refresh token so a sign-in outlives one access token.
+    pub const DEFAULT_SCOPES: [&'static str; 2] = ["openid", "offline_access"];
+}
+
 /// Behaviour that is not specific to a profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct General {
@@ -284,6 +358,8 @@ pub struct Config {
     pub oauth_clients: Vec<OAuthClientConfig>,
     /// When the attention queue brings items back.
     pub queue: QueueRules,
+    /// The autognomus gateway, when vetinarid works for one.
+    pub autognomus: Option<AutognomusConfig>,
 }
 
 impl Config {
@@ -299,6 +375,10 @@ impl Config {
         let sources = parse_sources(&raw.sources, &mut problems);
         let oauth_clients = parse_oauth(&raw.oauth, &mut problems);
         let queue = parse_queue(&raw.queue, &mut problems);
+        let autognomus = raw
+            .autognomus
+            .as_ref()
+            .and_then(|table| parse_autognomus(table, context, &mut problems));
 
         let profiles = match profiles {
             Some(mut set) => {
@@ -333,6 +413,7 @@ impl Config {
             sources,
             oauth_clients,
             queue,
+            autognomus,
         })
     }
 
@@ -920,6 +1001,102 @@ fn parse_oauth(
     clients
 }
 
+fn parse_autognomus(
+    raw: &RawAutognomus,
+    context: &ParseContext,
+    problems: &mut Vec<ConfigProblem>,
+) -> Option<AutognomusConfig> {
+    let before = problems.len();
+    let mut problem = |field: &str, message: String| {
+        problems.push(ConfigProblem {
+            path: format!("autognomus.{field}"),
+            message,
+        });
+    };
+    let url = |field: &str, value: &str, problem: &mut dyn FnMut(&str, String)| {
+        HttpUrl::parse(value)
+            .map_err(|message| problem(field, message))
+            .ok()
+    };
+    let gateway_url = match &raw.gateway_url {
+        None => {
+            problem(
+                "gateway_url",
+                "the gateway needs its gateway_url".to_owned(),
+            );
+            None
+        }
+        Some(value) => url("gateway_url", value, &mut problem),
+    };
+    let credential = match &raw.token_file {
+        Some(file) if file.trim().is_empty() => {
+            problem("token_file", "names no file".to_owned());
+            None
+        }
+        Some(file) => Some(GatewayCredential::TokenFile(expand(file, context))),
+        None => {
+            let issuer = match &raw.issuer {
+                None => {
+                    problem(
+                        "issuer",
+                        "the gateway needs its issuer, or a token_file to read a token from"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Some(value) => url("issuer", value, &mut problem),
+            };
+            let client_id = raw
+                .client_id
+                .as_ref()
+                .map(|id| id.trim().to_owned())
+                .filter(|id| !id.is_empty());
+            if client_id.is_none() {
+                problem(
+                    "client_id",
+                    "the issuer needs vetinari's client id, or a token_file to read a token from"
+                        .to_owned(),
+                );
+            }
+            issuer.zip(client_id).map(|(issuer, client_id)| {
+                GatewayCredential::SignIn(OidcClient {
+                    issuer,
+                    client_id,
+                    audience: raw
+                        .audience
+                        .as_ref()
+                        .map(|audience| audience.trim().to_owned())
+                        .filter(|audience| !audience.is_empty()),
+                    scopes: raw.scopes.clone().unwrap_or_else(|| {
+                        AutognomusConfig::DEFAULT_SCOPES
+                            .iter()
+                            .map(|scope| (*scope).to_owned())
+                            .collect()
+                    }),
+                })
+            })
+        }
+    };
+    let worker = match &raw.worker {
+        None => None,
+        Some(name) => match WorkerName::parse(name) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                problem("worker", error.to_string());
+                None
+            }
+        },
+    };
+    if problems.len() > before {
+        return None;
+    }
+    Some(AutognomusConfig {
+        gateway_url: gateway_url?,
+        credential: credential?,
+        worker,
+    })
+}
+
 fn expand(path: &str, context: &ParseContext) -> PathBuf {
     let trimmed = path.trim();
     if let Some(rest) = trimmed.strip_prefix("~/")
@@ -955,6 +1132,28 @@ pub struct RawConfig {
     pub oauth: BTreeMap<String, RawOAuthClient>,
     /// The attention queue's rules.
     pub queue: RawQueue,
+    /// The autognomus gateway vetinarid works for.
+    pub autognomus: Option<RawAutognomus>,
+}
+
+/// The `[autognomus]` table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawAutognomus {
+    /// The gateway's base URL.
+    pub gateway_url: Option<String>,
+    /// The OIDC issuer.
+    pub issuer: Option<String>,
+    /// vetinari's client id at the issuer.
+    pub client_id: Option<String>,
+    /// The audience to request.
+    pub audience: Option<String>,
+    /// The scopes to request.
+    pub scopes: Option<Vec<String>>,
+    /// The worker label.
+    pub worker: Option<String>,
+    /// A file holding the token, in place of signing in.
+    pub token_file: Option<String>,
 }
 
 /// The `[queue]` table.
@@ -1673,6 +1872,136 @@ mod tests {
         )
         .expect_err("unknown provider");
         assert_eq!(error.problems()[0].path, "oauth.telepathy");
+    }
+
+    #[test]
+    fn the_autognomus_gateway_and_its_issuer_are_configured_together() {
+        let config = parse(
+            r#"
+            [autognomus]
+            gateway_url = "https://autognomus.example.net/"
+            issuer = "https://id.example.net/realms/home"
+            client_id = "vetinari"
+            audience = "autognomus"
+            worker = "hex"
+            "#,
+        )
+        .expect("config");
+        let autognomus = config.autognomus.expect("configured");
+        assert_eq!(
+            autognomus.gateway_url.as_str(),
+            "https://autognomus.example.net"
+        );
+        let GatewayCredential::SignIn(oidc) = &autognomus.credential else {
+            panic!("expected a sign-in, got {:?}", autognomus.credential);
+        };
+        assert_eq!(oidc.issuer.as_str(), "https://id.example.net/realms/home");
+        assert_eq!(oidc.client_id, "vetinari");
+        assert_eq!(oidc.audience.as_deref(), Some("autognomus"));
+        assert_eq!(oidc.scopes, ["openid", "offline_access"]);
+        assert_eq!(
+            autognomus.worker.map(|w| w.as_str().to_owned()).as_deref(),
+            Some("hex")
+        );
+        assert!(parse("").expect("defaults").autognomus.is_none());
+    }
+
+    #[test]
+    fn a_token_file_stands_in_for_the_issuer() {
+        let at_home = |toml_text: &str| {
+            let raw: RawConfig = toml::from_str(toml_text).expect("valid TOML");
+            Config::parse(
+                raw,
+                &ParseContext {
+                    home: Some(PathBuf::from("/home/dev")),
+                },
+            )
+            .expect("config")
+            .autognomus
+            .expect("configured")
+            .credential
+        };
+        let file = GatewayCredential::TokenFile(PathBuf::from("/home/dev/.autognomus/token"));
+        assert_eq!(
+            at_home(
+                r#"
+                [autognomus]
+                gateway_url = "http://localhost:8080"
+                token_file = "~/.autognomus/token"
+                "#
+            ),
+            file
+        );
+        assert_eq!(
+            at_home(
+                r#"
+                [autognomus]
+                gateway_url = "http://localhost:8080"
+                issuer = "https://id.example.net"
+                client_id = "vetinari"
+                token_file = "~/.autognomus/token"
+                "#
+            ),
+            file,
+            "the file wins over a sign-in"
+        );
+    }
+
+    #[test]
+    fn an_autognomus_table_with_neither_a_token_file_nor_an_issuer_is_reported() {
+        let error = parse(
+            r#"
+            [autognomus]
+            gateway_url = "https://autognomus.example.net"
+            "#,
+        )
+        .expect_err("no credential");
+        let problems: Vec<(&str, &str)> = error
+            .problems()
+            .iter()
+            .map(|p| (p.path.as_str(), p.message.as_str()))
+            .collect();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(problems[0].0, "autognomus.issuer");
+        assert_eq!(problems[1].0, "autognomus.client_id");
+        assert!(
+            problems
+                .iter()
+                .all(|(_, message)| message.contains("token_file")),
+            "{problems:?}"
+        );
+
+        let blank = parse(
+            r#"
+            [autognomus]
+            gateway_url = "https://autognomus.example.net"
+            token_file = "  "
+            "#,
+        )
+        .expect_err("a blank file");
+        assert_eq!(blank.problems()[0].path, "autognomus.token_file");
+    }
+
+    #[test]
+    fn an_autognomus_table_missing_its_issuer_or_with_a_bad_url_is_reported() {
+        let error = parse(
+            r#"
+            [autognomus]
+            gateway_url = "autognomus.example.net"
+            client_id = "vetinari"
+            worker = "Not A Slug"
+            "#,
+        )
+        .expect_err("problems");
+        let paths: Vec<&str> = error.problems().iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "autognomus.gateway_url",
+                "autognomus.issuer",
+                "autognomus.worker"
+            ]
+        );
     }
 
     #[test]

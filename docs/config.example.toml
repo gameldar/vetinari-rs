@@ -148,6 +148,23 @@ calendar_id = "primary"
 lookahead_hours = 12
 
 
+# --- Dev workflows gateway --------------------------------------------------
+# Only vetinarid reads this. It signs in at the OIDC issuer by device code
+# (`vetinarid login`) and keeps the credential in the keyring.
+
+[autognomus]
+gateway_url = "https://autognomus.example.net"
+issuer = "https://id.example.net/realms/home"
+client_id = "vetinari"
+audience = "autognomus"
+# worker = "hex"                 # default: the hostname
+# On a machine with no keyring, or against an issuer with no device code
+# endpoint (the local dev stack), read the token from a file instead; it
+# replaces issuer and client_id, and is read again whenever the gateway
+# refuses it, so rotating the file needs no restart.
+# token_file = "~/.config/vetinari/autognomus-token"
+
+
 # --- OAuth clients ----------------------------------------------------------
 # Only needed for providers that use the device-code flow (the calendars).
 # These identify the application rather than you; the tokens they obtain are

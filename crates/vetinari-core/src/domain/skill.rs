@@ -305,6 +305,14 @@ impl SkillLibrary {
         self.skills.insert(skill.id.clone(), skill);
     }
 
+    /// This library, with every built-in it does not define added.
+    #[must_use]
+    pub fn or_builtin(self) -> Self {
+        let mut library = Self::builtin();
+        library.skills.extend(self.skills);
+        library
+    }
+
     /// Look a skill up.
     #[must_use]
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
@@ -400,6 +408,43 @@ impl SkillLibrary {
                 "{{context}}\n\nImplement this change in the current worktree, test first: \
                  {{request}}",
             ),
+            (
+                "ticket-preflight",
+                "Ticket preflight",
+                TaskClass::IssueSummary,
+                "Check whether ticket {{ticket}} says enough to implement it: what to change, \
+                 how to tell it is done, and any constraint that matters. Read the ticket and \
+                 the code it touches; change nothing. This is check {{iteration}}. Note from \
+                 the person who updated the ticket: {{note}}. Last of all, write \
+                 {{result_path}} as JSON: either {\"schema\": 1, \"outcome\": \"ready\", \
+                 \"summary\": \"<what the implementation will do>\"} or {\"schema\": 1, \
+                 \"outcome\": \"needs-info\", \"questions\": [\"<what the ticket must \
+                 answer>\"]}.",
+            ),
+            (
+                "implement-tdd",
+                "Implement a ticket, test first",
+                TaskClass::DeepCodeChange,
+                "Implement ticket {{ticket}} in this worktree. This is round {{iteration}}; \
+                 review findings to address: {{findings}}. The worktree may hold work from an \
+                 earlier attempt: continue from it rather than starting again. Follow TDD: \
+                 write a failing test first, then the code that makes it pass. Commit your \
+                 work on the current branch. Last of all, write {{result_path}} as JSON: \
+                 {\"schema\": 1, \"outcome\": \"implemented\", \"summary\": \"<what you \
+                 did>\"}.",
+            ),
+            (
+                "self-review",
+                "Review a ticket's implementation",
+                TaskClass::PrReview,
+                "Review the work on this branch for ticket {{ticket}} as a strict reviewer: \
+                 correctness, missing tests, and anything that would block approval. Run the \
+                 tests. Change nothing. This is round {{iteration}}. Last of all, write \
+                 {{result_path}} as JSON: either {\"schema\": 1, \"outcome\": \"approved\", \
+                 \"summary\": \"<why>\"} or {\"schema\": 1, \"outcome\": \
+                 \"changes-requested\", \"findings\": [{\"file\": \"<path>\", \"line\": \
+                 <number>, \"text\": \"<what is wrong>\"}]}.",
+            ),
         ];
 
         let mut library = Self::default();
@@ -421,6 +466,28 @@ mod tests {
 
     fn template(raw: &str) -> PromptTemplate {
         PromptTemplate::parse(raw).expect("template")
+    }
+
+    #[test]
+    fn built_ins_fill_in_what_a_saved_library_lacks_and_never_replace_it() {
+        let ours = Skill::new(
+            SkillId::parse("pr-review").expect("id"),
+            NonEmptyText::parse("Our review").expect("name"),
+            template("Ours"),
+            TaskClass::PrReview,
+        );
+        let mut saved = SkillLibrary::default();
+        saved.upsert(ours.clone());
+
+        let library = saved.or_builtin();
+
+        assert_eq!(library.get(&ours.id), Some(&ours));
+        assert_eq!(library.len(), SkillLibrary::builtin().len());
+        assert!(
+            library
+                .get(&SkillId::parse("ticket-preflight").expect("id"))
+                .is_some()
+        );
     }
 
     #[test]

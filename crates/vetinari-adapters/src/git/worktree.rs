@@ -11,7 +11,7 @@ use std::process::Output;
 use async_trait::async_trait;
 use tokio::process::Command;
 use vetinari_core::application::ports::{PortError, PortResult, WorktreeManager};
-use vetinari_core::domain::git::{BranchName, Worktree, WorktreeSpec};
+use vetinari_core::domain::git::{BranchName, CommitId, Worktree, WorktreeSpec};
 
 /// Creates and removes git worktrees.
 #[derive(Debug, Clone)]
@@ -109,6 +109,17 @@ impl WorktreeManager for GitWorktreeManager {
         Ok(())
     }
 
+    async fn push(&self, repo: &Path, remote: &str, branch: &BranchName) -> PortResult<()> {
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let output = self
+            .run(repo, &["push", "--quiet", remote, &refspec])
+            .await?;
+        if !output.status.success() {
+            return Err(PortError::unavailable("git push", stderr_of(&output)));
+        }
+        Ok(())
+    }
+
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree> {
         if self.is_worktree(spec.path()).await {
             return Ok(Worktree::new(
@@ -171,6 +182,14 @@ impl WorktreeManager for GitWorktreeManager {
             )
             .await?;
         Ok(parse_porcelain(&output, repo))
+    }
+
+    async fn head(&self, worktree: &Path) -> PortResult<CommitId> {
+        let output = self
+            .run_ok(worktree, "git rev-parse", &["rev-parse", "HEAD"])
+            .await?;
+        CommitId::parse(&output)
+            .map_err(|_| PortError::protocol("git", "rev-parse printed nothing"))
     }
 }
 
@@ -305,6 +324,20 @@ mod tests {
             second.path().join("scratch.txt").is_file(),
             "adopting must not throw away work in progress"
         );
+    }
+
+    #[tokio::test]
+    async fn head_names_the_commit_a_worktree_has_checked_out() {
+        let repo = repo_with_a_commit().await;
+        let manager = GitWorktreeManager::default();
+        let head = manager.head(repo.path()).await.expect("head");
+        assert_eq!(
+            head.as_str(),
+            git(repo.path(), &["rev-parse", "HEAD"]).await
+        );
+
+        let missing = tempfile::tempdir().expect("tempdir");
+        assert!(manager.head(missing.path()).await.is_err());
     }
 
     #[tokio::test]
@@ -478,6 +511,60 @@ mod tests {
             worktree.path().join("fix.txt").is_file(),
             "the worktree holds the fetched branch's work"
         );
+    }
+
+    #[tokio::test]
+    async fn a_branch_is_pushed_to_the_same_name_on_the_remote() {
+        let origin = tempfile::tempdir().expect("tempdir");
+        let output = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(origin.path())
+            .output()
+            .await
+            .expect("git init runs");
+        assert!(output.status.success());
+        let clone = repo_with_a_commit().await;
+        git(
+            clone.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.path().to_str().expect("utf-8"),
+            ],
+        )
+        .await;
+        git(clone.path(), &["branch", "vetinari/eng-412-retries"]).await;
+
+        let manager = GitWorktreeManager::default();
+        let branch = BranchName::sanitized("vetinari/eng-412-retries");
+        manager
+            .push(clone.path(), "origin", &branch)
+            .await
+            .expect("push");
+        manager
+            .push(clone.path(), "origin", &branch)
+            .await
+            .expect("pushing again changes nothing");
+
+        assert_eq!(
+            git(
+                origin.path(),
+                &["rev-parse", "refs/heads/vetinari/eng-412-retries"]
+            )
+            .await,
+            git(clone.path(), &["rev-parse", "vetinari/eng-412-retries"]).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_that_fails_is_worth_trying_again() {
+        let repo = repo_with_a_commit().await;
+        let error = GitWorktreeManager::default()
+            .push(repo.path(), "origin", &BranchName::sanitized("main"))
+            .await
+            .expect_err("no remote");
+        assert!(matches!(error, PortError::Unavailable { .. }), "{error:?}");
     }
 
     #[tokio::test]

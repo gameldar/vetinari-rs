@@ -1,0 +1,13 @@
+{
+  "kind": "loop",
+  "id": "rework",
+  "body": [
+    "implement",
+    "review"
+  ],
+  "exit": {
+    "node": "review",
+    "when": "approved"
+  },
+  "max_iterations": 3
+}

@@ -21,7 +21,7 @@ use crate::domain::attention::{
     AttentionItem, IssueRef, MessageRef, PullRequestRef, SourceCategory,
 };
 use crate::domain::credentials::{CredentialKey, Provider, StoredCredential};
-use crate::domain::git::{Worktree, WorktreeSpec};
+use crate::domain::git::{BranchName, CommitId, Worktree, WorktreeSpec};
 use crate::domain::ids::{AgentId, SessionId, Slug, SourceId, SpaceId};
 use crate::domain::skill::SkillLibrary;
 use crate::domain::workspace::{Space, SpaceName, TargetKind};
@@ -549,11 +549,22 @@ pub struct FakeWorktreeManager {
     created: Mutex<Vec<WorktreeSpec>>,
     removed: Mutex<Vec<PathBuf>>,
     fetched: Mutex<Vec<(PathBuf, String, String)>>,
+    pushed: Mutex<Vec<(PathBuf, String, String)>>,
+    push_failure: Mutex<Option<PortError>>,
     failure: Mutex<Option<PortError>>,
     fetch_failure: Mutex<Option<PortError>>,
+    heads: Mutex<BTreeMap<PathBuf, CommitId>>,
 }
 
 impl FakeWorktreeManager {
+    /// Say which commit a worktree has checked out.
+    pub fn set_head(&self, worktree: &Path, commit: &str) {
+        self.heads.lock().expect("heads lock").insert(
+            worktree.to_path_buf(),
+            CommitId::parse(commit).expect("commit id"),
+        );
+    }
+
     /// Make the next creation fail.
     pub fn fail_create(&self, error: PortError) {
         *self.failure.lock().expect("failure lock") = Some(error);
@@ -562,6 +573,17 @@ impl FakeWorktreeManager {
     /// Make every fetch fail, as it would with no remote configured.
     pub fn fail_fetch(&self, error: PortError) {
         *self.fetch_failure.lock().expect("fetch failure lock") = Some(error);
+    }
+
+    /// The branches it was asked to push, with their repository and remote.
+    #[must_use]
+    pub fn pushed(&self) -> Vec<(PathBuf, String, String)> {
+        self.pushed.lock().expect("pushed lock").clone()
+    }
+
+    /// Make the next push fail.
+    pub fn fail_push(&self, error: PortError) {
+        *self.push_failure.lock().expect("push failure lock") = Some(error);
     }
 
     /// The refspecs it was asked to fetch.
@@ -602,6 +624,18 @@ impl WorktreeManager for FakeWorktreeManager {
         }
     }
 
+    async fn push(&self, repo: &Path, remote: &str, branch: &BranchName) -> PortResult<()> {
+        if let Some(error) = self.push_failure.lock().expect("push failure lock").take() {
+            return Err(error);
+        }
+        self.pushed.lock().expect("pushed lock").push((
+            repo.to_path_buf(),
+            remote.to_owned(),
+            branch.to_string(),
+        ));
+        Ok(())
+    }
+
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree> {
         if let Some(error) = self.failure.lock().expect("failure lock").take() {
             return Err(error);
@@ -623,6 +657,15 @@ impl WorktreeManager for FakeWorktreeManager {
             .expect("removed lock")
             .push(worktree.path().to_path_buf());
         Ok(())
+    }
+
+    async fn head(&self, worktree: &Path) -> PortResult<CommitId> {
+        self.heads
+            .lock()
+            .expect("heads lock")
+            .get(worktree)
+            .cloned()
+            .ok_or_else(|| PortError::not_found("worktree", worktree.display().to_string()))
     }
 
     async fn list(&self, repo: &Path) -> PortResult<Vec<Worktree>> {
@@ -851,4 +894,520 @@ pub fn polled(
             outcome: Ok(items),
         })
         .collect()
+}
+
+/// Step files held in memory, keyed by full path.
+#[derive(Debug, Default)]
+pub struct FakeStepFiles {
+    files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
+    prepared: Mutex<Vec<PathBuf>>,
+    prepare_failure: Mutex<Option<PortError>>,
+}
+
+impl FakeStepFiles {
+    /// Put a file in place, as a skill would.
+    pub fn put(&self, path: &Path, contents: &str) {
+        self.files
+            .lock()
+            .expect("files lock")
+            .insert(path.to_path_buf(), contents.as_bytes().to_vec());
+    }
+
+    /// A file's contents, if it exists.
+    #[must_use]
+    pub fn contents(&self, path: &Path) -> Option<String> {
+        self.files
+            .lock()
+            .expect("files lock")
+            .get(path)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// The worktrees prepared, in order.
+    #[must_use]
+    pub fn prepared(&self) -> Vec<PathBuf> {
+        self.prepared.lock().expect("prepared lock").clone()
+    }
+
+    /// Make the next preparation fail.
+    pub fn fail_prepare(&self, error: PortError) {
+        *self.prepare_failure.lock().expect("failure lock") = Some(error);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::StepFiles for FakeStepFiles {
+    async fn prepare(&self, worktree: &Path) -> PortResult<()> {
+        if let Some(error) = self.prepare_failure.lock().expect("failure lock").take() {
+            return Err(error);
+        }
+        self.prepared
+            .lock()
+            .expect("prepared lock")
+            .push(worktree.to_path_buf());
+        Ok(())
+    }
+
+    async fn read(&self, path: &Path) -> PortResult<Option<Vec<u8>>> {
+        Ok(self.files.lock().expect("files lock").get(path).cloned())
+    }
+
+    async fn write(&self, path: &Path, contents: &[u8]) -> PortResult<()> {
+        self.files
+            .lock()
+            .expect("files lock")
+            .insert(path.to_path_buf(), contents.to_vec());
+        Ok(())
+    }
+}
+
+/// One call a [`FakeTaskGateway`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCall {
+    /// A claim on a queue.
+    Claim(String),
+    /// A heartbeat for a task.
+    Heartbeat(String),
+    /// A completion, with its output.
+    Complete(String, crate::domain::devflow::task::StepOutput),
+    /// A failure.
+    Fail(String, crate::domain::devflow::task::StepFailure),
+}
+
+/// A task gateway that replies from scripts and records every call.
+///
+/// Unscripted calls answer the common case: no task, an extended lease, an
+/// accepted completion or failure.
+#[derive(Debug)]
+pub struct FakeTaskGateway {
+    claims: Mutex<
+        std::collections::VecDeque<PortResult<Option<crate::domain::devflow::task::RawTask>>>,
+    >,
+    heartbeats: Mutex<
+        std::collections::VecDeque<PortResult<crate::application::devflow::ports::LeaseReply>>,
+    >,
+    completes: Mutex<
+        std::collections::VecDeque<PortResult<crate::application::devflow::ports::TaskReply>>,
+    >,
+    fails: Mutex<
+        std::collections::VecDeque<PortResult<crate::application::devflow::ports::TaskReply>>,
+    >,
+    calls: Mutex<Vec<TaskCall>>,
+    extends_to: OffsetDateTime,
+}
+
+impl FakeTaskGateway {
+    /// A gateway whose unscripted heartbeats extend leases to `extends_to`.
+    #[must_use]
+    pub fn new(extends_to: OffsetDateTime) -> Self {
+        Self {
+            claims: Mutex::default(),
+            heartbeats: Mutex::default(),
+            completes: Mutex::default(),
+            fails: Mutex::default(),
+            calls: Mutex::default(),
+            extends_to,
+        }
+    }
+
+    /// Queue a claim reply.
+    pub fn on_claim(&self, reply: PortResult<Option<crate::domain::devflow::task::RawTask>>) {
+        self.claims.lock().expect("claims lock").push_back(reply);
+    }
+
+    /// Queue a heartbeat reply.
+    pub fn on_heartbeat(&self, reply: PortResult<crate::application::devflow::ports::LeaseReply>) {
+        self.heartbeats
+            .lock()
+            .expect("heartbeats lock")
+            .push_back(reply);
+    }
+
+    /// Queue a completion reply.
+    pub fn on_complete(&self, reply: PortResult<crate::application::devflow::ports::TaskReply>) {
+        self.completes
+            .lock()
+            .expect("completes lock")
+            .push_back(reply);
+    }
+
+    /// Queue a failure reply.
+    pub fn on_fail(&self, reply: PortResult<crate::application::devflow::ports::TaskReply>) {
+        self.fails.lock().expect("fails lock").push_back(reply);
+    }
+
+    /// Every call, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<TaskCall> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+
+    fn record(&self, call: TaskCall) {
+        self.calls.lock().expect("calls lock").push(call);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::TaskGateway for FakeTaskGateway {
+    async fn claim(
+        &self,
+        queue: &crate::domain::devflow::ids::TaskQueue,
+        _worker: &crate::domain::devflow::ids::WorkerName,
+        _wait: time::Duration,
+    ) -> PortResult<Option<crate::domain::devflow::task::RawTask>> {
+        self.record(TaskCall::Claim(queue.to_string()));
+        self.claims
+            .lock()
+            .expect("claims lock")
+            .pop_front()
+            .unwrap_or(Ok(None))
+    }
+
+    async fn heartbeat(
+        &self,
+        task: &crate::domain::devflow::ids::TaskId,
+        _lease: &crate::domain::devflow::ids::LeaseToken,
+    ) -> PortResult<crate::application::devflow::ports::LeaseReply> {
+        self.record(TaskCall::Heartbeat(task.to_string()));
+        self.heartbeats
+            .lock()
+            .expect("heartbeats lock")
+            .pop_front()
+            .unwrap_or(Ok(
+                crate::application::devflow::ports::LeaseReply::Extended {
+                    expires_at: self.extends_to,
+                },
+            ))
+    }
+
+    async fn complete(
+        &self,
+        task: &crate::domain::devflow::ids::TaskId,
+        _lease: &crate::domain::devflow::ids::LeaseToken,
+        output: &crate::domain::devflow::task::StepOutput,
+    ) -> PortResult<crate::application::devflow::ports::TaskReply> {
+        self.record(TaskCall::Complete(task.to_string(), output.clone()));
+        self.completes
+            .lock()
+            .expect("completes lock")
+            .pop_front()
+            .unwrap_or(Ok(crate::application::devflow::ports::TaskReply::Accepted))
+    }
+
+    async fn fail(
+        &self,
+        task: &crate::domain::devflow::ids::TaskId,
+        _lease: &crate::domain::devflow::ids::LeaseToken,
+        failure: &crate::domain::devflow::task::StepFailure,
+    ) -> PortResult<crate::application::devflow::ports::TaskReply> {
+        self.record(TaskCall::Fail(task.to_string(), failure.clone()));
+        self.fails
+            .lock()
+            .expect("fails lock")
+            .pop_front()
+            .unwrap_or(Ok(crate::application::devflow::ports::TaskReply::Accepted))
+    }
+}
+
+/// A lease journal held in memory.
+#[derive(Debug, Default)]
+pub struct MemoryLeaseJournal {
+    held: Mutex<Vec<crate::domain::devflow::held::HeldLease>>,
+}
+
+impl MemoryLeaseJournal {
+    /// Start with these leases recorded.
+    pub fn seed(&self, held: Vec<crate::domain::devflow::held::HeldLease>) {
+        *self.held.lock().expect("journal lock") = held;
+    }
+
+    /// What is recorded.
+    #[must_use]
+    pub fn held(&self) -> Vec<crate::domain::devflow::held::HeldLease> {
+        self.held.lock().expect("journal lock").clone()
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::LeaseJournal for MemoryLeaseJournal {
+    async fn load(&self) -> PortResult<Vec<crate::domain::devflow::held::HeldLease>> {
+        Ok(self.held())
+    }
+
+    async fn save(&self, held: &[crate::domain::devflow::held::HeldLease]) -> PortResult<()> {
+        *self.held.lock().expect("journal lock") = held.to_vec();
+        Ok(())
+    }
+}
+
+/// Run worktrees that record which branches' worktrees were removed, and
+/// can be told to refuse.
+#[derive(Debug, Default)]
+pub struct RecordingRunWorktrees {
+    removed: Mutex<Vec<String>>,
+    refuse: Mutex<Option<PortError>>,
+}
+
+impl RecordingRunWorktrees {
+    /// The branches whose worktrees were removed, in order.
+    #[must_use]
+    pub fn removed(&self) -> Vec<String> {
+        self.removed.lock().expect("removed lock").clone()
+    }
+
+    /// Refuse the next removal with `error`.
+    pub fn refuse(&self, error: PortError) {
+        *self.refuse.lock().expect("refuse lock") = Some(error);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::RunWorktrees for RecordingRunWorktrees {
+    async fn remove(&self, config: &crate::domain::devflow::step::StepConfig) -> PortResult<()> {
+        if let Some(error) = self.refuse.lock().expect("refuse lock").take() {
+            return Err(error);
+        }
+        self.removed
+            .lock()
+            .expect("removed lock")
+            .push(config.branch.to_string());
+        Ok(())
+    }
+}
+
+/// Run ids that count up from one millisecond, so a test knows each.
+#[derive(Debug, Default)]
+pub struct CountingRunIds(Mutex<u64>);
+
+impl crate::application::devflow::ports::RunIds for CountingRunIds {
+    fn next(&self) -> crate::domain::devflow::ids::Ulid {
+        let mut count = self.0.lock().expect("ids lock");
+        *count += 1;
+        crate::domain::devflow::ids::Ulid::from_parts(*count, 0)
+    }
+}
+
+/// A run gateway whose outputs and graphs are set by the test, and which
+/// records the definitions registered, started and removed. Listing
+/// definitions is refused until a test needs it.
+#[derive(Debug, Default)]
+pub struct FakeRunGateway {
+    outputs: Mutex<BTreeMap<String, BTreeMap<String, serde_json::Value>>>,
+    graphs: Mutex<BTreeMap<String, crate::domain::devflow::run_view::RunGraph>>,
+    fetched: Mutex<Vec<String>>,
+    cancelled: Mutex<Vec<String>>,
+    registered: Mutex<Vec<crate::domain::devflow::compile::WorkflowGraph>>,
+    started: Mutex<Vec<(String, serde_json::Value)>>,
+    removed: Mutex<Vec<String>>,
+    register_fails: Mutex<Option<PortError>>,
+    start_fails: Mutex<Option<PortError>>,
+}
+
+impl FakeRunGateway {
+    /// The definitions registered, in order.
+    #[must_use]
+    pub fn registered(&self) -> Vec<crate::domain::devflow::compile::WorkflowGraph> {
+        self.registered.lock().expect("registered lock").clone()
+    }
+
+    /// The definitions started, with their input, in order.
+    #[must_use]
+    pub fn started(&self) -> Vec<(String, serde_json::Value)> {
+        self.started.lock().expect("started lock").clone()
+    }
+
+    /// The definitions removed, in order.
+    #[must_use]
+    pub fn removed(&self) -> Vec<String> {
+        self.removed.lock().expect("removed lock").clone()
+    }
+
+    /// Refuse the next registration with `error`.
+    pub fn fail_register(&self, error: PortError) {
+        *self.register_fails.lock().expect("register lock") = Some(error);
+    }
+
+    /// Refuse the next start with `error`.
+    pub fn fail_start(&self, error: PortError) {
+        *self.start_fails.lock().expect("start lock") = Some(error);
+    }
+
+    /// The graph a fetch of its run returns from now on.
+    pub fn set_graph(&self, graph: crate::domain::devflow::run_view::RunGraph) {
+        self.graphs
+            .lock()
+            .expect("graphs lock")
+            .insert(graph.run.to_string(), graph);
+    }
+
+    /// Forget a run, so fetching its graph is `NotFound`.
+    pub fn remove_graph(&self, run: &crate::domain::devflow::ids::RunId) {
+        self.graphs
+            .lock()
+            .expect("graphs lock")
+            .remove(run.as_str());
+    }
+
+    /// The runs whose graph was fetched, in order.
+    #[must_use]
+    pub fn fetched(&self) -> Vec<String> {
+        self.fetched.lock().expect("fetched lock").clone()
+    }
+
+    /// The runs cancelled, in order.
+    #[must_use]
+    pub fn cancelled(&self) -> Vec<String> {
+        self.cancelled.lock().expect("cancelled lock").clone()
+    }
+
+    /// Record an output for a run's instance.
+    pub fn set_output(&self, run: &str, instance: &str, output: serde_json::Value) {
+        self.outputs
+            .lock()
+            .expect("outputs lock")
+            .entry(run.to_owned())
+            .or_default()
+            .insert(instance.to_owned(), output);
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::RunGateway for FakeRunGateway {
+    async fn register(
+        &self,
+        graph: &crate::domain::devflow::compile::WorkflowGraph,
+    ) -> PortResult<()> {
+        if let Some(error) = self.register_fails.lock().expect("register lock").take() {
+            return Err(error);
+        }
+        self.registered
+            .lock()
+            .expect("registered lock")
+            .push(graph.clone());
+        Ok(())
+    }
+
+    async fn start(
+        &self,
+        definition: &crate::domain::devflow::ids::DefinitionId,
+        input: &serde_json::Value,
+    ) -> PortResult<crate::domain::devflow::ids::RunId> {
+        if let Some(error) = self.start_fails.lock().expect("start lock").take() {
+            return Err(error);
+        }
+        let mut started = self.started.lock().expect("started lock");
+        started.push((definition.to_string(), input.clone()));
+        crate::domain::devflow::ids::RunId::parse(&format!("run-{}", started.len()))
+            .map_err(|error| PortError::protocol("fake run gateway", error.to_string()))
+    }
+
+    async fn remove(
+        &self,
+        definition: &crate::domain::devflow::ids::DefinitionId,
+    ) -> PortResult<()> {
+        self.removed
+            .lock()
+            .expect("removed lock")
+            .push(definition.to_string());
+        Ok(())
+    }
+
+    async fn definitions(&self) -> PortResult<Vec<crate::domain::devflow::ids::DefinitionId>> {
+        Err(PortError::unsupported("fake run gateway", "definitions"))
+    }
+
+    async fn step_config(
+        &self,
+        _definition: &crate::domain::devflow::ids::DefinitionId,
+    ) -> PortResult<crate::domain::devflow::step::StepConfig> {
+        Err(PortError::unsupported("fake run gateway", "step_config"))
+    }
+
+    async fn runs(
+        &self,
+        _definition: &crate::domain::devflow::ids::DefinitionId,
+    ) -> PortResult<Vec<crate::domain::devflow::run_view::RunHeader>> {
+        Err(PortError::unsupported("fake run gateway", "runs"))
+    }
+
+    async fn graph(
+        &self,
+        run: &crate::domain::devflow::ids::RunId,
+    ) -> PortResult<crate::domain::devflow::run_view::RunGraph> {
+        self.fetched
+            .lock()
+            .expect("fetched lock")
+            .push(run.to_string());
+        self.graphs
+            .lock()
+            .expect("graphs lock")
+            .get(run.as_str())
+            .cloned()
+            .ok_or_else(|| PortError::not_found("run", run.as_str()))
+    }
+
+    async fn cancel(
+        &self,
+        run: &crate::domain::devflow::ids::RunId,
+    ) -> PortResult<crate::application::devflow::ports::CancelReply> {
+        self.cancelled
+            .lock()
+            .expect("cancelled lock")
+            .push(run.to_string());
+        Ok(crate::application::devflow::ports::CancelReply::Cancelled)
+    }
+
+    async fn outputs(
+        &self,
+        run: &crate::domain::devflow::ids::RunId,
+    ) -> PortResult<BTreeMap<String, serde_json::Value>> {
+        Ok(self
+            .outputs
+            .lock()
+            .expect("outputs lock")
+            .get(run.as_str())
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+/// A pull request publisher that answers from a script.
+#[derive(Debug, Default)]
+pub struct FakePullRequestPublisher {
+    replies: Mutex<
+        std::collections::VecDeque<PortResult<crate::domain::devflow::outcome::OpenPrOutcome>>,
+    >,
+    published: Mutex<Vec<String>>,
+}
+
+impl FakePullRequestPublisher {
+    /// Queue a reply.
+    pub fn on_publish(&self, reply: PortResult<crate::domain::devflow::outcome::OpenPrOutcome>) {
+        self.replies.lock().expect("replies lock").push_back(reply);
+    }
+
+    /// The branches it was asked to publish.
+    #[must_use]
+    pub fn published(&self) -> Vec<String> {
+        self.published.lock().expect("published lock").clone()
+    }
+}
+
+#[async_trait]
+impl crate::application::devflow::ports::PullRequestPublisher for FakePullRequestPublisher {
+    async fn publish(
+        &self,
+        config: &crate::domain::devflow::step::StepConfig,
+        _profile: &crate::domain::profile::Profile,
+    ) -> PortResult<crate::domain::devflow::outcome::OpenPrOutcome> {
+        self.published
+            .lock()
+            .expect("published lock")
+            .push(config.branch.to_string());
+        self.replies
+            .lock()
+            .expect("replies lock")
+            .pop_front()
+            .unwrap_or_else(|| Err(PortError::unavailable("publisher", "nothing scripted")))
+    }
 }

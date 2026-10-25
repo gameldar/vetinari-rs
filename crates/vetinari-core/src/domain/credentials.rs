@@ -59,6 +59,8 @@ pub enum Provider {
     Anthropic,
     /// Google AI / Gemini API, for `agy`-backed agents.
     GoogleAi,
+    /// The autognomus gateway vetinarid claims dev workflow steps from.
+    Autognomus,
 }
 
 /// A configuration file named a provider that does not exist.
@@ -81,6 +83,7 @@ impl Provider {
         Provider::Outlook,
         Provider::Anthropic,
         Provider::GoogleAi,
+        Provider::Autognomus,
     ];
 
     /// The stable name used in configuration and as a keychain namespace.
@@ -96,6 +99,7 @@ impl Provider {
             Provider::Outlook => "outlook",
             Provider::Anthropic => "anthropic",
             Provider::GoogleAi => "google-ai",
+            Provider::Autognomus => "autognomus",
         }
     }
 
@@ -112,6 +116,7 @@ impl Provider {
             Provider::Outlook => "Outlook",
             Provider::Anthropic => "Anthropic",
             Provider::GoogleAi => "Google AI (Gemini)",
+            Provider::Autognomus => "autognomus",
         }
     }
 
@@ -210,7 +215,21 @@ impl Provider {
                     fields: vec![FieldSpec::secret("api_key", "Google AI API key")],
                 },
             },
+            Provider::Autognomus => AuthSpec {
+                provider: *self,
+                instructions: "vetinarid signs in to the gateway's issuer: run `vetinarid login`, \
+                               or sign in from the run that asks for it.",
+                method: AuthMethod::OidcDeviceCode,
+            },
         }
+    }
+
+    /// Whether only vetinarid holds this credential: refresh tokens rotate
+    /// on use, so two processes refreshing one would each invalidate the
+    /// other's (design 12).
+    #[must_use]
+    pub const fn signs_in_through_the_daemon(&self) -> bool {
+        matches!(self, Provider::Autognomus)
     }
 }
 
@@ -302,6 +321,10 @@ pub enum AuthMethod {
         /// Whether the provider also demands a client secret.
         needs_client_secret: bool,
     },
+    /// RFC 8628 device authorisation at endpoints an OIDC issuer
+    /// advertises in its discovery document, for a provider whose issuer is
+    /// whatever the developer deployed.
+    OidcDeviceCode,
 }
 
 /// A provider's authentication requirements, ready to drive a wizard.
@@ -669,6 +692,7 @@ mod tests {
                 AuthMethod::OAuthDeviceCode { scopes, .. } => {
                     assert!(!scopes.is_empty(), "{} requests no scopes", provider.name());
                 }
+                AuthMethod::OidcDeviceCode => {}
             }
             assert!(!spec.instructions.is_empty());
         }
@@ -684,5 +708,15 @@ mod tests {
         assert_eq!(keys, vec!["base_url", "email", "api_token"]);
         assert!(!fields[0].secret);
         assert!(fields[2].secret);
+    }
+
+    #[test]
+    fn autognomus_signs_in_by_device_code_at_endpoints_its_issuer_advertises() {
+        let provider: Provider = "autognomus".parse().expect("known");
+        assert_eq!(provider, Provider::Autognomus);
+        assert!(Provider::ALL.contains(&Provider::Autognomus));
+        assert_eq!(provider.auth_spec().method, AuthMethod::OidcDeviceCode);
+        assert!(provider.signs_in_through_the_daemon());
+        assert!(!Provider::GoogleCalendar.signs_in_through_the_daemon());
     }
 }

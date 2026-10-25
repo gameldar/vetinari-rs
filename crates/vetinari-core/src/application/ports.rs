@@ -15,7 +15,7 @@ use crate::domain::attention::{
     AttentionItem, IssueRef, MessageRef, PullRequestRef, SourceCategory,
 };
 use crate::domain::credentials::{CredentialKey, Provider, StoredCredential};
-use crate::domain::git::{Worktree, WorktreeSpec};
+use crate::domain::git::{BranchName, CommitId, Worktree, WorktreeSpec};
 use crate::domain::ids::{AgentId, SessionId, Slug, SourceId, SpaceId};
 use crate::domain::skill::SkillLibrary;
 use crate::domain::workspace::{Space, SpaceName, TargetKind};
@@ -321,11 +321,19 @@ pub trait WorktreeManager: Send + Sync {
     /// Create a worktree, or adopt the existing one if it is already there.
     async fn create(&self, spec: &WorktreeSpec) -> PortResult<Worktree>;
 
+    /// Push a branch of a repository to the same name on a remote. A push
+    /// that fails is `Unavailable`: it is most often the network or the
+    /// host, and whoever asked bounds how often it is tried again.
+    async fn push(&self, repo: &Path, remote: &str, branch: &BranchName) -> PortResult<()>;
+
     /// Remove a worktree.
     async fn remove(&self, worktree: &Worktree) -> PortResult<()>;
 
     /// Every worktree of a repository.
     async fn list(&self, repo: &Path) -> PortResult<Vec<Worktree>>;
+
+    /// The commit a worktree has checked out.
+    async fn head(&self, worktree: &Path) -> PortResult<CommitId>;
 }
 
 /// Where the skill library is persisted.

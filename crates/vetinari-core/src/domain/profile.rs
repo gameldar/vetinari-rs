@@ -107,6 +107,17 @@ impl Profile {
         &self.repo_roots
     }
 
+    /// Where the clone of `owner/name` is: `name` under the first
+    /// repository root, or the working directory without one.
+    #[must_use]
+    pub fn repo_path(&self, slug: &str) -> PathBuf {
+        let name = slug.rsplit('/').next().unwrap_or(slug);
+        match self.repo_roots.first() {
+            Some(root) => root.join(name),
+            None => PathBuf::from(name),
+        }
+    }
+
     /// Where its worktrees are created.
     #[must_use]
     pub fn worktree_root(&self) -> Option<&PathBuf> {
@@ -256,6 +267,18 @@ mod tests {
             NonEmptyText::parse(id).expect("name"),
             TargetKind::Tmux,
         )
+    }
+
+    #[test]
+    fn a_repository_is_found_by_name_under_the_first_root() {
+        let rooted = profile("work")
+            .with_repo_root(PathBuf::from("/work/repos"))
+            .with_repo_root(PathBuf::from("/other"));
+        assert_eq!(
+            rooted.repo_path("acme/web"),
+            PathBuf::from("/work/repos/web")
+        );
+        assert_eq!(profile("bare").repo_path("acme/web"), PathBuf::from("web"));
     }
 
     #[test]

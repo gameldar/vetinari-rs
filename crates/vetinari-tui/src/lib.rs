@@ -8,6 +8,8 @@
 pub mod app;
 pub mod controller;
 pub mod event;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod overlay;
 pub mod startup;
 pub mod text_input;

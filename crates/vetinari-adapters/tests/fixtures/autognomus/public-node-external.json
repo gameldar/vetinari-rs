@@ -1,0 +1,11 @@
+{
+  "kind": "external",
+  "id": "implement",
+  "queue": "vetinari",
+  "config": {},
+  "lease_seconds": 300,
+  "deadline_seconds": 14400,
+  "retry": {
+    "attempts": 1
+  }
+}

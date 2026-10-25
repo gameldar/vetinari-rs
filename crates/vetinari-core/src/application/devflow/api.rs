@@ -1,0 +1,504 @@
+//! `ClientApi`: what a client of the daemon may ask, in domain types
+//! (design 10.3). The socket is only its first adapter; a web UI would be
+//! another over the same service.
+
+use std::collections::BTreeMap;
+
+use time::OffsetDateTime;
+
+use crate::application::ports::PortError;
+use crate::domain::devflow::ids::{RunId, WorkerName};
+use serde_json::Value;
+
+use crate::domain::attention::{AttentionItem, ItemContext, ItemState, SourceCategory};
+use crate::domain::devflow::lanes::{IterationSelection, LaneRow, lanes};
+use crate::domain::devflow::notes::{RunNotes, notes};
+use crate::domain::devflow::run_view::RunGraph;
+use crate::domain::devflow::run_view::RunStatus;
+use crate::domain::devflow::summary::{LocalSteps, Mark, NeedsYou, RunSummary, row_mark};
+use crate::domain::devflow::template::TemplateKind;
+use crate::domain::ids::SourceId;
+use crate::domain::text::NonEmptyText;
+
+/// The protocol this daemon speaks. A client speaking another is told to
+/// restart the daemon, since the two were built apart.
+pub const PROTOCOL: u32 = 1;
+
+/// What a run is about, for its queue row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLabel {
+    /// The ticket's key.
+    pub ticket: NonEmptyText,
+    /// The ticket's title.
+    pub title: NonEmptyText,
+}
+
+/// A run as a client sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunItem {
+    /// The strip and what needs the developer.
+    pub summary: RunSummary,
+    /// What it is about, when known: a run found on the gateway after a
+    /// restart has none until its definition is read.
+    pub label: Option<RunLabel>,
+    /// When it was started, when known.
+    pub started_at: Option<OffsetDateTime>,
+}
+
+/// One row of a run's popup, marked as the strip would mark it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailRow {
+    /// The row.
+    pub row: LaneRow,
+    /// Its mark.
+    pub mark: Mark,
+}
+
+/// A run as its popup shows it (design 9.3): the item, every row, and what
+/// the latest preflight and review said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDetail {
+    /// The run's item.
+    pub item: RunItem,
+    /// The rows, at the selected iterations.
+    pub rows: Vec<DetailRow>,
+    /// The questions and findings.
+    pub notes: RunNotes,
+}
+
+impl RunDetail {
+    /// The detail of a run from its graph, this machine's steps and the
+    /// run's outputs.
+    #[must_use]
+    pub fn of(
+        item: RunItem,
+        graph: &RunGraph,
+        template: TemplateKind,
+        selection: &IterationSelection,
+        local: &LocalSteps,
+        outputs: &BTreeMap<String, Value>,
+    ) -> Self {
+        let rows = lanes(graph, selection)
+            .into_iter()
+            .map(|row| DetailRow {
+                mark: row_mark(row.state.as_ref(), local),
+                row,
+            })
+            .collect();
+        Self {
+            item,
+            rows,
+            notes: notes(template, outputs),
+        }
+    }
+}
+
+impl RunItem {
+    /// The run as a queue item: named by its ticket, in the state that says
+    /// what it wants, with its summary as context for the row's strip.
+    #[must_use]
+    pub fn to_attention(&self, source: &SourceId, now: OffsetDateTime) -> AttentionItem {
+        let summary = &self.summary;
+        let title = match &self.label {
+            Some(label) => format!("{} {}", label.ticket, label.title),
+            None => format!("run {}", summary.run),
+        };
+        let state = match (&summary.needs_you, summary.status) {
+            (Some(NeedsYou::Gate { .. }), _) => ItemState::NeedsDecision,
+            (Some(NeedsYou::Question { .. }), _) => ItemState::AgentWaiting,
+            (None, RunStatus::Active) => ItemState::AgentRunning,
+            (None, RunStatus::Completed) => ItemState::AgentDone,
+            (None, RunStatus::Failed) => ItemState::AgentFailed,
+            (None, RunStatus::Cancelled) => ItemState::Resolved,
+        };
+        let mut builder = AttentionItem::builder(
+            source,
+            summary.run.as_str(),
+            SourceCategory::AgentState,
+            NonEmptyText::parse(&title).unwrap_or_else(|_| {
+                NonEmptyText::parse(summary.run.as_str()).expect("a run id is never blank")
+            }),
+        )
+        .state(state)
+        .occurred_at(self.started_at.unwrap_or(now))
+        .detail("Run", summary.run.as_str())
+        .detail("Progress", summary.strip());
+        match &summary.needs_you {
+            Some(NeedsYou::Gate { instance, .. }) => {
+                builder = builder.detail("Waiting at", instance.to_string());
+            }
+            Some(NeedsYou::Question { question, .. }) => {
+                builder = builder.detail("Question", question.clone());
+            }
+            None => {}
+        }
+        builder.context(ItemContext::Run(summary.clone())).build()
+    }
+}
+
+/// A change a `runs.watch` stream pushes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoardChange {
+    /// A run is new or changed.
+    Run(RunItem),
+    /// A run left the queue.
+    Removed(RunId),
+}
+
+/// The current item of every run, from which watchers get a snapshot and
+/// then only what changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunBoard {
+    items: BTreeMap<RunId, RunItem>,
+}
+
+impl RunBoard {
+    /// Every run, in run id order.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<RunItem> {
+        self.items.values().cloned().collect()
+    }
+
+    /// Record a run's item; the change to push, unless nothing changed.
+    pub fn put(&mut self, item: RunItem) -> Option<BoardChange> {
+        if self.items.get(&item.summary.run) == Some(&item) {
+            return None;
+        }
+        self.items.insert(item.summary.run.clone(), item.clone());
+        Some(BoardChange::Run(item))
+    }
+
+    /// One run's item.
+    #[must_use]
+    pub fn get(&self, run: &RunId) -> Option<RunItem> {
+        self.items.get(run).cloned()
+    }
+
+    /// Drop a run; the change to push, unless it was not there.
+    pub fn remove(&mut self, run: &RunId) -> Option<BoardChange> {
+        self.items
+            .remove(run)
+            .map(|_| BoardChange::Removed(run.clone()))
+    }
+}
+
+/// Why a client's request failed: a closed set, because a client decides
+/// what to do from the code alone.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ApiError {
+    /// The request is wrong: a bad method, bad params, a protocol mismatch.
+    #[error("invalid: {0}")]
+    Invalid(String),
+    /// What it names does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// It conflicts with how things are, such as a second run for a ticket.
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// The gateway cannot be reached; worth retrying.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+    /// The daemon needs signing in.
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    /// The gateway answered with something unexpected.
+    #[error("protocol: {0}")]
+    Protocol(String),
+}
+
+impl ApiError {
+    /// The code a frame carries.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::NotFound(_) => "not-found",
+            Self::Conflict(_) => "conflict",
+            Self::Unavailable(_) => "unavailable",
+            Self::Unauthenticated(_) => "unauthenticated",
+            Self::Protocol(_) => "protocol",
+        }
+    }
+}
+
+impl From<PortError> for ApiError {
+    fn from(error: PortError) -> Self {
+        let message = error.to_string();
+        match error {
+            PortError::NotConfigured { .. } | PortError::Unavailable { .. } => {
+                Self::Unavailable(message)
+            }
+            PortError::Unauthenticated { .. } => Self::Unauthenticated(message),
+            PortError::NotFound { .. } => Self::NotFound(message),
+            PortError::Protocol { .. } => Self::Protocol(message),
+            PortError::Unsupported { .. } => Self::Invalid(message),
+            PortError::Refused { .. } => Self::Conflict(message),
+        }
+    }
+}
+
+/// The answer to `hello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    /// The daemon's name and version.
+    pub daemon: String,
+    /// The protocol it speaks.
+    pub protocol: u32,
+    /// The worker label it claims as.
+    pub worker: WorkerName,
+}
+
+/// What a client may ask the daemon.
+#[derive(Debug, Clone)]
+pub struct ClientApi {
+    daemon: String,
+    worker: WorkerName,
+}
+
+impl ClientApi {
+    /// The API of a daemon with this name and worker label.
+    #[must_use]
+    pub fn new(daemon: impl Into<String>, worker: WorkerName) -> Self {
+        Self {
+            daemon: daemon.into(),
+            worker,
+        }
+    }
+
+    /// Greet a client, refusing one that speaks another protocol.
+    pub fn hello(&self, client: &str, protocol: u32) -> Result<Hello, ApiError> {
+        if protocol != PROTOCOL {
+            return Err(ApiError::Invalid(format!(
+                "{client} speaks protocol {protocol} and {} speaks {PROTOCOL}: restart the daemon",
+                self.daemon
+            )));
+        }
+        Ok(Hello {
+            daemon: self.daemon.clone(),
+            protocol: PROTOCOL,
+            worker: self.worker.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::credentials::Provider;
+    use crate::domain::devflow::summary::{Phase, PhaseCell};
+
+    fn run(raw: &str) -> RunId {
+        RunId::parse(raw).expect("run")
+    }
+
+    fn item(raw: &str, mark: Mark) -> RunItem {
+        RunItem {
+            summary: RunSummary {
+                run: run(raw),
+                status: RunStatus::Active,
+                phases: vec![PhaseCell {
+                    phase: Phase::Pre,
+                    mark,
+                    round: None,
+                }],
+                needs_you: None,
+            },
+            label: Some(RunLabel {
+                ticket: NonEmptyText::parse("ENG-412").expect("key"),
+                title: NonEmptyText::parse("Rate-limit retries").expect("title"),
+            }),
+            started_at: None,
+        }
+    }
+
+    fn api() -> ClientApi {
+        ClientApi::new("vetinarid 0.1.0", WorkerName::parse("hex").expect("worker"))
+    }
+
+    #[test]
+    fn a_new_or_changed_run_is_pushed_and_an_unchanged_one_is_not() {
+        let mut board = RunBoard::default();
+        assert_eq!(
+            board.put(item("r1", Mark::Next)),
+            Some(BoardChange::Run(item("r1", Mark::Next)))
+        );
+        assert_eq!(board.put(item("r1", Mark::Next)), None);
+        assert_eq!(
+            board.put(item("r1", Mark::RunningHere)),
+            Some(BoardChange::Run(item("r1", Mark::RunningHere)))
+        );
+    }
+
+    #[test]
+    fn a_snapshot_lists_every_run_and_a_removed_one_leaves_it() {
+        let mut board = RunBoard::default();
+        board.put(item("r2", Mark::Next));
+        board.put(item("r1", Mark::Done));
+        assert_eq!(
+            board.snapshot(),
+            [item("r1", Mark::Done), item("r2", Mark::Next)]
+        );
+
+        assert_eq!(
+            board.remove(&run("r1")),
+            Some(BoardChange::Removed(run("r1")))
+        );
+        assert_eq!(board.remove(&run("r1")), None);
+        assert_eq!(board.snapshot(), [item("r2", Mark::Next)]);
+    }
+
+    #[test]
+    fn a_runs_detail_marks_each_row_and_reads_its_notes() {
+        use crate::domain::devflow::lanes::IterationSelection;
+        use crate::domain::devflow::run_view::InstanceStatus;
+        use crate::domain::devflow::run_view::tests::{feature_graph, instance, nz, state};
+        use crate::domain::devflow::summary::{LocalStep, LocalSteps};
+        use crate::domain::devflow::template::TemplateKind;
+
+        let graph = feature_graph(
+            4,
+            vec![
+                state("intake", InstanceStatus::Looping { iteration: nz(1) }),
+                state(
+                    "preflight@1",
+                    InstanceStatus::Done {
+                        branch: Some(
+                            crate::domain::devflow::ids::BranchLabel::parse("needs-info")
+                                .expect("label"),
+                        ),
+                    },
+                ),
+                state(
+                    "ask-info@1",
+                    InstanceStatus::Claimed {
+                        worker: "hex".to_owned(),
+                        expires_at: time::macros::datetime!(2026-10-25 10:30 UTC),
+                    },
+                ),
+            ],
+        );
+        let local = LocalSteps::default().with(instance("ask-info@1"), LocalStep::AwaitingPerson);
+        let outputs = BTreeMap::from([(
+            "preflight@1".to_owned(),
+            serde_json::json!({ "branch": "needs-info", "step": "preflight",
+                "questions": ["Page size?"], "git_branch": "vetinari/eng-412" }),
+        )]);
+
+        let detail = RunDetail::of(
+            item("r1", Mark::NeedsYou),
+            &graph,
+            TemplateKind::FeatureFromTicket,
+            &IterationSelection::default(),
+            &local,
+            &outputs,
+        );
+
+        let marks: Vec<(String, Mark)> = detail
+            .rows
+            .iter()
+            .map(|row| (row.row.node.as_str().to_owned(), row.mark))
+            .collect();
+        assert_eq!(marks[1], ("preflight".to_owned(), Mark::Done));
+        assert_eq!(marks[2], ("ask-info".to_owned(), Mark::NeedsYou));
+        assert_eq!(detail.notes.questions[0].as_str(), "Page size?");
+        assert_eq!(detail.item, item("r1", Mark::NeedsYou));
+    }
+
+    #[test]
+    fn a_run_item_is_queued_under_its_ticket_with_a_state_for_what_it_needs() {
+        use crate::domain::devflow::ids::NodeInstance;
+        use crate::domain::devflow::step::GateKind;
+
+        let source = SourceId::parse("vetinarid").expect("source");
+        let now = time::macros::datetime!(2026-10-25 10:00 UTC);
+        let running = item("r1", Mark::Elsewhere).to_attention(&source, now);
+        assert_eq!(running.title().as_str(), "ENG-412 Rate-limit retries");
+        assert_eq!(running.state(), ItemState::AgentRunning);
+        assert!(matches!(running.context(), ItemContext::Run(summary) if summary.run == run("r1")));
+
+        let mut gated = item("r1", Mark::NeedsYou);
+        gated.summary.needs_you = Some(NeedsYou::Gate {
+            instance: NodeInstance::parse("ask-info@1").expect("instance"),
+            gate: GateKind::InfoNeeded,
+        });
+        assert_eq!(
+            gated.to_attention(&source, now).state(),
+            ItemState::NeedsDecision
+        );
+
+        let mut asking = item("r1", Mark::NeedsYou);
+        asking.summary.needs_you = Some(NeedsYou::Question {
+            instance: NodeInstance::parse("implement@1").expect("instance"),
+            question: "Which client?".to_owned(),
+        });
+        assert_eq!(
+            asking.to_attention(&source, now).state(),
+            ItemState::AgentWaiting
+        );
+
+        for (status, state) in [
+            (RunStatus::Completed, ItemState::AgentDone),
+            (RunStatus::Failed, ItemState::AgentFailed),
+            (RunStatus::Cancelled, ItemState::Resolved),
+        ] {
+            let mut finished = item("r1", Mark::Done);
+            finished.summary.status = status;
+            assert_eq!(finished.to_attention(&source, now).state(), state);
+        }
+
+        let mut unlabelled = item("r2", Mark::Next);
+        unlabelled.label = None;
+        assert_eq!(
+            unlabelled.to_attention(&source, now).title().as_str(),
+            "run r2"
+        );
+    }
+
+    #[test]
+    fn hello_names_the_daemon_its_protocol_and_worker() {
+        assert_eq!(
+            api().hello("vetinari 0.1.0", PROTOCOL),
+            Ok(Hello {
+                daemon: "vetinarid 0.1.0".to_owned(),
+                protocol: PROTOCOL,
+                worker: WorkerName::parse("hex").expect("worker"),
+            })
+        );
+    }
+
+    #[test]
+    fn a_client_speaking_another_protocol_is_told_to_restart_the_daemon() {
+        let error = api().hello("vetinari 0.2.0", 2).expect_err("mismatch");
+        assert_eq!(error.code(), "invalid");
+        assert!(error.to_string().contains("restart"), "{error}");
+    }
+
+    #[test]
+    fn port_errors_map_onto_the_closed_set_of_codes() {
+        for (error, code) in [
+            (PortError::unavailable("autognomus", "down"), "unavailable"),
+            (PortError::protocol("autognomus", "odd"), "protocol"),
+            (PortError::not_found("run", "r1"), "not-found"),
+            (
+                PortError::Unauthenticated {
+                    provider: Provider::GitHub,
+                },
+                "unauthenticated",
+            ),
+            (
+                PortError::Refused {
+                    what: "autognomus".to_owned(),
+                    detail: "exists".to_owned(),
+                },
+                "conflict",
+            ),
+            (
+                PortError::not_configured("gateway", "no url"),
+                "unavailable",
+            ),
+            (PortError::unsupported("fake", "start"), "invalid"),
+        ] {
+            assert_eq!(ApiError::from(error.clone()).code(), code, "{error:?}");
+        }
+    }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "01JB7ZR2M4Q9V8C6T3N5HKD0WX",
+  "workflow": "vetinari-feature-01JB7ZQ3XK",
+  "version": 1,
+  "state": "active",
+  "in_flight": ["ask-info@1"],
+  "outputs": {
+    "preflight@1": {
+      "branch": "needs-info", "step": "preflight", "questions": ["Page size?"],
+      "git_branch": "vetinari/eng-412-rate-limit-webhook-retries"
+    },
+    "ask-info@1": {
+      "branch": "recheck", "step": "info-needed", "note": "Page size is 50",
+      "git_branch": "vetinari/eng-412-rate-limit-webhook-retries"
+    }
+  },
+  "created_at": "2026-10-25T09:00:00Z"
+}

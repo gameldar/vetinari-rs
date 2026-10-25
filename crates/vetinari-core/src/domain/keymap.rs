@@ -298,6 +298,7 @@ impl Keymap {
             ("SPC w s", Action::WorkspaceFocusSpace),
             ("SPC w d", Action::WorkspaceCloseSpace),
             ("SPC w r", Action::WorkspaceRunAgent),
+            ("SPC w f", Action::RunFeatureFromTicket),
             ("SPC s e", Action::SkillEditor),
             ("SPC s r", Action::SkillRun),
             ("SPC h k", Action::Help),
@@ -541,6 +542,7 @@ mod tests {
             ("SPC m p", Action::MeetingPrep),
             ("SPC w s", Action::WorkspaceFocusSpace),
             ("SPC a u", Action::AgentUnblock),
+            ("SPC w f", Action::RunFeatureFromTicket),
             ("SPC q", Action::Quit),
         ] {
             assert_eq!(

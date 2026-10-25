@@ -3550,10 +3550,31 @@ dependencies = [
  "async-trait",
  "futures",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "time",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "vetinari-daemon"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "directories",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "vetinari-adapters",
+ "vetinari-core",
 ]
 
 [[package]]

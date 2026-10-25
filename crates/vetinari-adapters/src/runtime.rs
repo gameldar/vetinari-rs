@@ -29,6 +29,7 @@ use crate::HttpClient;
 use crate::agent::CliAgent;
 use crate::clock::SystemClock;
 use crate::credentials::KeyringStore;
+use crate::daemon::client::DaemonRuns;
 use crate::git::GitWorktreeManager;
 use crate::oauth::HttpDeviceCodeFlow;
 use crate::skills::FileSkillStore;
@@ -74,6 +75,8 @@ pub struct Runtime {
     pub chats: BTreeMap<SourceId, Arc<dyn ChatSource>>,
     /// The calendars, by source id, for agendas.
     pub schedules: BTreeMap<SourceId, Arc<dyn ScheduleSource>>,
+    /// The runs vetinarid serves, once attached.
+    pub daemon: Option<Arc<DaemonRuns>>,
     /// Where files were looked for.
     pub paths: Paths,
     /// Things the configuration asked for that could not be provided.
@@ -198,9 +201,16 @@ impl Runtime {
             issue_trackers,
             chats,
             schedules,
+            daemon: None,
             paths,
             problems,
         })
+    }
+
+    /// Queue the runs vetinarid serves, and act on them through it.
+    pub fn attach_daemon(&mut self, daemon: Arc<DaemonRuns>) {
+        self.attention.register(daemon.clone());
+        self.daemon = Some(daemon);
     }
 
     /// The providers whose credentials this configuration needs.
