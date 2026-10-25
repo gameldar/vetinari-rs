@@ -868,6 +868,12 @@ answer time is not possible: `ClaimTask` takes the oldest task on a queue, not a
 `loop.iteration` and for terminal run events, because `Skipped` is derived by the engine
 (engine spec 6) and the mirror must not try to derive it a second way.
 
+As built, `apply` also returns `Already` for an event at or below the graph's `seq`, so the
+buffered events of step 3 can be handed to it without filtering, and `Refetch` for a node failure
+with a retry to come, whose backoff the event does not carry, and for `Changed`. A run starting
+moves only `seq`. `node_step(template, node)` in `compile.rs` names the step a node runs, because
+the graph view carries no config.
+
 Refetches are coalesced to at most one in flight per run, with a 250 ms debounce. `seq` counts
 only observable transitions (13), so a gap genuinely means a missed event; the debounce keeps a
 burst of them cheap.

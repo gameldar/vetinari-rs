@@ -279,6 +279,24 @@ pub fn compile(
     }
 }
 
+/// The step a template's node runs, or `None` for a loop or a node the
+/// template does not have. A run graph names its nodes but not their
+/// config, so this is how a view knows what a node is for.
+#[must_use]
+pub fn node_step(template: TemplateKind, node: &NodeId) -> Option<StepKind> {
+    match template {
+        TemplateKind::FeatureFromTicket => match node.as_str() {
+            node::PREFLIGHT => Some(StepKind::Preflight),
+            node::ASK_INFO => Some(StepKind::Gate(GateKind::InfoNeeded)),
+            node::IMPLEMENT => Some(StepKind::Implement),
+            node::REVIEW => Some(StepKind::Review),
+            node::REVIEW_STUCK => Some(StepKind::Gate(GateKind::ReviewStuck)),
+            node::OPEN_PR => Some(StepKind::OpenPr),
+            _ => None,
+        },
+    }
+}
+
 fn feature_graph(
     feature: &FeatureFromTicket,
     id: DefinitionId,
@@ -400,6 +418,31 @@ mod tests {
             &queues(),
             &StepPolicies::default(),
         )
+    }
+
+    #[test]
+    fn every_external_node_runs_the_step_node_step_names() {
+        for graph in every_template() {
+            for node in &graph.nodes {
+                let expected = match node {
+                    GraphNode::External { config, .. } => Some(config.step),
+                    GraphNode::Loop { .. } => None,
+                };
+                assert_eq!(
+                    node_step(TemplateKind::FeatureFromTicket, node.id()),
+                    expected,
+                    "{}",
+                    node.id()
+                );
+            }
+        }
+        assert_eq!(
+            node_step(
+                TemplateKind::FeatureFromTicket,
+                &NodeId::parse("deploy").expect("id")
+            ),
+            None
+        );
     }
 
     /// Every template this crate can compile, for the checks that must hold
