@@ -629,6 +629,13 @@ The HTTP adapter maps statuses onto these, and nothing else does:
 | `401` | refresh the token once and retry; then `PortError::Unauthenticated` |
 | `503`, connect error, timeout | `PortError::Unavailable`, which `is_transient` |
 
+The adapter takes its token from a small `Bearer` trait of its own (`token(refresh)`), with a
+`StaticBearer` for a local gateway; slice 13 implements it over `AuthService`. Until then
+`Provider::Autognomus` does not exist, so a `401` that survives the refresh is
+`PortError::Refused` rather than `Unauthenticated`; slice 13 changes it, and the claim loop's
+"needs sign-in" waits on that. `429` is treated as `503`. A claim's request timeout is its
+`wait` plus the client's usual 20 seconds, since the long-poll outlasts the default.
+
 ### 7.2 Claiming
 
 One claim loop per queue. Each long-polls with `wait_seconds: 30`, the gateway's cap.
