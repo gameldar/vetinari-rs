@@ -2,6 +2,7 @@
 //! engine. They decide what is due from the clock; the daemon runtime
 //! decides when to ask.
 
+pub mod api;
 pub mod lease;
 pub mod mirror;
 pub mod ports;
