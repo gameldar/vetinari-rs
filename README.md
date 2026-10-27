@@ -49,6 +49,8 @@ the local autognomus dev stack to run it against:
 
 ```sh
 cargo install --path crates/vetinari-daemon
+# in the autognomus checkout the unit names:
+cargo build --release --locked -p autognomus-hub --example dev_stack
 cp docs/systemd/*.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now autognomus-dev-stack vetinarid
