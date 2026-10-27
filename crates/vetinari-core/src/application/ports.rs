@@ -346,11 +346,13 @@ pub trait SkillStore: Send + Sync {
     async fn save(&self, library: &SkillLibrary) -> PortResult<()>;
 }
 
-/// A device-code challenge the developer must approve elsewhere.
+/// A sign-in the developer must approve elsewhere: a device code to type
+/// on another device, or a browser sign-in that comes back by itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCodeChallenge {
-    /// The code to type on the verification page.
-    pub user_code: String,
+    /// The code to type on the verification page; none for a browser
+    /// sign-in, which needs no code typed.
+    pub user_code: Option<String>,
     /// The page to visit.
     pub verification_uri: String,
     /// The opaque code Vetinari polls with.
@@ -359,6 +361,20 @@ pub struct DeviceCodeChallenge {
     pub interval_secs: u64,
     /// When the challenge stops being valid.
     pub expires_at: OffsetDateTime,
+}
+
+impl DeviceCodeChallenge {
+    /// What the developer is asked to do, on one line.
+    #[must_use]
+    pub fn instruction(&self) -> String {
+        match &self.user_code {
+            Some(code) => format!("Visit {} and enter {code}", self.verification_uri),
+            None => format!(
+                "Sign in in your browser; if it did not open, visit {}",
+                self.verification_uri
+            ),
+        }
+    }
 }
 
 /// Where a device-code poll has got to.
@@ -375,7 +391,9 @@ pub enum DeviceCodePoll {
     },
 }
 
-/// RFC 8628 device authorisation, used for calendar providers.
+/// An OAuth sign-in Vetinari starts and then polls, used for calendar
+/// providers: RFC 8628 device authorisation, or an RFC 8252 browser
+/// sign-in that comes back to a loopback port.
 #[async_trait]
 pub trait DeviceCodeFlow: Send + Sync {
     /// Begin a flow.

@@ -32,7 +32,7 @@ knowing what deserved his attention and what did not.
 - **Agent-agnostic.** Claude Code for codebase work, Gemini through `agy` for
   long-context reading, scripts for cheap summaries, chosen per class of work
   by a routing table you own.
-- **Credentials in the OS keychain**, with token and OAuth device-code flows.
+- **Credentials in the OS keychain**, with token, OAuth device-code and browser sign-in flows.
 
 ## Installing
 
@@ -50,7 +50,8 @@ vetinari                      # open the interface
 vetinari doctor               # check config, engines, and credentials
 vetinari auth                 # list every provider's credential state
 vetinari auth github          # paste a token (read from stdin)
-vetinari auth google-calendar --device
+vetinari auth google-calendar   # sign in in the browser
+vetinari auth outlook --device  # show a code to enter
 vetinari auth --account home github   # a profile other than the active one
 vetinari config               # print where configuration is looked for
 ```

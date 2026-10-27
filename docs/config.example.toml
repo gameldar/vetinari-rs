@@ -166,9 +166,10 @@ audience = "autognomus"
 
 
 # --- OAuth clients ----------------------------------------------------------
-# Only needed for providers that use the device-code flow (the calendars).
+# Only needed for providers that sign in through OAuth (the calendars).
 # These identify the application rather than you; the tokens they obtain are
-# what goes in the keychain.
+# what goes in the keychain. Google's must be a "Desktop app" client: Vetinari
+# opens the browser and listens on 127.0.0.1 for it to come back.
 
 [oauth.google-calendar]
 client_id = "000000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com"

@@ -163,7 +163,7 @@ mod tests {
         });
 
         let (challenge, outcome) = sign_in.begin().await.expect("challenge");
-        assert_eq!(challenge.user_code, "WXYZ-1234");
+        assert_eq!(challenge.user_code.as_deref(), Some("WXYZ-1234"));
         let outcome = tokio::time::timeout(Duration::from_secs(60), outcome)
             .await
             .expect("ends within a minute")

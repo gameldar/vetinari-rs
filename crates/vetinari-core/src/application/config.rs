@@ -965,12 +965,12 @@ fn parse_oauth(
         };
         if !matches!(
             provider.auth_spec().method,
-            AuthMethod::OAuthDeviceCode { .. }
+            AuthMethod::OAuthDeviceCode { .. } | AuthMethod::OAuthLoopback { .. }
         ) {
             problems.push(ConfigProblem {
                 path: format!("oauth.{name}"),
                 message: format!(
-                    "{} does not use the device-code flow; paste an API token instead",
+                    "{} does not sign in with an OAuth client; paste an API token instead",
                     provider.name()
                 ),
             });
@@ -1847,7 +1847,7 @@ mod tests {
         )
         .expect_err("wrong method");
         assert_eq!(error.problems()[0].path, "oauth.github");
-        assert!(error.problems()[0].message.contains("device"));
+        assert!(error.problems()[0].message.contains("OAuth client"));
     }
 
     #[test]

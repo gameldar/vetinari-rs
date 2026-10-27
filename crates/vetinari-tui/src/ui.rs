@@ -222,37 +222,47 @@ fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, area: Rect) {
         Overlay::Text(view) => render_text(frame, view, area),
         Overlay::Run(view) => render_run(frame, view, area),
         Overlay::DeviceCode(view) => {
-            let popup = centred(area, 70, 9);
-            let lines = vec![
+            let uri = &view.challenge.verification_uri;
+            let mut lines = vec![
                 Line::raw(format!("Authorising {}", view.provider.display_name())),
                 Line::raw(""),
-                Line::from(vec![
-                    Span::raw("Visit  "),
-                    Span::styled(
-                        view.challenge.verification_uri.clone(),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::raw("Code   "),
-                    Span::styled(
-                        view.challenge.user_code.clone(),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::raw(""),
-                Line::styled(view.message.clone(), Style::default().fg(Color::DarkGray)),
             ];
+            match &view.challenge.user_code {
+                Some(code) => {
+                    lines.push(Line::from(vec![
+                        Span::raw("Visit  "),
+                        Span::styled(uri.clone(), Style::default().fg(Color::Cyan)),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::raw("Code   "),
+                        Span::styled(
+                            code.clone(),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                // A browser sign-in's page is long; it is shown whole so
+                // that it can be copied when the browser did not open.
+                None => {
+                    lines.push(Line::raw(
+                        "Sign in in your browser. If it did not open, visit",
+                    ));
+                    lines.push(Line::styled(uri.clone(), Style::default().fg(Color::Cyan)));
+                }
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                view.message.clone(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            let wrapped = u16::try_from(uri.len() / 66).unwrap_or(u16::MAX);
+            let popup = centred(area, 70, 9_u16.saturating_add(wrapped));
             frame.render_widget(Clear, popup);
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Device authorisation "),
-                    )
+                    .block(Block::default().borders(Borders::ALL).title(" Sign in "))
                     .wrap(Wrap { trim: true }),
                 popup,
             );
@@ -796,7 +806,7 @@ mod tests {
         app.apply(Update::DeviceCode(
             vetinari_core::domain::credentials::Provider::GoogleCalendar,
             vetinari_core::application::ports::DeviceCodeChallenge {
-                user_code: "WXYZ-1234".to_owned(),
+                user_code: Some("WXYZ-1234".to_owned()),
                 verification_uri: "https://google.test/device".to_owned(),
                 device_code: "dev".to_owned(),
                 interval_secs: 5,

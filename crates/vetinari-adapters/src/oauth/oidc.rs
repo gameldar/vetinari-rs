@@ -208,7 +208,7 @@ mod tests {
 
     fn challenge() -> DeviceCodeChallenge {
         DeviceCodeChallenge {
-            user_code: "BDWP-HQPK".to_owned(),
+            user_code: Some("BDWP-HQPK".to_owned()),
             verification_uri: "https://id.example.net/device".to_owned(),
             device_code: "dev-1".to_owned(),
             interval_secs: 5,
@@ -242,7 +242,7 @@ mod tests {
         ] {
             assert!(request.body.contains(part), "{part} in {}", request.body);
         }
-        assert_eq!(challenge.user_code, "BDWP-HQPK");
+        assert_eq!(challenge.user_code.as_deref(), Some("BDWP-HQPK"));
         assert_eq!(challenge.verification_uri, "https://id.example.net/device");
         assert_eq!(challenge.expires_at, NOW + Duration::minutes(10));
     }

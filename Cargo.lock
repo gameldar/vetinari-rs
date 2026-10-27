@@ -3526,14 +3526,17 @@ name = "vetinari-adapters"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "directories",
  "futures",
+ "getrandom 0.3.4",
  "keyring",
  "keyring-core",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "time",

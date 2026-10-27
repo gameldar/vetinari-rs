@@ -1683,7 +1683,7 @@ mod tests {
             panic!("expected a device-code challenge");
         };
         assert_eq!(provider, Provider::Autognomus);
-        assert_eq!(challenge.user_code, "BDWP-HQPK");
+        assert_eq!(challenge.user_code.as_deref(), Some("BDWP-HQPK"));
 
         let polled = h
             .controller

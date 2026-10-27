@@ -1,4 +1,5 @@
-//! RFC 8628 device authorisation.
+//! RFC 8628 device authorisation, and the loopback sign-in (`loopback.rs`)
+//! for a provider that refuses device-code clients its scopes.
 //!
 //! Chosen over a redirect flow because Vetinari lives in a terminal: it can
 //! show a code and a URL, but it cannot usefully be a web server waiting for
@@ -19,6 +20,7 @@ use vetinari_core::application::ports::{
 };
 use vetinari_core::domain::credentials::{AuthMethod, Provider, Secret, StoredCredential};
 
+use super::loopback::{self, Loopback};
 use crate::HttpClient;
 
 /// The requests of a device-code flow, at whichever endpoints.
@@ -34,6 +36,10 @@ impl Exchange {
 
     pub(crate) fn http(&self) -> &HttpClient {
         &self.http
+    }
+
+    pub(crate) fn now(&self) -> time::OffsetDateTime {
+        self.clock.now()
     }
 
     /// Ask for a device and user code. `fallback_page` is the verification
@@ -88,7 +94,7 @@ impl Exchange {
             .unwrap_or(600);
 
         Ok(DeviceCodeChallenge {
-            user_code,
+            user_code: Some(user_code),
             verification_uri,
             device_code,
             interval_secs,
@@ -206,7 +212,8 @@ impl Exchange {
 
 /// Runs device-code flows over HTTP.
 pub struct HttpDeviceCodeFlow {
-    exchange: Exchange,
+    exchange: Arc<Exchange>,
+    loopback: Loopback,
     clients: BTreeMap<Provider, OAuthClientConfig>,
     base_url_override: Option<String>,
 }
@@ -215,8 +222,10 @@ impl HttpDeviceCodeFlow {
     /// Build a flow with the configured OAuth clients.
     #[must_use]
     pub fn new(http: HttpClient, clients: Vec<OAuthClientConfig>, clock: Arc<dyn Clock>) -> Self {
+        let exchange = Arc::new(Exchange::new(http, clock));
         Self {
-            exchange: Exchange::new(http, clock),
+            loopback: Loopback::new(exchange.clone()),
+            exchange,
             clients: clients
                 .into_iter()
                 .map(|client| (client.provider, client))
@@ -232,6 +241,13 @@ impl HttpDeviceCodeFlow {
         self
     }
 
+    /// Leave the browser closed on a loopback sign-in, for testing.
+    #[must_use]
+    pub fn without_browser(mut self) -> Self {
+        self.loopback = self.loopback.without_browser();
+        self
+    }
+
     fn client(&self, provider: Provider) -> PortResult<&OAuthClientConfig> {
         self.clients.get(&provider).ok_or_else(|| {
             PortError::not_configured(
@@ -244,18 +260,12 @@ impl HttpDeviceCodeFlow {
         })
     }
 
-    fn endpoints(provider: Provider) -> PortResult<(&'static str, &'static str, Vec<String>)> {
+    /// How `provider` signs in, when it signs in here at all.
+    fn method(provider: Provider) -> PortResult<AuthMethod> {
         match provider.auth_spec().method {
-            AuthMethod::OAuthDeviceCode {
-                device_authorization_url,
-                token_url,
-                scopes,
-                ..
-            } => Ok((
-                device_authorization_url,
-                token_url,
-                scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-            )),
+            method @ (AuthMethod::OAuthDeviceCode { .. } | AuthMethod::OAuthLoopback { .. }) => {
+                Ok(method)
+            }
             AuthMethod::ApiToken { .. } => Err(PortError::unsupported(
                 provider.name(),
                 "device-code authentication; paste an API token instead",
@@ -264,6 +274,16 @@ impl HttpDeviceCodeFlow {
                 provider.name(),
                 "signing in here; vetinarid holds this credential",
             )),
+        }
+    }
+
+    fn token_url(provider: Provider) -> PortResult<&'static str> {
+        match Self::method(provider)? {
+            AuthMethod::OAuthDeviceCode { token_url, .. }
+            | AuthMethod::OAuthLoopback { token_url, .. } => Ok(token_url),
+            AuthMethod::ApiToken { .. } | AuthMethod::OidcDeviceCode => {
+                unreachable!("method() admits only signing-in methods")
+            }
         }
     }
 
@@ -286,16 +306,44 @@ impl HttpDeviceCodeFlow {
 impl DeviceCodeFlow for HttpDeviceCodeFlow {
     async fn start(&self, provider: Provider) -> PortResult<DeviceCodeChallenge> {
         let client = self.client(provider)?;
-        let (device_url, _, scopes) = Self::endpoints(provider)?;
-        let scope = scopes.join(" ");
-        self.exchange
-            .challenge(
-                provider,
-                &self.url(device_url),
-                &[("client_id", client.client_id.as_str()), ("scope", &scope)],
-                Some("https://www.google.com/device"),
-            )
-            .await
+        match Self::method(provider)? {
+            AuthMethod::OAuthLoopback {
+                authorization_url,
+                token_url,
+                scopes,
+                extra_parameters,
+            } => {
+                self.loopback
+                    .start(loopback::Request {
+                        provider,
+                        authorization_url: &self.url(authorization_url),
+                        token_url: self.url(token_url),
+                        scopes,
+                        extra_parameters,
+                        client_id: client.client_id.clone(),
+                        client_secret: client.client_secret.clone(),
+                    })
+                    .await
+            }
+            AuthMethod::OAuthDeviceCode {
+                device_authorization_url,
+                scopes,
+                ..
+            } => {
+                let scope = scopes.join(" ");
+                self.exchange
+                    .challenge(
+                        provider,
+                        &self.url(device_authorization_url),
+                        &[("client_id", client.client_id.as_str()), ("scope", &scope)],
+                        None,
+                    )
+                    .await
+            }
+            AuthMethod::ApiToken { .. } | AuthMethod::OidcDeviceCode => {
+                unreachable!("method() admits only signing-in methods")
+            }
+        }
     }
 
     async fn poll(
@@ -304,7 +352,13 @@ impl DeviceCodeFlow for HttpDeviceCodeFlow {
         challenge: &DeviceCodeChallenge,
     ) -> PortResult<DeviceCodePoll> {
         let client = self.client(provider)?;
-        let (_, token_url, _) = Self::endpoints(provider)?;
+        let token_url = Self::token_url(provider)?;
+        if matches!(
+            provider.auth_spec().method,
+            AuthMethod::OAuthLoopback { .. }
+        ) {
+            return Ok(self.loopback.poll(&challenge.device_code));
+        }
 
         let mut form = vec![
             ("client_id", client.client_id.as_str()),
@@ -323,7 +377,7 @@ impl DeviceCodeFlow for HttpDeviceCodeFlow {
         credential: &StoredCredential,
     ) -> PortResult<StoredCredential> {
         let client = self.client(provider)?;
-        let (_, token_url, _) = Self::endpoints(provider)?;
+        let token_url = Self::token_url(provider)?;
         let refresh = credential
             .refresh_token()
             .ok_or(PortError::Unauthenticated { provider })?;
@@ -355,11 +409,14 @@ mod tests {
 
     fn flow(base_url: &str, with_client: bool) -> HttpDeviceCodeFlow {
         let clients = if with_client {
-            vec![OAuthClientConfig {
-                provider: Provider::GoogleCalendar,
-                client_id: "123.apps.googleusercontent.com".to_owned(),
-                client_secret: Some("GOCSPX-secret".to_owned()),
-            }]
+            [Provider::GoogleCalendar, Provider::Outlook]
+                .into_iter()
+                .map(|provider| OAuthClientConfig {
+                    provider,
+                    client_id: "123.apps.googleusercontent.com".to_owned(),
+                    client_secret: Some("GOCSPX-secret".to_owned()),
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -369,11 +426,12 @@ mod tests {
             Arc::new(FixedClock::new(NOW)),
         )
         .with_base_url(base_url)
+        .without_browser()
     }
 
     fn challenge() -> DeviceCodeChallenge {
         DeviceCodeChallenge {
-            user_code: "WXYZ-1234".to_owned(),
+            user_code: Some("WXYZ-1234".to_owned()),
             verification_uri: "https://google.test/device".to_owned(),
             device_code: "dev-code".to_owned(),
             interval_secs: 5,
@@ -389,13 +447,13 @@ mod tests {
         .await;
 
         let challenge = flow(&server.base_url, true)
-            .start(Provider::GoogleCalendar)
+            .start(Provider::Outlook)
             .await
             .expect("start");
 
         let request = server.request();
         assert_eq!(request.method, "POST");
-        assert_eq!(request.target, "/device/code");
+        assert_eq!(request.target, "/common/oauth2/v2.0/devicecode");
         assert!(
             request
                 .body
@@ -404,12 +462,12 @@ mod tests {
             request.body
         );
         assert!(
-            request.body.contains("calendar.readonly"),
+            request.body.contains("Calendars.Read"),
             "got {}",
             request.body
         );
 
-        assert_eq!(challenge.user_code, "WXYZ-1234");
+        assert_eq!(challenge.user_code.as_deref(), Some("WXYZ-1234"));
         assert_eq!(challenge.verification_uri, "https://google.test/device");
         assert_eq!(challenge.interval_secs, 5);
         assert_eq!(challenge.expires_at, NOW + Duration::minutes(30));
@@ -419,14 +477,11 @@ mod tests {
     async fn a_provider_with_no_configured_client_says_what_to_add() {
         let server = MockServer::with_json("{}").await;
         let error = flow(&server.base_url, false)
-            .start(Provider::GoogleCalendar)
+            .start(Provider::Outlook)
             .await
             .expect_err("no client");
 
-        assert!(
-            error.to_string().contains("[oauth.google-calendar]"),
-            "got {error}"
-        );
+        assert!(error.to_string().contains("[oauth.outlook]"), "got {error}");
         assert!(server.requests().is_empty());
     }
 
@@ -447,7 +502,7 @@ mod tests {
     async fn a_reply_without_a_device_code_is_a_protocol_error() {
         let server = MockServer::with_json(r#"{"user_code":"WXYZ"}"#).await;
         let error = flow(&server.base_url, true)
-            .start(Provider::GoogleCalendar)
+            .start(Provider::Outlook)
             .await
             .expect_err("no device code");
         assert!(matches!(error, PortError::Protocol { .. }));
@@ -458,7 +513,7 @@ mod tests {
         let server = MockServer::with_json(r#"{"error":"authorization_pending"}"#).await;
         assert_eq!(
             flow(&server.base_url, true)
-                .poll(Provider::GoogleCalendar, &challenge())
+                .poll(Provider::Outlook, &challenge())
                 .await
                 .expect("poll"),
             DeviceCodePoll::Pending
@@ -470,7 +525,7 @@ mod tests {
         let server = MockServer::with_json(r#"{"error":"slow_down"}"#).await;
         assert_eq!(
             flow(&server.base_url, true)
-                .poll(Provider::GoogleCalendar, &challenge())
+                .poll(Provider::Outlook, &challenge())
                 .await
                 .expect("poll"),
             DeviceCodePoll::Pending
@@ -481,7 +536,7 @@ mod tests {
     async fn a_declined_request_is_rejected_with_a_reason() {
         let server = MockServer::with_json(r#"{"error":"access_denied"}"#).await;
         match flow(&server.base_url, true)
-            .poll(Provider::GoogleCalendar, &challenge())
+            .poll(Provider::Outlook, &challenge())
             .await
             .expect("poll")
         {
@@ -494,7 +549,7 @@ mod tests {
     async fn an_expired_code_is_rejected_rather_than_polled_forever() {
         let server = MockServer::with_json(r#"{"error":"expired_token"}"#).await;
         match flow(&server.base_url, true)
-            .poll(Provider::GoogleCalendar, &challenge())
+            .poll(Provider::Outlook, &challenge())
             .await
             .expect("poll")
         {
@@ -511,12 +566,12 @@ mod tests {
         .await;
 
         let granted = flow(&server.base_url, true)
-            .poll(Provider::GoogleCalendar, &challenge())
+            .poll(Provider::Outlook, &challenge())
             .await
             .expect("poll");
 
         let request = server.request();
-        assert_eq!(request.target, "/token");
+        assert_eq!(request.target, "/common/oauth2/v2.0/token");
         assert!(request.body.contains("device_code=dev-code"));
         assert!(request.body.contains("client_secret=GOCSPX-secret"));
         assert!(
@@ -604,6 +659,172 @@ mod tests {
 
         assert!(matches!(error, PortError::Unauthenticated { .. }));
         assert!(server.requests().is_empty());
+    }
+
+    /// The query parameters of the page a loopback sign-in opens.
+    fn page_parameters(challenge: &DeviceCodeChallenge) -> BTreeMap<String, String> {
+        reqwest::Url::parse(&challenge.verification_uri)
+            .expect("page")
+            .query_pairs()
+            .into_owned()
+            .collect()
+    }
+
+    /// Come back from the authorisation page as the browser would.
+    async fn return_from_browser(challenge: &DeviceCodeChallenge, query: &[(&str, &str)]) -> u16 {
+        let redirect = &page_parameters(challenge)["redirect_uri"];
+        reqwest::Client::new()
+            .get(redirect)
+            .query(query)
+            .send()
+            .await
+            .expect("callback")
+            .status()
+            .as_u16()
+    }
+
+    /// Poll until the listener has recorded something other than pending.
+    async fn settled(flow: &HttpDeviceCodeFlow, challenge: &DeviceCodeChallenge) -> DeviceCodePoll {
+        for _ in 0..100 {
+            let poll = flow
+                .poll(Provider::GoogleCalendar, challenge)
+                .await
+                .expect("poll");
+            if poll != DeviceCodePoll::Pending {
+                return poll;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        DeviceCodePoll::Pending
+    }
+
+    #[tokio::test]
+    async fn a_browser_sign_in_sends_the_browser_to_the_authorisation_page() {
+        let flow = flow("http://auth.test", true);
+
+        let challenge = flow.start(Provider::GoogleCalendar).await.expect("start");
+
+        assert_eq!(challenge.user_code, None);
+        assert!(
+            challenge
+                .verification_uri
+                .starts_with("http://auth.test/o/oauth2/v2/auth?"),
+            "got {}",
+            challenge.verification_uri
+        );
+        let parameters = page_parameters(&challenge);
+        assert_eq!(parameters["client_id"], "123.apps.googleusercontent.com");
+        assert_eq!(parameters["response_type"], "code");
+        assert_eq!(parameters["state"], challenge.device_code);
+        assert_eq!(parameters["code_challenge_method"], "S256");
+        assert_eq!(parameters["access_type"], "offline");
+        assert!(parameters["scope"].contains("calendar.readonly"));
+        assert!(parameters["redirect_uri"].starts_with("http://127.0.0.1:"));
+        assert_eq!(
+            flow.poll(Provider::GoogleCalendar, &challenge)
+                .await
+                .expect("poll"),
+            DeviceCodePoll::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn the_code_the_browser_brings_back_is_exchanged_with_its_verifier() {
+        let server = MockServer::with_json(
+            r#"{"access_token":"ya29.access","refresh_token":"1//refresh","expires_in":3599}"#,
+        )
+        .await;
+        let flow = flow(&server.base_url, true);
+        let challenge = flow.start(Provider::GoogleCalendar).await.expect("start");
+
+        let status = return_from_browser(
+            &challenge,
+            &[("state", &challenge.device_code), ("code", "4/abc")],
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        match settled(&flow, &challenge).await {
+            DeviceCodePoll::Granted(credential) => {
+                assert_eq!(credential.token().expose(), "ya29.access");
+                assert_eq!(credential.expires_at(), Some(NOW + Duration::seconds(3599)));
+            }
+            other => panic!("expected a grant, got {other:?}"),
+        }
+        let request = server.request();
+        assert_eq!(request.target, "/token");
+        assert!(request.body.contains("grant_type=authorization_code"));
+        assert!(
+            request.body.contains("code=4%2Fabc"),
+            "got {}",
+            request.body
+        );
+        assert!(request.body.contains("code_verifier="));
+        assert!(request.body.contains("client_secret=GOCSPX-secret"));
+        let redirect = &page_parameters(&challenge)["redirect_uri"];
+        assert!(
+            request.body.contains(&format!(
+                "redirect_uri={}",
+                redirect.replace(':', "%3A").replace('/', "%2F")
+            )),
+            "got {}",
+            request.body
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_for_another_sign_in_is_turned_away_and_the_wait_goes_on() {
+        let flow = flow("http://auth.test", true);
+        let challenge = flow.start(Provider::GoogleCalendar).await.expect("start");
+
+        let status =
+            return_from_browser(&challenge, &[("state", "forged"), ("code", "4/abc")]).await;
+
+        assert_eq!(status, 400);
+        assert_eq!(
+            flow.poll(Provider::GoogleCalendar, &challenge)
+                .await
+                .expect("poll"),
+            DeviceCodePoll::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn declining_in_the_browser_rejects_the_sign_in() {
+        let flow = flow("http://auth.test", true);
+        let challenge = flow.start(Provider::GoogleCalendar).await.expect("start");
+
+        return_from_browser(
+            &challenge,
+            &[
+                ("state", &challenge.device_code),
+                ("error", "access_denied"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            settled(&flow, &challenge).await,
+            DeviceCodePoll::Rejected {
+                reason: "the request was declined".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_a_sign_in_that_was_never_started_is_rejected() {
+        let flow = flow("http://auth.test", true);
+        let mut unknown = challenge();
+        unknown.device_code = "never-started".to_owned();
+
+        assert_eq!(
+            flow.poll(Provider::GoogleCalendar, &unknown)
+                .await
+                .expect("poll"),
+            DeviceCodePoll::Rejected {
+                reason: "no sign-in is in progress".to_owned()
+            }
+        );
     }
 
     #[test]

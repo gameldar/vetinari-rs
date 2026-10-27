@@ -1430,9 +1430,9 @@ impl App {
                         );
                         Outcome::Nothing
                     }
-                    AuthMethod::OAuthDeviceCode { .. } | AuthMethod::OidcDeviceCode => {
-                        Outcome::Task(Task::BeginDeviceFlow(provider))
-                    }
+                    AuthMethod::OAuthDeviceCode { .. }
+                    | AuthMethod::OAuthLoopback { .. }
+                    | AuthMethod::OidcDeviceCode => Outcome::Task(Task::BeginDeviceFlow(provider)),
                 }
             }
             (MenuKind::Meetings, MenuTarget::Item(id)) => {
@@ -1647,6 +1647,7 @@ impl App {
                 detail: match provider.auth_spec().method {
                     AuthMethod::ApiToken { .. } => "token".to_owned(),
                     AuthMethod::OAuthDeviceCode { .. } => "device code".to_owned(),
+                    AuthMethod::OAuthLoopback { .. } => "browser sign-in".to_owned(),
                     AuthMethod::OidcDeviceCode => "device code, held by vetinarid".to_owned(),
                 },
                 target: MenuTarget::Provider(*provider),
@@ -3212,7 +3213,7 @@ mod tests {
         app.apply(Update::DeviceCode(
             Provider::GoogleCalendar,
             DeviceCodeChallenge {
-                user_code: "WXYZ-1234".to_owned(),
+                user_code: Some("WXYZ-1234".to_owned()),
                 verification_uri: "https://google.test/device".to_owned(),
                 device_code: "dev".to_owned(),
                 interval_secs: 5,
@@ -3223,7 +3224,7 @@ mod tests {
         let Some(Overlay::DeviceCode(view)) = app.overlay() else {
             panic!("expected the device-code overlay");
         };
-        assert_eq!(view.challenge.user_code, "WXYZ-1234");
+        assert_eq!(view.challenge.user_code.as_deref(), Some("WXYZ-1234"));
         assert_eq!(view.provider, Provider::GoogleCalendar);
     }
 

@@ -836,7 +836,7 @@ impl FakeDeviceCodeFlow {
 impl DeviceCodeFlow for FakeDeviceCodeFlow {
     async fn start(&self, _provider: Provider) -> PortResult<DeviceCodeChallenge> {
         Ok(DeviceCodeChallenge {
-            user_code: "WXYZ-1234".to_owned(),
+            user_code: Some("WXYZ-1234".to_owned()),
             verification_uri: "https://example.test/device".to_owned(),
             device_code: "dev-code".to_owned(),
             interval_secs: 5,

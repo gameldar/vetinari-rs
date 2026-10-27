@@ -23,7 +23,7 @@ use vetinari_adapters::{Paths, Runtime};
 use vetinari_core::application::config::ParseContext;
 use vetinari_core::application::observed::ObservedAgents;
 use vetinari_core::application::ports::{Clock, DeviceCodeChallenge, DeviceCodePoll};
-use vetinari_core::domain::credentials::{Provider, Secret};
+use vetinari_core::domain::credentials::{AuthMethod, Provider, Secret};
 use vetinari_core::domain::devflow::ids::RunId;
 use vetinari_core::domain::devflow::lanes::IterationSelection;
 use vetinari_core::domain::feedback::FeedbackTarget;
@@ -76,7 +76,8 @@ enum Command {
     Auth {
         /// The provider, e.g. `github`. Omit to list every provider.
         provider: Option<String>,
-        /// Run the device-code flow instead of reading a token.
+        /// Sign in through the provider instead of reading a token. Implied
+        /// for a provider that has no token to paste.
         #[arg(long)]
         device: bool,
         /// Forget the stored credential.
@@ -216,12 +217,10 @@ async fn auth(cli: Cli, provider: Option<String>, device: bool, forget: bool) ->
         return Ok(());
     }
 
-    if device {
+    let signs_in = !matches!(provider.auth_spec().method, AuthMethod::ApiToken { .. });
+    if device || signs_in {
         let challenge = runtime.auth.begin_device_flow(provider).await?;
-        println!(
-            "Visit {} and enter {}",
-            challenge.verification_uri, challenge.user_code
-        );
+        println!("{}", challenge.instruction());
         loop {
             tokio::time::sleep(Duration::from_secs(challenge.interval_secs.max(1))).await;
             match runtime
