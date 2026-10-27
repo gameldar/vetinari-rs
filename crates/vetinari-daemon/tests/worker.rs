@@ -201,6 +201,7 @@ async fn a_claimed_preflight_is_run_and_completed_with_its_outcome() {
     let socket = dir.path().join("vetinarid.sock");
     let daemon = tokio::spawn(serve(
         socket,
+        None,
         Services {
             runs: http.clone(),
             events: http.clone(),
@@ -272,6 +273,7 @@ async fn a_daemon_whose_token_is_refused_keeps_serving_and_asks_for_a_sign_in() 
     let socket = dir.path().join("vetinarid.sock");
     let daemon = tokio::spawn(serve(
         socket.clone(),
+        None,
         Services {
             runs: http.clone(),
             events: http.clone(),

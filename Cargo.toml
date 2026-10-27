@@ -36,6 +36,9 @@ base64 = "0.22.1"
 getrandom = "0.3.4"
 sha2 = "0.10.9"
 tempfile = "3"
+axum = "0.8.9"
+tower = { version = "0.5.3", features = ["util"] }
+rust-embed = { version = "8.13.0", features = ["mime-guess"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

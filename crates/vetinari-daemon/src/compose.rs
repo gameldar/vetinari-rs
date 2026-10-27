@@ -51,6 +51,7 @@ use crate::scripted::{Script, ScriptError};
 use crate::signin::{SignIn, SignInOutcome};
 use crate::socket::{self, Backend};
 use crate::steps::{LocalBoard, StepParts, claim_loop, spawn_steps};
+use crate::web::{BuiltPage, LoopbackAddr, Web, WebToken};
 
 /// Where the daemon's runs come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,8 @@ pub struct Settings {
     pub source: Source,
     /// vetinari's configuration file, when not the usual one.
     pub config: Option<PathBuf>,
+    /// Where to serve the web page; none for no page.
+    pub web: Option<LoopbackAddr>,
 }
 
 /// Why the daemon stopped.
@@ -574,12 +577,16 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
             }
         }
     };
-    serve(settings.socket, services).await
+    serve(settings.socket, settings.web, services).await
 }
 
 /// Serve `services` on `socket` until interrupted or the socket fails: the
 /// run board, and the worker's claim loops when there is a worker.
-pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonError> {
+pub async fn serve(
+    socket: PathBuf,
+    web: Option<LoopbackAddr>,
+    services: Services,
+) -> Result<(), DaemonError> {
     let socket_error = |error| DaemonError::Socket {
         path: socket.clone(),
         error,
@@ -618,6 +625,17 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
         template: TemplateKind::FeatureFromTicket,
         sign_in: services.sign_in.clone(),
     });
+    if let Some(addr) = web {
+        let token = WebToken::generate().map_err(socket_error)?;
+        let page = Web {
+            hub: hub.clone(),
+            backend: backend.clone(),
+            queues: WorkerQueues::for_worker(&services.worker),
+            assets: Arc::new(BuiltPage),
+            token,
+        };
+        tasks.extend(crate::web::start(addr, &socket, page).await);
+    }
     let feed = Feed {
         runs: services.runs,
         events: services.events,
@@ -641,6 +659,7 @@ pub async fn serve(socket: PathBuf, services: Services) -> Result<(), DaemonErro
         task.abort();
     }
     let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(crate::web::url_file(&socket));
     served
 }
 
@@ -822,6 +841,7 @@ mod tests {
             worker: Some(WorkerName::parse("hex").expect("worker")),
             source: Source::Scripted(script),
             config: None,
+            web: None,
         }));
         let stream = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -857,6 +877,109 @@ mod tests {
         }
         assert_eq!(runs[0]["ticket"], json!("ENG-412"));
         assert_eq!(runs[0]["phases"][0]["glyph"], json!("◐"));
+    }
+
+    fn scripted(dir: &std::path::Path) -> PathBuf {
+        let script = dir.join("run.json");
+        let mut text: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/feature-run.script.json"))
+                .expect("script");
+        text["steps"] = json!([]);
+        std::fs::write(&script, text.to_string()).expect("write script");
+        script
+    }
+
+    /// The status line of a GET to `url`, sent over plain HTTP/1.1.
+    async fn status_line(url: &str) -> String {
+        let rest = url.strip_prefix("http://").expect("an http url");
+        let (host, path) = rest.split_once('/').expect("a path");
+        let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+        stream
+            .write_all(
+                format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write");
+        let mut lines = BufReader::new(stream).lines();
+        lines
+            .next_line()
+            .await
+            .expect("read")
+            .expect("a status line")
+    }
+
+    async fn eventually<T>(mut found: impl FnMut() -> Option<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(value) = found() {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("within ten seconds")
+    }
+
+    #[tokio::test]
+    async fn a_daemon_serves_the_page_and_says_where_with_its_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("vetinari").join("vetinarid.sock");
+        let daemon = tokio::spawn(run(Settings {
+            socket: socket.clone(),
+            worker: Some(WorkerName::parse("hex").expect("worker")),
+            source: Source::Scripted(scripted(dir.path())),
+            config: None,
+            web: Some(LoopbackAddr::parse("127.0.0.1:0").expect("addr")),
+        }));
+
+        let url = eventually(|| {
+            assert!(!daemon.is_finished(), "the daemon stopped");
+            crate::web::read_url(&socket).ok()
+        })
+        .await;
+
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        let token = url.split_once("?token=").expect("a token").1.to_owned();
+        let base = url.split_once('?').expect("a query").0;
+        assert_eq!(
+            status_line(&format!("{base}api/preview?token={token}")).await,
+            "HTTP/1.1 200 OK"
+        );
+        assert_eq!(
+            status_line(&format!("{base}api/preview")).await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(crate::web::url_file(&socket))
+            .expect("url file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn a_page_address_in_use_leaves_the_daemon_serving_its_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = taken.local_addr().expect("addr").to_string();
+        let socket = dir.path().join("vetinari").join("vetinarid.sock");
+        let daemon = tokio::spawn(run(Settings {
+            socket: socket.clone(),
+            worker: Some(WorkerName::parse("hex").expect("worker")),
+            source: Source::Scripted(scripted(dir.path())),
+            config: None,
+            web: Some(LoopbackAddr::parse(&address).expect("addr")),
+        }));
+
+        eventually(|| {
+            assert!(!daemon.is_finished(), "the daemon stopped");
+            std::os::unix::net::UnixStream::connect(&socket).ok()
+        })
+        .await;
+
+        assert!(!crate::web::url_file(&socket).exists());
     }
 
     fn configured(toml_text: &str) -> Config {

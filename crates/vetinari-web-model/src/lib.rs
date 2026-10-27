@@ -268,6 +268,15 @@ pub enum GateAnswer {
     OpenAnyway,
 }
 
+/// What became of a gate answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateReply {
+    /// The gateway accepted it.
+    pub sent: bool,
+    /// The gateway could not be reached, and it is sent when it can be.
+    pub queued: bool,
+}
+
 /// Dismissing a finished run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dismiss {
