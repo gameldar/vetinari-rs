@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vetinari runs</title>
+  <link data-trunk rel="rust" data-bin="vetinari-web" data-wasm-opt="z"
+    data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals" />
+  <style>
+    :root {
+      --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #d9d8d2;
+      --done: #2f7d4f; --running: #1f6fd1; --elsewhere: #8a6fd1; --needs: #c26a00;
+      --failed: #c0392b; --next: #1d1d1b; --unreached: #a9a8a1; --loop: #efeee9;
+      color-scheme: light dark;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #9a9993; --line: #3a3936;
+        --done: #5cbf85; --running: #5ea2f0; --elsewhere: #b39cf0; --needs: #f0a14a;
+        --failed: #ef6f61; --next: #ecebe6; --unreached: #6b6a65; --loop: #262624;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    header { display: flex; align-items: center; gap: 24px; padding: 12px 16px;
+      border-bottom: 1px solid var(--line); background: var(--panel); }
+    header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+    nav { display: flex; gap: 4px; }
+    main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+    button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+      border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+    button:hover { border-color: var(--muted); }
+    button.tab.current { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+    button.danger { color: var(--failed); border-color: var(--failed); }
+    code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+    .empty, .hint { color: var(--muted); }
+    .problem { color: var(--failed); }
+    .message { padding: 8px 12px; border-left: 3px solid var(--running); background: var(--panel); }
+    .run-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+    .run-row { display: grid; grid-template-columns: 110px minmax(0, 1fr) auto auto; gap: 12px;
+      align-items: center; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 8px; cursor: pointer; }
+    .run-row:hover { border-color: var(--muted); }
+    .run-row.completed, .run-row.cancelled { opacity: .7; }
+    .ticket { font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
+    .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .strip { display: inline-flex; gap: 8px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+    .badge { color: var(--needs); font-weight: 600; font-size: 12px; }
+    .phase.mark-done { color: var(--done); } .phase.mark-running { color: var(--running); }
+    .phase.mark-elsewhere { color: var(--elsewhere); } .phase.mark-needs-you { color: var(--needs); }
+    .phase.mark-failed { color: var(--failed); } .phase.mark-not-reached { color: var(--unreached); }
+    .run-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .run-head h2 { font-size: 18px; margin: 0; }
+    .status { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    .run-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+    @media (max-width: 900px) { .run-body { grid-template-columns: 1fr; }
+      .run-row { grid-template-columns: 1fr; } }
+    aside { display: grid; gap: 12px; }
+    aside > div, aside > p { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px 12px; margin: 0; }
+    aside h3 { font-size: 13px; margin: 0 0 6px; }
+    aside ul { margin: 0; padding-left: 18px; }
+    .gate { border-color: var(--needs) !important; display: flex; flex-wrap: wrap; gap: 6px; }
+    .gate h3 { width: 100%; color: var(--needs); }
+    .note { width: 100%; display: grid; gap: 6px; }
+    .note textarea { font: inherit; min-height: 70px; padding: 6px; border-radius: 6px;
+      border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; }
+    dt { color: var(--muted); } dd { margin: 0; word-break: break-word; }
+    .graph { width: 100%; height: auto; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 8px; }
+    .graph text { font-size: 13px; fill: var(--ink); }
+    .loop rect { fill: var(--loop); stroke: var(--line); stroke-dasharray: 5 4; }
+    .loop .loop-name { font-size: 12px; fill: var(--muted); font-weight: 600; }
+    .round-step { cursor: pointer; font-size: 16px !important; fill: var(--running) !important; }
+    .step { cursor: pointer; }
+    .step rect { fill: var(--panel); stroke: var(--unreached); stroke-width: 1.5; }
+    .step.selected rect { stroke-width: 3; }
+    .step .glyph { font-family: ui-monospace, Menlo, monospace; }
+    .step.mark-done rect { stroke: var(--done); } .step.mark-done .glyph { fill: var(--done); }
+    .step.mark-running rect { stroke: var(--running); animation: pulse 1.4s ease-in-out infinite; }
+    .step.mark-running .glyph { fill: var(--running); }
+    .step.mark-elsewhere rect { stroke: var(--elsewhere); animation: pulse 1.4s ease-in-out infinite; }
+    .step.mark-elsewhere .glyph { fill: var(--elsewhere); }
+    .step.mark-needs-you rect { stroke: var(--needs); stroke-width: 2.5; }
+    .step.mark-needs-you .glyph { fill: var(--needs); }
+    .step.mark-failed rect { stroke: var(--failed); } .step.mark-failed .glyph { fill: var(--failed); }
+    .step.mark-next rect { stroke: var(--next); stroke-dasharray: 3 3; }
+    .step.mark-not-reached .name, .step.mark-not-reached .glyph { fill: var(--unreached); }
+    .edge path { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+    .arrowhead { fill: var(--muted); }
+    .edge-label { font-size: 11px !important; fill: var(--muted) !important; text-anchor: middle;
+      paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+    .controls { display: flex; gap: 16px; margin: 8px 0 12px; }
+    .controls input { width: 60px; margin-left: 6px; font: inherit; }
+    @keyframes pulse { 50% { stroke-opacity: .35; } }
+    @media (prefers-reduced-motion: reduce) { .step rect { animation: none !important; } }
+  </style>
+</head>
+<body></body>
+</html>

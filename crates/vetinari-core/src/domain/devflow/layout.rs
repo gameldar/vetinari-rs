@@ -15,7 +15,7 @@ pub const NODE_WIDTH: u32 = 150;
 /// A step's height.
 pub const NODE_HEIGHT: u32 = 40;
 /// The space between columns.
-pub const COLUMN_GAP: u32 = 60;
+pub const COLUMN_GAP: u32 = 100;
 /// The space between nodes in one column.
 pub const ROW_GAP: u32 = 24;
 /// The space between a loop's border and its body.

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vetinari-core", "crates/vetinari-adapters", "crates/vetinari-tui", "crates/vetinari-daemon", "crates/vetinari-web-model"]
+members = ["crates/vetinari-core", "crates/vetinari-adapters", "crates/vetinari-tui", "crates/vetinari-daemon", "crates/vetinari-web-model", "crates/vetinari-web"]
 resolver = "3"
 
 [workspace.package]

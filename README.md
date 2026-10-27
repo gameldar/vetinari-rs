@@ -56,6 +56,20 @@ systemctl --user daemon-reload
 systemctl --user enable --now autognomus-dev-stack vetinarid
 ```
 
+vetinarid also serves a web page that draws each run's graph: its loops and
+rounds, what is running, the open gate and its answers. Build it before
+vetinarid, since a release build embeds it (a debug build reads it from disk):
+
+```sh
+cargo binstall trunk                              # or: cargo install trunk
+(cd crates/vetinari-web && trunk build --release)
+cargo install --path crates/vetinari-daemon
+xdg-open "$(vetinarid web)"                       # the URL carries the page's token
+```
+
+It listens on `127.0.0.1:7878`; `--web <addr>` moves it (loopback only) and
+`--no-web` turns it off.
+
 ## Using it
 
 ```sh
