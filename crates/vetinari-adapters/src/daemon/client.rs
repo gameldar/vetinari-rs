@@ -800,7 +800,7 @@ mod tests {
             "expires_at": "2026-10-25T09:10:00Z" } }))
             .await;
         let challenge = asking.await.expect("joined").expect("challenge");
-        assert_eq!(challenge.user_code, "BDWP-HQPK");
+        assert_eq!(challenge.user_code.as_deref(), Some("BDWP-HQPK"));
 
         let asking = tokio::spawn({
             let runs = runs.clone();

@@ -474,7 +474,8 @@ pub fn challenge_event(challenge: &DeviceCodeChallenge) -> Value {
 pub fn read_challenge(value: &Value) -> Result<DeviceCodeChallenge, String> {
     #[derive(Deserialize)]
     struct Wire {
-        user_code: String,
+        #[serde(default)]
+        user_code: Option<String>,
         verification_uri: String,
         interval: u64,
         #[serde(with = "time::serde::rfc3339")]
@@ -1538,7 +1539,7 @@ mod tests {
             assert_eq!(read_auth_status(&auth_status_result(state)), Ok(state));
         }
         let challenge = DeviceCodeChallenge {
-            user_code: "BDWP-HQPK".to_owned(),
+            user_code: Some("BDWP-HQPK".to_owned()),
             verification_uri: "https://id.example.net/device".to_owned(),
             device_code: "held by the daemon".to_owned(),
             interval_secs: 5,
@@ -1551,7 +1552,7 @@ mod tests {
             "the device code stays in the daemon"
         );
         let read = read_challenge(&event).expect("challenge");
-        assert_eq!(read.user_code, "BDWP-HQPK");
+        assert_eq!(read.user_code.as_deref(), Some("BDWP-HQPK"));
         assert_eq!(read.verification_uri, "https://id.example.net/device");
         assert_eq!(read.interval_secs, 5);
         assert_eq!(read.expires_at, datetime!(2026-10-25 09:10 UTC));

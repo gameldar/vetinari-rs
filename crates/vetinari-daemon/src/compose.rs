@@ -263,10 +263,7 @@ pub async fn login(socket: PathBuf, config: Option<PathBuf>) -> Result<(), Daemo
 }
 
 fn print_challenge(challenge: &DeviceCodeChallenge) {
-    println!(
-        "Visit {} and enter {}",
-        challenge.verification_uri, challenge.user_code
-    );
+    println!("{}", challenge.instruction());
 }
 
 /// The runs a gateway holds for vetinari, and what each definition says

@@ -178,15 +178,19 @@ impl Provider {
                     fields: vec![FieldSpec::secret("token", "Bot token")],
                 },
             },
+            // Google refuses Calendar scopes on device authorisation, so
+            // its sign-in goes through the browser instead.
             Provider::GoogleCalendar => AuthSpec {
                 provider: *self,
-                instructions: "Create an OAuth client of type 'TV and limited input' in Google \
-                               Cloud, then authorise Vetinari on another device.",
-                method: AuthMethod::OAuthDeviceCode {
-                    device_authorization_url: "https://oauth2.googleapis.com/device/code",
+                instructions: "Create an OAuth client of type 'Desktop app' in Google Cloud, \
+                               then sign in in the browser Vetinari opens.",
+                method: AuthMethod::OAuthLoopback {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
                     token_url: "https://oauth2.googleapis.com/token",
                     scopes: &["https://www.googleapis.com/auth/calendar.readonly"],
-                    needs_client_secret: true,
+                    // Without these Google issues no refresh token, and the
+                    // sign-in lasts an hour.
+                    extra_parameters: &[("access_type", "offline"), ("prompt", "consent")],
                 },
             },
             Provider::Outlook => AuthSpec {
@@ -320,6 +324,19 @@ pub enum AuthMethod {
         scopes: &'static [&'static str],
         /// Whether the provider also demands a client secret.
         needs_client_secret: bool,
+    },
+    /// RFC 8252 sign-in for native apps: Vetinari opens the browser at the
+    /// provider, which sends it back to a port on the loopback interface,
+    /// and the code it brings is exchanged with a PKCE verifier.
+    OAuthLoopback {
+        /// The page the browser is sent to.
+        authorization_url: &'static str,
+        /// Endpoint the authorisation code is exchanged at.
+        token_url: &'static str,
+        /// Scopes to request.
+        scopes: &'static [&'static str],
+        /// Provider-specific parameters for the authorisation page.
+        extra_parameters: &'static [(&'static str, &'static str)],
     },
     /// RFC 8628 device authorisation at endpoints an OIDC issuer
     /// advertises in its discovery document, for a provider whose issuer is
@@ -689,7 +706,8 @@ mod tests {
                         provider.name()
                     );
                 }
-                AuthMethod::OAuthDeviceCode { scopes, .. } => {
+                AuthMethod::OAuthDeviceCode { scopes, .. }
+                | AuthMethod::OAuthLoopback { scopes, .. } => {
                     assert!(!scopes.is_empty(), "{} requests no scopes", provider.name());
                 }
                 AuthMethod::OidcDeviceCode => {}

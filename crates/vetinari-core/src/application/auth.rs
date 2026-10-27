@@ -247,9 +247,9 @@ impl AuthService {
     /// Begin a device-code flow, for providers that use one.
     pub async fn begin_device_flow(&self, provider: Provider) -> PortResult<DeviceCodeChallenge> {
         match provider.auth_spec().method {
-            AuthMethod::OAuthDeviceCode { .. } | AuthMethod::OidcDeviceCode => {
-                self.flow.start(provider).await
-            }
+            AuthMethod::OAuthDeviceCode { .. }
+            | AuthMethod::OAuthLoopback { .. }
+            | AuthMethod::OidcDeviceCode => self.flow.start(provider).await,
             AuthMethod::ApiToken { .. } => Err(PortError::unsupported(
                 provider.name(),
                 "device-code authentication; paste an API token instead",
@@ -509,7 +509,7 @@ mod tests {
             .begin_device_flow(Provider::GoogleCalendar)
             .await
             .expect("challenge");
-        assert_eq!(challenge.user_code, "WXYZ-1234");
+        assert_eq!(challenge.user_code.as_deref(), Some("WXYZ-1234"));
 
         let first = service
             .poll_device_flow(Provider::GoogleCalendar, None, &challenge)
