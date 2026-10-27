@@ -13,11 +13,16 @@
 [Unit]
 Description=autognomus dev stack (engine, scheduler and gateway)
 
+# A unit that cannot start (no cargo, a configuration error) stops
+# retrying after five failures in a minute instead of looping.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 # A checkout with the dev stack and the External and Loop nodes.
 WorkingDirectory=%h/src/autognomus
 ExecStart=/usr/bin/make dev-stack
-Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
 Environment=GATEWAY_BIND=127.0.0.1:8080
 Restart=on-failure
 RestartSec=5

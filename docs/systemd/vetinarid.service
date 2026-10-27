@@ -17,11 +17,16 @@ Documentation=https://github.com/gameldar/vetinari/blob/main/docs/specs/2026-10-
 # keyring, which a desktop session provides.
 After=graphical-session.target
 
+# A unit that cannot start (no cargo, a configuration error) stops
+# retrying after five failures in a minute instead of looping.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 ExecStart=%h/.cargo/bin/vetinarid --foreground
 # With a configuration other than ~/.config/vetinari/config.toml:
 # ExecStart=%h/.cargo/bin/vetinarid --foreground --config %h/.config/vetinari/workflows.toml
-Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
 Environment=RUST_LOG=info
 # vetinarid shuts down on SIGINT and removes its socket.
 KillSignal=SIGINT
