@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
+use super::compile::GraphEdge;
 use super::ids::{NodeId, NodeInstance};
 use super::run_view::{InstanceState, InstanceStatus, RunGraph, RunNode, RunNodeKind};
 
@@ -94,7 +95,7 @@ fn scope_rows(
         .iter()
         .filter(|node| node.scope.as_ref() == scope)
         .collect();
-    let depths = depths(graph, &members);
+    let depths = depths(&graph.edges, &members);
     let mut ordered: Vec<(usize, usize, &RunNode)> = members
         .iter()
         .enumerate()
@@ -160,10 +161,9 @@ fn scope_rows(
 /// Each member's longest distance from an entry of its scope, over the
 /// edges inside the scope. The graph outside loops is acyclic, so one pass
 /// per member settles it.
-fn depths(graph: &RunGraph, members: &[&RunNode]) -> Vec<usize> {
+pub(super) fn depths(edges: &[GraphEdge], members: &[&RunNode]) -> Vec<usize> {
     let index = |id: &NodeId| members.iter().position(|node| node.id == *id);
-    let edges: Vec<(usize, usize)> = graph
-        .edges
+    let edges: Vec<(usize, usize)> = edges
         .iter()
         .filter_map(|edge| Some((index(&edge.from)?, index(&edge.to)?)))
         .collect();
