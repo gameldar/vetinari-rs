@@ -3578,6 +3578,7 @@ dependencies = [
  "tracing-subscriber",
  "vetinari-adapters",
  "vetinari-core",
+ "vetinari-web-model",
 ]
 
 [[package]]
@@ -3599,6 +3600,14 @@ dependencies = [
  "tracing-subscriber",
  "vetinari-adapters",
  "vetinari-core",
+]
+
+[[package]]
+name = "vetinari-web-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

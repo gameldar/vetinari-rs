@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vetinari-core", "crates/vetinari-adapters", "crates/vetinari-tui", "crates/vetinari-daemon"]
+members = ["crates/vetinari-core", "crates/vetinari-adapters", "crates/vetinari-tui", "crates/vetinari-daemon", "crates/vetinari-web-model"]
 resolver = "3"
 
 [workspace.package]
@@ -13,6 +13,7 @@ description = "An orchestrator for coding agents, attention, and technical leade
 [workspace.dependencies]
 vetinari-core = { path = "crates/vetinari-core" }
 vetinari-adapters = { path = "crates/vetinari-adapters" }
+vetinari-web-model = { path = "crates/vetinari-web-model" }
 
 async-trait = "0.1.92"
 thiserror = "2.0.21"

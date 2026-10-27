@@ -14,3 +14,4 @@ pub mod scripted;
 pub mod signin;
 pub mod socket;
 pub mod steps;
+pub mod view;

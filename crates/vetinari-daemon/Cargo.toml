@@ -18,6 +18,7 @@ path = "src/bin/vetinarid.rs"
 [dependencies]
 vetinari-core.workspace = true
 vetinari-adapters.workspace = true
+vetinari-web-model.workspace = true
 
 async-trait.workspace = true
 clap.workspace = true
