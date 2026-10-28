@@ -37,8 +37,14 @@ knowing what deserved his attention and what did not.
 ## Installing
 
 ```sh
-cargo install --path crates/vetinari-tui     # or: cargo build --release
+make install    # vetinari, the web page, vetinarid and its systemd units, then restarts vetinarid
 ```
+
+`make install-tui`, `install-daemon`, `install-units` and `restart` do one part
+each. Units go to `~/.config/systemd/user` (`UNIT_DIR=` moves them) and are
+overwritten, so keep local changes in a drop-in (`systemctl --user edit
+vetinarid`). The autognomus dev stack's unit is installed but not restarted,
+since a restart forgets every run.
 
 Needs Rust 1.88 or newer, `git`, and whichever agents and workspace backends
 you point it at (`claude`, `agy`, `tmux`, Herdr, an editor).
