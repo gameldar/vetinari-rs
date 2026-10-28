@@ -45,7 +45,7 @@ use vetinari_core::domain::profile::ProfileSet;
 
 use crate::gates::{Gates, NoGates};
 use crate::hub::Hub;
-use crate::launches::{GatewayLaunches, Launches, NoLaunches};
+use crate::launches::{GatewayLaunches, Launches, NoLaunches, Starts};
 use crate::runtime::{Feed, OwnedRun, RunChange, TokioClock, feed_runs};
 use crate::scripted::{Script, ScriptError};
 use crate::signin::{SignIn, SignInOutcome};
@@ -529,6 +529,10 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
             let local = LocalBoard::new();
             let hub = Arc::new(Hub::default());
             let (feed, changes) = mpsc::unbounded_channel();
+            let starts = Starts {
+                profiles: config.profiles.clone(),
+                origins: Arc::new(GitWorktreeManager::default()),
+            };
             let (claims, run_worktrees) =
                 claims(config, &paths, gateway.clone(), &worker, clock.clone())?;
             let launcher = Launcher::new(
@@ -540,6 +544,7 @@ pub async fn run(settings: Settings) -> Result<(), DaemonError> {
             );
             let launches = Arc::new(GatewayLaunches::new(
                 launcher,
+                starts,
                 hub.clone(),
                 clock.clone(),
                 feed.clone(),

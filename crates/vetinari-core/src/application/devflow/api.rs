@@ -22,7 +22,7 @@ use crate::domain::text::NonEmptyText;
 
 /// The protocol this daemon speaks. A client speaking another is told to
 /// restart the daemon, since the two were built apart.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// What a run is about, for its queue row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,7 +468,9 @@ mod tests {
 
     #[test]
     fn a_client_speaking_another_protocol_is_told_to_restart_the_daemon() {
-        let error = api().hello("vetinari 0.2.0", 2).expect_err("mismatch");
+        let error = api()
+            .hello("vetinari 0.2.0", PROTOCOL + 1)
+            .expect_err("mismatch");
         assert_eq!(error.code(), "invalid");
         assert!(error.to_string().contains("restart"), "{error}");
     }

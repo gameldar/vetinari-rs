@@ -465,7 +465,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-    use vetinari_core::application::devflow::api::RunLabel;
+    use vetinari_core::application::devflow::api::{PROTOCOL, RunLabel};
     use vetinari_core::domain::devflow::ids::{NodeId, NodeInstance, TaskQueue, WorkerName};
     use vetinari_core::domain::devflow::outcome::GateAnswer;
     use vetinari_core::domain::devflow::run_view::{
@@ -682,32 +682,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_start_names_its_run_and_a_second_for_the_ticket_is_a_conflict() {
-        use vetinari_adapters::daemon::protocol::run_start_params;
-        use vetinari_core::domain::devflow::ids::Rounds;
-        use vetinari_core::domain::devflow::template::{
-            DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
-        };
-        use vetinari_core::domain::ids::{ProfileId, SourceId};
-
         let server = server().await;
         let mut client = Client::connect(&server).await;
-        let params = run_start_params(&DevWorkflow::FeatureFromTicket(FeatureFromTicket {
-            ticket: TicketRef {
-                source: SourceId::parse("jira").expect("source"),
-                key: NonEmptyText::parse("ENG-412").expect("key"),
-                title: NonEmptyText::parse("Rate-limit retries").expect("title"),
-                url: None,
+        let params = json!({
+            "template": "feature-from-ticket",
+            "input": {
+                "ticket": { "source": "jira", "key": "ENG-412", "title": "Rate-limit retries" },
+                "repo": { "path": "/src/web" },
+                "profile": "work",
             },
-            repo: RepoTarget {
-                path: std::path::PathBuf::from("/work/repos/web"),
-                remote: NonEmptyText::parse("acme/web").expect("remote"),
-            },
-            profile: ProfileId::parse("work").expect("profile"),
-            base: None,
-            max_review_rounds: Rounds::DEFAULT,
-            max_intake_rounds: Rounds::DEFAULT,
-            agent: None,
-        }));
+        });
         let start =
             |id: u64| json!({ "id": id, "method": "run.start", "params": params }).to_string();
         client.send(&start(1)).await;
@@ -772,7 +756,7 @@ mod tests {
 
         async fn hello(&mut self, id: u64) -> Value {
             self.send(&format!(
-                r#"{{"id":{id},"method":"hello","params":{{"client":"test","protocol":1}}}}"#
+                r#"{{"id":{id},"method":"hello","params":{{"client":"test","protocol":{PROTOCOL}}}}}"#
             ))
             .await;
             self.frame().await
@@ -850,7 +834,7 @@ mod tests {
         let mut client = Client::connect(&server).await;
         assert_eq!(
             client.hello(1).await,
-            json!({ "id": 1, "result": { "daemon": "vetinarid test", "protocol": 1, "worker": "hex" } })
+            json!({ "id": 1, "result": { "daemon": "vetinarid test", "protocol": PROTOCOL, "worker": "hex" } })
         );
     }
 

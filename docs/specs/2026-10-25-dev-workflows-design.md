@@ -1033,10 +1033,10 @@ versioning policy until it is not enough.
 
 | Method | Params | Result or stream |
 |---|---|---|
-| `hello` | `{ client, protocol: 1 }` | `{ daemon, protocol, worker }`; a protocol mismatch is `invalid` and the client says to restart the daemon |
+| `hello` | `{ client, protocol: 2 }` | `{ daemon, protocol, worker }`; a protocol mismatch is `invalid` and the client says to restart the daemon |
 | `runs.watch` | `{}` | stream: `snapshot { runs: [RunSummary] }`, then `run { RunSummary }` and `removed { run }` |
 | `run.watch` | `{ run }` | stream: `graph { RunDetail }` on every change |
-| `run.start` | `{ template: "feature-from-ticket", ticket, repo, profile, max_review_rounds? }` | `{ run }`; `conflict` if the ticket already has a live run |
+| `run.start` | `{ template, input }` | `{ run }`; `invalid` if the template refuses its input or names no profile vetinari has; `conflict` if the ticket already has a live run |
 | `run.cancel` | `{ run }` | `{}` once the gateway accepted |
 | `run.dismiss` | `{ run, remove_worktree: bool }` | `{}`; deletes the definition, so the run leaves the queue |
 | `gate.answer` | `{ run, instance, answer }` | `{ sent: bool }` |
@@ -1181,10 +1181,14 @@ Slice 11 builds the daemon's run board end to end; 11c adds the worker (below):
 - One run per ticket (15) is checked against every run the daemon owns, finished or not, not only
   live ones: every run of a ticket shares one branch and worktree, so a second waits until the
   first is dismissed. `run.start` replies `conflict` otherwise.
-- `run.start`'s params are `{ template, ticket: { source, key, title, url? }, repo: { path,
-  remote }, profile, max_review_rounds? }`; both loops default to `Rounds::DEFAULT`, 3. `base` and
-  `agent` are not on the socket yet, so a run branches from the default branch and routing picks
-  its agent.
+- `run.start`'s params are `{ template, input }`, and the template parses its own input
+  (`TemplateKind::parse_input`), so a new template needs no change to the socket or its callers.
+  `feature-from-ticket` takes `{ ticket: { source, key, title, url? }, repo: { path, remote? },
+  profile, max_review_rounds?, max_intake_rounds? }`; both loops default to `Rounds::DEFAULT`, 3.
+  Without `remote` the daemon reads `owner/name` from the clone's `origin`. `base` and `agent`
+  are not on the socket yet, so a run branches from the default branch and routing picks its
+  agent. `vetinarid templates` lists each template's input fields, and `vetinarid start`
+  sends a start from the command line.
 - `run.dismiss` refuses a run that is still going with `conflict` (cancel it first): deleting its
   definition would hide a run the worker still serves. With `remove_worktree` the worktree goes
   first, through a `RunWorktrees` port the daemon implements with

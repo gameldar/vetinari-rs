@@ -101,19 +101,43 @@ impl RepoTarget {
     /// The repository `owner/name`, cloned where `profile` keeps it.
     pub fn named(slug: &str, profile: &Profile) -> Result<Self, NotARepository> {
         let slug = slug.trim();
-        let named = slug.split_once('/').is_some_and(|(owner, name)| {
-            !owner.is_empty() && !name.is_empty() && !name.contains('/')
-        });
-        match NonEmptyText::parse(slug) {
-            Ok(remote) if named => Ok(Self {
-                path: profile.repo_path(slug),
-                remote,
-            }),
-            _ => Err(NotARepository {
-                found: slug.to_owned(),
-            }),
-        }
+        Self::at(profile.repo_path(slug), slug)
     }
+
+    /// The clone at `path` of the repository `owner/name`.
+    pub fn at(path: PathBuf, slug: &str) -> Result<Self, NotARepository> {
+        Ok(Self {
+            path,
+            remote: owner_name(slug).ok_or_else(|| NotARepository {
+                found: slug.to_owned(),
+            })?,
+        })
+    }
+
+    /// The clone at `path`, named after its `origin` url: scp-like
+    /// `git@host:owner/name.git` or `scheme://host/owner/name.git`.
+    pub fn cloned(path: PathBuf, origin: &str) -> Result<Self, NotARepository> {
+        let origin = origin.trim();
+        let on_host = match origin.split_once("://") {
+            Some((_, rest)) => rest.split_once('/').filter(|(host, _)| !host.is_empty()),
+            None => origin.split_once(':'),
+        };
+        let remote = on_host
+            .map(|(_, path)| path.trim_end_matches('/'))
+            .map(|path| path.strip_suffix(".git").unwrap_or(path))
+            .and_then(owner_name)
+            .ok_or_else(|| NotARepository {
+                found: origin.to_owned(),
+            })?;
+        Ok(Self { path, remote })
+    }
+}
+
+fn owner_name(slug: &str) -> Option<NonEmptyText> {
+    let named = slug
+        .split_once('/')
+        .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'));
+    named.then(|| NonEmptyText::parse(slug).ok()).flatten()
 }
 
 /// A dev workflow, with everything a run of it needs.
@@ -214,6 +238,37 @@ mod tests {
         );
         for bad in ["web", "acme/", "/web", "acme/web/extra", ""] {
             assert!(RepoTarget::named(bad, &profile).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_clone_is_named_after_its_origin() {
+        for url in [
+            "git@github.com:acme/web.git",
+            "git@github.com:acme/web",
+            "https://github.com/acme/web.git",
+            "https://github.com/acme/web/",
+            "ssh://git@github.com/acme/web.git",
+        ] {
+            assert_eq!(
+                RepoTarget::cloned(PathBuf::from("/src/web"), url),
+                Ok(RepoTarget {
+                    path: PathBuf::from("/src/web"),
+                    remote: NonEmptyText::parse("acme/web").expect("remote"),
+                }),
+                "{url}"
+            );
+        }
+        for bad in [
+            "/srv/git/web.git",
+            "https://github.com/acme",
+            "",
+            "file:///web",
+        ] {
+            assert!(
+                RepoTarget::cloned(PathBuf::from("/src/web"), bad).is_err(),
+                "{bad:?}"
+            );
         }
     }
 

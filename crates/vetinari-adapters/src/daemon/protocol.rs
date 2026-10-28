@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,9 +16,8 @@ use vetinari_core::application::devflow::api::{
 };
 use vetinari_core::application::devflow::worker::GateReply;
 use vetinari_core::application::ports::DeviceCodeChallenge;
-use vetinari_core::domain::devflow::ids::{
-    BranchLabel, NodeId, NodeInstance, Rounds, RunId, TaskQueue,
-};
+use vetinari_core::domain::devflow::ids::{BranchLabel, NodeId, NodeInstance, RunId, TaskQueue};
+use vetinari_core::domain::devflow::input::WorkflowInput;
 use vetinari_core::domain::devflow::lanes::{IterationSelection, Lane, LaneRow, RowKind};
 use vetinari_core::domain::devflow::notes::{ReviewFindings, RunNotes};
 use vetinari_core::domain::devflow::outcome::{Finding, GateAnswer, Line};
@@ -28,10 +26,7 @@ use vetinari_core::domain::devflow::run_view::{InstanceState, InstanceStatus};
 use vetinari_core::domain::devflow::step::StepKind;
 use vetinari_core::domain::devflow::summary::{Mark, NeedsYou};
 use vetinari_core::domain::devflow::summary::{Phase, PhaseCell, Round, RunSummary};
-use vetinari_core::domain::devflow::template::{
-    DevWorkflow, FeatureFromTicket, RepoTarget, TemplateKind, TicketRef,
-};
-use vetinari_core::domain::ids::{ProfileId, SourceId};
+use vetinari_core::domain::devflow::template::TemplateKind;
 use vetinari_core::domain::text::NonEmptyText;
 
 /// The longest frame either end accepts, newline excluded.
@@ -87,8 +82,8 @@ pub enum Request {
         /// The run.
         run: RunId,
     },
-    /// `run.start`: a run of a template, for one ticket.
-    RunStart(Box<DevWorkflow>),
+    /// `run.start`: a run of a template, with the input it parsed.
+    RunStart(Box<WorkflowInput>),
     /// `run.dismiss`: take a finished run off the queue.
     RunDismiss {
         /// The run.
@@ -235,89 +230,28 @@ pub fn parse_request(line: &str) -> Result<(u64, Request), BadFrame> {
     Ok((frame.id, request))
 }
 
-/// `run.start`'s params for `workflow`, as a client sends them.
+/// `run.start`'s params: a template by name and its input, which the
+/// template parses.
 #[must_use]
-pub fn run_start_params(workflow: &DevWorkflow) -> Value {
-    match workflow {
-        DevWorkflow::FeatureFromTicket(feature) => json!({
-            "template": workflow.kind().name(),
-            "ticket": {
-                "source": feature.ticket.source.as_str(),
-                "key": feature.ticket.key.as_str(),
-                "title": feature.ticket.title.as_str(),
-                "url": feature.ticket.url,
-            },
-            "repo": {
-                "path": feature.repo.path,
-                "remote": feature.repo.remote.as_str(),
-            },
-            "profile": feature.profile.as_str(),
-            "max_review_rounds": feature.max_review_rounds.get().get(),
-        }),
-    }
+pub fn run_start_params(template: &str, input: Value) -> Value {
+    json!({ "template": template, "input": input })
 }
 
-/// Read `run.start`'s params: a ticket, its repository and profile, for
-/// the one template there is. What a run does not say is the default.
-fn run_start(params: &Value) -> Result<DevWorkflow, String> {
+fn run_start(params: &Value) -> Result<WorkflowInput, String> {
     #[derive(Deserialize)]
     struct Params {
         template: String,
-        ticket: Ticket,
-        repo: Repo,
-        profile: String,
-        #[serde(default)]
-        max_review_rounds: Option<u32>,
-    }
-    #[derive(Deserialize)]
-    struct Ticket {
-        source: String,
-        key: String,
-        title: String,
-        #[serde(default)]
-        url: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct Repo {
-        path: PathBuf,
-        remote: String,
+        input: Value,
     }
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|error| format!("run.start params: {error}"))?;
-    let text = |field: &str, raw: &str| {
-        NonEmptyText::parse(raw).map_err(|error| format!("{field}: {error}"))
-    };
     let template: TemplateKind = params
         .template
         .parse()
         .map_err(|error| format!("template: {error}"))?;
-    let max_review_rounds = params
-        .max_review_rounds
-        .map(Rounds::new)
-        .transpose()
-        .map_err(|error| format!("max_review_rounds: {error}"))?
-        .unwrap_or(Rounds::DEFAULT);
-    match template {
-        TemplateKind::FeatureFromTicket => Ok(DevWorkflow::FeatureFromTicket(FeatureFromTicket {
-            ticket: TicketRef {
-                source: SourceId::parse(&params.ticket.source)
-                    .map_err(|error| format!("ticket source: {error}"))?,
-                key: text("ticket key", &params.ticket.key)?,
-                title: text("ticket title", &params.ticket.title)?,
-                url: params.ticket.url,
-            },
-            repo: RepoTarget {
-                path: params.repo.path,
-                remote: text("repo remote", &params.repo.remote)?,
-            },
-            profile: ProfileId::parse(&params.profile)
-                .map_err(|error| format!("profile: {error}"))?,
-            base: None,
-            max_review_rounds,
-            max_intake_rounds: Rounds::DEFAULT,
-            agent: None,
-        })),
-    }
+    template
+        .parse_input(&params.input)
+        .map_err(|error| error.to_string())
 }
 
 /// `run.start`'s result.
@@ -1001,8 +935,12 @@ mod tests {
     use std::num::NonZeroU32;
 
     use time::macros::datetime;
-    use vetinari_core::domain::devflow::ids::WorkerName;
+    use vetinari_core::domain::devflow::ids::{Rounds, WorkerName};
     use vetinari_core::domain::devflow::step::GateKind;
+    use vetinari_core::domain::devflow::template::{
+        DevWorkflow, FeatureFromTicket, RepoTarget, TicketRef,
+    };
+    use vetinari_core::domain::ids::{ProfileId, SourceId};
 
     use super::*;
 
@@ -1158,37 +1096,31 @@ mod tests {
     }
 
     #[test]
-    fn a_run_is_started_for_a_ticket_in_a_repository_under_a_profile() {
+    fn a_run_is_started_from_a_template_and_its_input() {
         let raw = r#"{"id":7,"method":"run.start","params":{
             "template":"feature-from-ticket",
-            "ticket":{"source":"jira","key":"ENG-412","title":"Rate-limit retries",
-                "url":"https://acme.atlassian.net/browse/ENG-412"},
-            "repo":{"path":"/work/repos/web","remote":"acme/web"},
-            "profile":"work"}}"#
+            "input":{
+                "ticket":{"source":"jira","key":"ENG-412","title":"Rate-limit retries",
+                    "url":"https://acme.atlassian.net/browse/ENG-412"},
+                "repo":{"path":"/work/repos/web","remote":"acme/web"},
+                "profile":"work"}}}"#
             .replace('\n', "");
         assert_eq!(
             parse_request(&raw),
-            Ok((7, Request::RunStart(Box::new(feature()))))
+            Ok((
+                7,
+                Request::RunStart(Box::new(WorkflowInput::from(feature())))
+            ))
         );
-
-        let rounds = raw.replace(
-            r#""profile":"work""#,
-            r#""profile":"work","max_review_rounds":5"#,
-        );
-        let Ok((_, Request::RunStart(workflow))) = parse_request(&rounds) else {
-            panic!("a start");
-        };
-        let DevWorkflow::FeatureFromTicket(started) = *workflow;
-        assert_eq!(started.max_review_rounds.get().get(), 5);
     }
 
     #[test]
-    fn a_start_of_another_template_or_out_of_range_rounds_is_invalid() {
-        let start = run_start_params(&feature());
+    fn an_unknown_template_or_input_it_refuses_is_invalid() {
+        let start = run_start_params(TemplateKind::FeatureFromTicket.name(), feature().input());
         for (field, value) in [
             ("template", json!("deploy")),
-            ("max_review_rounds", json!(21)),
-            ("profile", json!("Not A Profile")),
+            ("input", json!({ "profile": "work" })),
+            ("input", json!("ENG-412")),
         ] {
             let mut params = start.clone();
             params[field] = value;
@@ -1209,11 +1141,14 @@ mod tests {
 
     #[test]
     fn the_daemon_reads_the_start_a_client_writes() {
-        let raw = json!({ "id": 1, "method": "run.start", "params": run_start_params(&feature()) })
-            .to_string();
+        let params = run_start_params(TemplateKind::FeatureFromTicket.name(), feature().input());
+        let raw = json!({ "id": 1, "method": "run.start", "params": params }).to_string();
         assert_eq!(
             parse_request(&raw),
-            Ok((1, Request::RunStart(Box::new(feature()))))
+            Ok((
+                1,
+                Request::RunStart(Box::new(WorkflowInput::from(feature())))
+            ))
         );
         let run = RunId::parse("01JB80").expect("run");
         assert_eq!(run_started_result(&run), json!({ "run": "01JB80" }));

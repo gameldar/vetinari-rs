@@ -10,6 +10,7 @@ pub mod compile;
 mod engine_rules;
 pub mod held;
 pub mod ids;
+pub mod input;
 pub mod lanes;
 pub mod layout;
 pub mod notes;

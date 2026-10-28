@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use vetinari_core::application::devflow::api::ApiError;
 use vetinari_core::application::devflow::worker::GateReply;
 use vetinari_core::domain::devflow::ids::{NodeInstance, RunId};
+use vetinari_core::domain::devflow::input::WorkflowInput;
 use vetinari_core::domain::devflow::outcome::GateAnswer;
 
 use crate::gates::Gates;
@@ -20,12 +21,8 @@ pub struct RecordingLaunches {
 
 #[async_trait]
 impl Launches for RecordingLaunches {
-    async fn start(
-        &self,
-        workflow: vetinari_core::domain::devflow::template::DevWorkflow,
-    ) -> Result<RunId, ApiError> {
-        let vetinari_core::domain::devflow::template::DevWorkflow::FeatureFromTicket(feature) =
-            workflow;
+    async fn start(&self, input: WorkflowInput) -> Result<RunId, ApiError> {
+        let WorkflowInput::FeatureFromTicket(feature) = input;
         let mut started = self.started.lock().expect("lock");
         let ticket = feature.ticket.key.to_string();
         if started.contains(&ticket) {

@@ -190,3 +190,10 @@ pub trait LeaseJournal: Send + Sync {
     /// Replace what is recorded with `held`, atomically.
     async fn save(&self, held: &[HeldLease]) -> PortResult<()>;
 }
+
+/// Where a local clone's `origin` points.
+#[async_trait]
+pub trait RepoOrigins: Send + Sync {
+    /// The url of `clone`'s `origin` remote.
+    async fn origin(&self, clone: &Path) -> PortResult<String>;
+}

@@ -197,9 +197,15 @@ impl DaemonRuns {
 
     /// Start a run; the daemon refuses a ticket that already has one.
     pub async fn start_run(&self, workflow: &DevWorkflow) -> PortResult<RunId> {
+        self.start_template(workflow.kind().name(), workflow.input())
+            .await
+    }
+
+    /// Start a run of `template`, which the daemon parses `input` for.
+    pub async fn start_template(&self, template: &str, input: Value) -> PortResult<RunId> {
         let result = Connection::open(&self.socket, &self.client)
             .await?
-            .request("run.start", run_start_params(workflow))
+            .request("run.start", run_start_params(template, input))
             .await?;
         read_run_started(&result).map_err(protocol)
     }
@@ -676,7 +682,7 @@ mod tests {
         let request = peer.answer("run.start", json!({ "run": "01JB80" })).await;
         assert_eq!(
             request["params"],
-            super::super::protocol::run_start_params(&workflow)
+            json!({ "template": "feature-from-ticket", "input": workflow.input() })
         );
         assert_eq!(
             starting.await.expect("join"),

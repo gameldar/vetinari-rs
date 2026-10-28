@@ -76,6 +76,19 @@ xdg-open "$(vetinarid web)"                       # the URL carries the page's t
 It listens on `127.0.0.1:7878`; `--web <addr>` moves it (loopback only) and
 `--no-web` turns it off.
 
+Other tools start runs through the running daemon with `vetinarid start`, which
+takes a template and its input as JSON (inline, `@file` or `-` for stdin) and
+prints the run's id. `vetinarid templates` lists the templates and the fields
+each one's input takes:
+
+```sh
+vetinarid start feature-from-ticket --input '{
+  "ticket": {"source": "jira", "key": "ENG-412", "title": "Paginate audit export"},
+  "repo": {"path": "/home/me/src/web"},
+  "profile": "work"
+}'
+```
+
 ## Using it
 
 ```sh

@@ -10,9 +10,13 @@ use vetinari_core::application::devflow::api::ApiError;
 use vetinari_core::application::devflow::launcher::{
     DismissError, LaunchError, Launcher, RunOrigin,
 };
+use vetinari_core::application::devflow::ports::RepoOrigins;
+use vetinari_core::application::devflow::start::{self, StartError};
 use vetinari_core::application::ports::Clock;
 use vetinari_core::domain::devflow::ids::RunId;
+use vetinari_core::domain::devflow::input::WorkflowInput;
 use vetinari_core::domain::devflow::template::DevWorkflow;
+use vetinari_core::domain::profile::ProfileSet;
 
 use crate::hub::Hub;
 use crate::runtime::{OwnedRun, RunChange};
@@ -20,8 +24,8 @@ use crate::runtime::{OwnedRun, RunChange};
 /// Starts and dismisses this daemon's runs.
 #[async_trait]
 pub trait Launches: Send + Sync {
-    /// Start a run of `workflow`.
-    async fn start(&self, workflow: DevWorkflow) -> Result<RunId, ApiError>;
+    /// Start a run of the workflow `input` asks for.
+    async fn start(&self, input: WorkflowInput) -> Result<RunId, ApiError>;
 
     /// Take a finished run off the queue, and its worktree with it when
     /// asked.
@@ -35,7 +39,7 @@ const SCRIPTED: &str = "this daemon replays a script and starts or dismisses no 
 
 #[async_trait]
 impl Launches for NoLaunches {
-    async fn start(&self, _workflow: DevWorkflow) -> Result<RunId, ApiError> {
+    async fn start(&self, _input: WorkflowInput) -> Result<RunId, ApiError> {
         Err(ApiError::Invalid(SCRIPTED.to_owned()))
     }
 
@@ -44,11 +48,21 @@ impl Launches for NoLaunches {
     }
 }
 
+/// What a start is checked against: the profiles vetinari has, and where
+/// a clone given by path alone points.
+pub struct Starts {
+    /// The profiles a start may name.
+    pub profiles: ProfileSet,
+    /// Reads a clone's `origin`.
+    pub origins: Arc<dyn RepoOrigins>,
+}
+
 /// The launcher over the gateway, knowing every run this daemon owns by
 /// its definition. Starts and dismissals take turns, so two starts for one
 /// ticket cannot both pass the check for a run already on it.
 pub struct GatewayLaunches {
     launcher: Launcher,
+    starts: Starts,
     hub: Arc<Hub>,
     clock: Arc<dyn Clock>,
     origins: Mutex<BTreeMap<RunId, RunOrigin>>,
@@ -61,12 +75,14 @@ impl GatewayLaunches {
     #[must_use]
     pub fn new(
         launcher: Launcher,
+        starts: Starts,
         hub: Arc<Hub>,
         clock: Arc<dyn Clock>,
         feed: mpsc::UnboundedSender<RunChange>,
     ) -> Self {
         Self {
             launcher,
+            starts,
             hub,
             clock,
             origins: Mutex::default(),
@@ -86,7 +102,14 @@ impl GatewayLaunches {
 
 #[async_trait]
 impl Launches for GatewayLaunches {
-    async fn start(&self, workflow: DevWorkflow) -> Result<RunId, ApiError> {
+    async fn start(&self, input: WorkflowInput) -> Result<RunId, ApiError> {
+        let workflow: DevWorkflow =
+            start::workflow(input, &self.starts.profiles, self.starts.origins.as_ref())
+                .await
+                .map_err(|error| match error {
+                    StartError::Port(error) => error.into(),
+                    refused => ApiError::Invalid(refused.to_string()),
+                })?;
         let mut origins = self.origins.lock().await;
         let owned: Vec<RunOrigin> = origins.values().cloned().collect();
         let origin =
@@ -129,15 +152,21 @@ impl Launches for GatewayLaunches {
 mod tests {
     use std::path::PathBuf;
 
+    use serde_json::json;
     use time::macros::datetime;
     use vetinari_core::application::devflow::api::{RunItem, RunLabel};
+    use vetinari_core::application::ports::PortResult;
     use vetinari_core::domain::devflow::compile::{StepPolicies, WorkerQueues};
     use vetinari_core::domain::devflow::ids::{Rounds, WorkerName};
     use vetinari_core::domain::devflow::run_view::RunStatus;
     use vetinari_core::domain::devflow::summary::RunSummary;
-    use vetinari_core::domain::devflow::template::{FeatureFromTicket, RepoTarget, TicketRef};
+    use vetinari_core::domain::devflow::template::{
+        FeatureFromTicket, RepoTarget, TemplateKind, TicketRef,
+    };
     use vetinari_core::domain::ids::{ProfileId, SourceId};
+    use vetinari_core::domain::profile::Profile;
     use vetinari_core::domain::text::NonEmptyText;
+    use vetinari_core::domain::workspace::TargetKind;
     use vetinari_core::testing::{
         CountingRunIds, FakeRunGateway, FixedClock, RecordingRunWorktrees,
     };
@@ -151,6 +180,24 @@ mod tests {
         hub: Arc<Hub>,
         launches: GatewayLaunches,
         fed: mpsc::UnboundedReceiver<RunChange>,
+    }
+
+    struct Origins;
+
+    #[async_trait]
+    impl RepoOrigins for Origins {
+        async fn origin(&self, _clone: &std::path::Path) -> PortResult<String> {
+            Ok("git@github.com:acme/web.git".to_owned())
+        }
+    }
+
+    fn profiles() -> ProfileSet {
+        let work = Profile::new(
+            ProfileId::parse("work").expect("id"),
+            NonEmptyText::parse("Work").expect("name"),
+            TargetKind::Tmux,
+        );
+        ProfileSet::new(work, Vec::new()).expect("profiles")
     }
 
     fn harness() -> Harness {
@@ -167,13 +214,22 @@ mod tests {
         Harness {
             runs,
             hub: hub.clone(),
-            launches: GatewayLaunches::new(launcher, hub, Arc::new(FixedClock::new(NOW)), feed),
+            launches: GatewayLaunches::new(
+                launcher,
+                Starts {
+                    profiles: profiles(),
+                    origins: Arc::new(Origins),
+                },
+                hub,
+                Arc::new(FixedClock::new(NOW)),
+                feed,
+            ),
             fed,
         }
     }
 
-    fn workflow(ticket: &str) -> DevWorkflow {
-        DevWorkflow::FeatureFromTicket(FeatureFromTicket {
+    fn workflow(ticket: &str) -> WorkflowInput {
+        WorkflowInput::from(DevWorkflow::FeatureFromTicket(FeatureFromTicket {
             ticket: TicketRef {
                 source: SourceId::parse("jira").expect("source"),
                 key: NonEmptyText::parse(ticket).expect("key"),
@@ -189,7 +245,17 @@ mod tests {
             max_review_rounds: Rounds::DEFAULT,
             max_intake_rounds: Rounds::DEFAULT,
             agent: None,
-        })
+        }))
+    }
+
+    fn clone_of(profile: &str) -> WorkflowInput {
+        TemplateKind::FeatureFromTicket
+            .parse_input(&json!({
+                "ticket": { "source": "jira", "key": "ENG-7", "title": "Rate-limit retries" },
+                "repo": { "path": "/src/web" },
+                "profile": profile,
+            }))
+            .expect("input")
     }
 
     fn label(ticket: &str) -> RunLabel {
@@ -229,6 +295,30 @@ mod tests {
                 started_at: Some(NOW),
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn a_clone_is_started_as_the_repository_its_origin_names() {
+        let h = harness();
+        h.launches.start(clone_of("work")).await.expect("started");
+        assert_eq!(h.runs.registered().len(), 1);
+        let origins = h.launches.origins.lock().await;
+        let origin = origins.values().next().expect("owned");
+        assert_eq!(origin.config.repo.remote.as_str(), "acme/web");
+        assert_eq!(origin.config.repo.path, PathBuf::from("/src/web"));
+    }
+
+    #[tokio::test]
+    async fn a_start_under_a_profile_vetinari_lacks_is_invalid() {
+        let h = harness();
+        let error = h
+            .launches
+            .start(clone_of("home"))
+            .await
+            .expect_err("invalid");
+        assert_eq!(error.code(), "invalid");
+        assert!(error.to_string().contains("home"), "{error}");
+        assert!(h.runs.registered().is_empty());
     }
 
     #[tokio::test]

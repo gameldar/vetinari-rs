@@ -10,6 +10,7 @@ use std::process::Output;
 
 use async_trait::async_trait;
 use tokio::process::Command;
+use vetinari_core::application::devflow::ports::RepoOrigins;
 use vetinari_core::application::ports::{PortError, PortResult, WorktreeManager};
 use vetinari_core::domain::git::{BranchName, CommitId, Worktree, WorktreeSpec};
 
@@ -193,6 +194,16 @@ impl WorktreeManager for GitWorktreeManager {
     }
 }
 
+#[async_trait]
+impl RepoOrigins for GitWorktreeManager {
+    async fn origin(&self, clone: &Path) -> PortResult<String> {
+        let url = self
+            .run_ok(clone, "origin", &["remote", "get-url", "origin"])
+            .await?;
+        Ok(url.trim().to_owned())
+    }
+}
+
 fn stderr_of(output: &Output) -> String {
     let text = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if text.is_empty() {
@@ -286,6 +297,23 @@ mod tests {
             trees.join(branch.replace('/', "-")),
             base.map(str::to_owned),
         )
+    }
+
+    #[tokio::test]
+    async fn a_clone_tells_where_its_origin_points() {
+        let repo = repo_with_a_commit().await;
+        let manager = GitWorktreeManager::default();
+        assert!(manager.origin(repo.path()).await.is_err());
+
+        git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:acme/web.git"],
+        )
+        .await;
+        assert_eq!(
+            manager.origin(repo.path()).await.expect("origin"),
+            "git@github.com:acme/web.git"
+        );
     }
 
     #[tokio::test]
