@@ -1,0 +1,36 @@
+# The autognomus dev stack as a systemd user service: engine, scheduler and
+# gateway in one process on 127.0.0.1:8080, signed by its own local issuer.
+# vetinarid reaches it through token_file (see docs/config.example.toml).
+#
+# Build the stack once in the autognomus checkout below, and again after
+# pulling changes to it:
+#
+#   cargo build --release --locked -p autognomus-hub --example dev_stack
+#
+#   cp docs/systemd/autognomus-dev-stack.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now autognomus-dev-stack
+#
+# Everything is in memory: a restart forgets every run and mints a new
+# token, which vetinarid picks up the next time the gateway refuses the old
+# one.
+
+[Unit]
+Description=autognomus dev stack (engine, scheduler and gateway)
+# A unit that cannot start stops retrying after five failures in a minute
+# instead of looping.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+# A checkout with the dev stack and the External and Loop nodes.
+ExecStart=%h/src/autognomus/target/release/examples/dev_stack
+Environment=AUTOGNOMUS_DEV_STACK_BIND=127.0.0.1:8080
+Environment=AUTOGNOMUS_DEV_STACK_TOKEN=%h/src/autognomus/target/dev-stack/owner.token
+# The stack shuts down on SIGINT.
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

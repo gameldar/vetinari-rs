@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 
 use super::ids::{BranchLabel, DefinitionId, NodeId, Rounds, TaskQueue, WorkerName};
 use super::outcome::label;
+use super::run_view::{RunNode, RunNodeKind};
 use super::step::{GateKind, StepConfig, StepKind};
 use super::template::{DevWorkflow, FeatureFromTicket, TemplateKind};
 use crate::domain::ids::SkillId;
@@ -176,6 +177,16 @@ impl WorkerQueues {
             human: queue("human"),
         }
     }
+
+    /// The queue a step is offered on: gates to a person, the rest to an
+    /// agent.
+    #[must_use]
+    pub const fn for_step(&self, kind: StepKind) -> &TaskQueue {
+        match kind {
+            StepKind::Gate(_) => &self.human,
+            _ => &self.agent,
+        }
+    }
 }
 
 /// A list with at least one entry.
@@ -297,77 +308,144 @@ pub fn node_step(template: TemplateKind, node: &NodeId) -> Option<StepKind> {
     }
 }
 
-fn feature_graph(
-    feature: &FeatureFromTicket,
-    id: DefinitionId,
+/// The nodes a compiled graph is drawn as, each scoped to the loop whose
+/// body names it.
+#[must_use]
+pub fn drawn(graph: &WorkflowGraph) -> Vec<RunNode> {
+    scoped(
+        graph
+            .nodes
+            .iter()
+            .map(|node| match node {
+                GraphNode::External { id, queue, .. } => (
+                    id.clone(),
+                    RunNodeKind::External {
+                        queue: queue.clone(),
+                    },
+                ),
+                GraphNode::Loop {
+                    id,
+                    body,
+                    exit,
+                    max_iterations,
+                } => (
+                    id.clone(),
+                    RunNodeKind::Loop {
+                        body: body.iter().cloned().collect(),
+                        exit: exit.node.clone(),
+                        exit_when: exit.when.clone(),
+                        max_iterations: max_iterations.get(),
+                    },
+                ),
+            })
+            .collect(),
+    )
+}
+
+/// A template as a run of it would be drawn before it starts: its nodes and
+/// edges, with the given round limits, offered on `queues`. Nothing is
+/// registered and no ticket is needed.
+#[must_use]
+pub fn preview(
+    template: TemplateKind,
+    intake: Rounds,
+    review: Rounds,
     queues: &WorkerQueues,
-    policies: &StepPolicies,
-) -> WorkflowGraph {
-    let branch = feature.branch();
-    let step = |node: &'static str, kind: StepKind, skill: Option<&'static str>| {
-        let agent_step = kind.is_agent_step();
-        GraphNode::External {
-            id: NodeId::known(node),
-            queue: if matches!(kind, StepKind::Gate(_)) {
-                queues.human.clone()
-            } else {
-                queues.agent.clone()
-            },
-            config: Box::new(StepConfig {
-                step: kind,
-                template: TemplateKind::FeatureFromTicket,
-                ticket: feature.ticket.clone(),
-                repo: feature.repo.clone(),
-                profile: feature.profile.clone(),
-                branch: branch.clone(),
-                base: feature.base.clone(),
-                skill: skill
-                    .map(|skill| SkillId::parse(skill).expect("built-in skill id is valid")),
-                agent: feature.agent.clone().filter(|_| agent_step),
-            }),
-            policy: policies.for_step(kind),
-        }
+) -> (Vec<RunNode>, Vec<GraphEdge>) {
+    let (parts, edges) = match template {
+        TemplateKind::FeatureFromTicket => feature_shape(intake, review),
     };
-    let looping = |node: &'static str, body: [&'static str; 2], exit: &'static str, when, max| {
-        GraphNode::Loop {
-            id: NodeId::known(node),
-            body: NonEmpty::new(NodeId::known(body[0]), vec![NodeId::known(body[1])]),
-            exit: LoopExit {
-                node: NodeId::known(exit),
-                when: BranchLabel::known(when),
-            },
-            max_iterations: max,
-        }
+    let nodes = parts
+        .into_iter()
+        .map(|part| match part {
+            Part::Step { id, kind, .. } => (
+                NodeId::known(id),
+                RunNodeKind::External {
+                    queue: queues.for_step(kind).clone(),
+                },
+            ),
+            Part::Loop {
+                id,
+                body,
+                exit,
+                when,
+                max,
+            } => (
+                NodeId::known(id),
+                RunNodeKind::Loop {
+                    body: body.iter().map(|node| NodeId::known(node)).collect(),
+                    exit: NodeId::known(exit),
+                    exit_when: BranchLabel::known(when),
+                    max_iterations: max.get(),
+                },
+            ),
+        })
+        .collect();
+    (scoped(nodes), edges)
+}
+
+/// Nodes, each scoped to the loop whose body names it.
+fn scoped(nodes: Vec<(NodeId, RunNodeKind)>) -> Vec<RunNode> {
+    let scope_of = |id: &NodeId| {
+        nodes.iter().find_map(|(loop_id, kind)| match kind {
+            RunNodeKind::Loop { body, .. } if body.contains(id) => Some(loop_id.clone()),
+            _ => None,
+        })
     };
+    let scopes: Vec<Option<NodeId>> = nodes.iter().map(|(id, _)| scope_of(id)).collect();
+    nodes
+        .into_iter()
+        .zip(scopes)
+        .map(|((id, kind), scope)| RunNode { id, kind, scope })
+        .collect()
+}
+
+/// One node of a template before a run gives it a ticket.
+enum Part {
+    Step {
+        id: &'static str,
+        kind: StepKind,
+        skill: Option<&'static str>,
+    },
+    Loop {
+        id: &'static str,
+        body: [&'static str; 2],
+        exit: &'static str,
+        when: &'static str,
+        max: Rounds,
+    },
+}
+
+/// [`FeatureFromTicket`]'s nodes and edges, the same for every run.
+fn feature_shape(intake: Rounds, review: Rounds) -> (Vec<Part>, Vec<GraphEdge>) {
+    let step = |id, kind, skill| Part::Step { id, kind, skill };
     let edge = |from: &'static str, to: &'static str, when: &'static str| GraphEdge {
         from: NodeId::known(from),
         to: NodeId::known(to),
         when: Some(BranchLabel::known(when)),
     };
-
-    WorkflowGraph {
-        id,
-        nodes: vec![
-            looping(
-                node::INTAKE,
-                [node::PREFLIGHT, node::ASK_INFO],
-                node::PREFLIGHT,
-                label::READY,
-                feature.max_intake_rounds,
-            ),
+    (
+        vec![
+            Part::Loop {
+                id: node::INTAKE,
+                body: [node::PREFLIGHT, node::ASK_INFO],
+                exit: node::PREFLIGHT,
+                when: label::READY,
+                max: intake,
+            },
             step(
                 node::PREFLIGHT,
                 StepKind::Preflight,
                 Some(skill::TICKET_PREFLIGHT),
             ),
             step(node::ASK_INFO, StepKind::Gate(GateKind::InfoNeeded), None),
-            looping(
-                node::REWORK,
-                [node::IMPLEMENT, node::REVIEW],
-                node::REVIEW,
-                label::APPROVED,
-                feature.max_review_rounds,
-            ),
+            Part::Loop {
+                id: node::REWORK,
+                body: [node::IMPLEMENT, node::REVIEW],
+                exit: node::REVIEW,
+                when: label::APPROVED,
+                max: review,
+            },
             step(
                 node::IMPLEMENT,
                 StepKind::Implement,
@@ -381,7 +459,7 @@ fn feature_graph(
             ),
             step(node::OPEN_PR, StepKind::OpenPr, None),
         ],
-        edges: vec![
+        vec![
             edge(node::PREFLIGHT, node::ASK_INFO, label::NEEDS_INFO),
             edge(node::INTAKE, node::REWORK, label::DONE),
             edge(node::IMPLEMENT, node::REVIEW, label::IMPLEMENTED),
@@ -389,7 +467,55 @@ fn feature_graph(
             edge(node::REWORK, node::REVIEW_STUCK, label::EXHAUSTED),
             edge(node::REVIEW_STUCK, node::OPEN_PR, label::OPEN_ANYWAY),
         ],
-    }
+    )
+}
+
+fn feature_graph(
+    feature: &FeatureFromTicket,
+    id: DefinitionId,
+    queues: &WorkerQueues,
+    policies: &StepPolicies,
+) -> WorkflowGraph {
+    let branch = feature.branch();
+    let (parts, edges) = feature_shape(feature.max_intake_rounds, feature.max_review_rounds);
+    let nodes = parts
+        .into_iter()
+        .map(|part| match part {
+            Part::Step { id, kind, skill } => GraphNode::External {
+                id: NodeId::known(id),
+                queue: queues.for_step(kind).clone(),
+                config: Box::new(StepConfig {
+                    step: kind,
+                    template: TemplateKind::FeatureFromTicket,
+                    ticket: feature.ticket.clone(),
+                    repo: feature.repo.clone(),
+                    profile: feature.profile.clone(),
+                    branch: branch.clone(),
+                    base: feature.base.clone(),
+                    skill: skill
+                        .map(|skill| SkillId::parse(skill).expect("built-in skill id is valid")),
+                    agent: feature.agent.clone().filter(|_| kind.is_agent_step()),
+                }),
+                policy: policies.for_step(kind),
+            },
+            Part::Loop {
+                id,
+                body,
+                exit,
+                when,
+                max,
+            } => GraphNode::Loop {
+                id: NodeId::known(id),
+                body: NonEmpty::new(NodeId::known(body[0]), vec![NodeId::known(body[1])]),
+                exit: LoopExit {
+                    node: NodeId::known(exit),
+                    when: BranchLabel::known(when),
+                },
+                max_iterations: max,
+            },
+        })
+        .collect();
+    WorkflowGraph { id, nodes, edges }
 }
 
 #[cfg(test)]
@@ -418,6 +544,66 @@ mod tests {
             &queues(),
             &StepPolicies::default(),
         )
+    }
+
+    #[test]
+    fn a_compiled_graph_is_drawn_with_each_loop_scoping_its_body() {
+        let graph = compiled(sample_feature());
+        let nodes = drawn(&graph);
+
+        let scope = |id: &str| {
+            nodes
+                .iter()
+                .find(|node| node.id.as_str() == id)
+                .and_then(|node| node.scope.as_ref().map(NodeId::as_str))
+        };
+        assert_eq!(scope("preflight"), Some("intake"));
+        assert_eq!(scope("review"), Some("rework"));
+        assert_eq!(scope("open-pr"), None);
+        let rework = nodes
+            .iter()
+            .find(|node| node.id.as_str() == "rework")
+            .expect("rework");
+        assert_eq!(
+            rework.kind,
+            RunNodeKind::Loop {
+                body: vec![
+                    NodeId::parse("implement").expect("id"),
+                    NodeId::parse("review").expect("id")
+                ],
+                exit: NodeId::parse("review").expect("id"),
+                exit_when: BranchLabel::parse("approved").expect("label"),
+                max_iterations: nz(3),
+            }
+        );
+        let ask = nodes
+            .iter()
+            .find(|node| node.id.as_str() == "ask-info")
+            .expect("ask-info");
+        assert_eq!(
+            ask.kind,
+            RunNodeKind::External {
+                queue: queues().human
+            }
+        );
+    }
+
+    #[test]
+    fn a_preview_draws_what_a_run_with_the_same_rounds_registers() {
+        let mut feature = sample_feature();
+        feature.max_intake_rounds = Rounds::new(2).expect("rounds");
+        feature.max_review_rounds = Rounds::new(5).expect("rounds");
+        let graph = compiled(feature.clone());
+
+        let (nodes, edges) = preview(
+            TemplateKind::FeatureFromTicket,
+            feature.max_intake_rounds,
+            feature.max_review_rounds,
+            &queues(),
+        );
+
+        assert_eq!(nodes, drawn(&graph));
+        assert_eq!(edges, graph.edges);
     }
 
     #[test]

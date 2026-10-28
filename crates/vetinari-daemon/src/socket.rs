@@ -24,6 +24,7 @@ use vetinari_core::application::devflow::api::{
 use vetinari_core::application::devflow::ports::RunGateway;
 use vetinari_core::domain::devflow::ids::RunId;
 use vetinari_core::domain::devflow::lanes::IterationSelection;
+use vetinari_core::domain::devflow::run_view::RunGraph;
 use vetinari_core::domain::devflow::template::TemplateKind;
 
 use crate::gates::Gates;
@@ -373,23 +374,37 @@ impl Watching {
     }
 
     async fn detail(&self) -> Option<RunDetail> {
-        let (item, graph) = self.hub.run(&self.run)?;
-        let outputs = match self.backend.runs.outputs(&self.run).await {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                tracing::warn!(%error, run = %self.run, "cannot read a run's outputs");
-                BTreeMap::new()
-            }
-        };
-        Some(RunDetail::of(
-            item,
-            &graph,
-            self.backend.template,
-            &self.selection,
-            &self.backend.local.get(&self.run),
-            &outputs,
-        ))
+        run_detail(&self.hub, &self.backend, &self.run, &self.selection)
+            .await
+            .map(|(detail, _)| detail)
     }
+}
+
+/// A run's detail at `selection`, with the graph it was taken from, when
+/// the hub has both.
+pub(crate) async fn run_detail(
+    hub: &Hub,
+    backend: &Backend,
+    run: &RunId,
+    selection: &IterationSelection,
+) -> Option<(RunDetail, RunGraph)> {
+    let (item, graph) = hub.run(run)?;
+    let outputs = match backend.runs.outputs(run).await {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            tracing::warn!(%error, %run, "cannot read a run's outputs");
+            BTreeMap::new()
+        }
+    };
+    let detail = RunDetail::of(
+        item,
+        &graph,
+        backend.template,
+        selection,
+        &backend.local.get(run),
+        &outputs,
+    );
+    Some((detail, graph))
 }
 
 /// A `runs.watch` stream: the snapshot, then each change, and whether the
@@ -433,7 +448,7 @@ async fn forward(
 }
 
 /// The next sign-in state, or never when the daemon signs in to nothing.
-async fn signed_in_change(sign_in: Option<&mut watch::Receiver<bool>>) -> Option<bool> {
+pub(crate) async fn signed_in_change(sign_in: Option<&mut watch::Receiver<bool>>) -> Option<bool> {
     if let Some(needed) = sign_in
         && needed.changed().await.is_ok()
     {
@@ -447,13 +462,10 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::{Value, json};
-    use std::sync::Mutex;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-    use async_trait::async_trait;
     use vetinari_core::application::devflow::api::RunLabel;
-    use vetinari_core::application::devflow::worker::GateReply;
     use vetinari_core::domain::devflow::ids::{NodeId, NodeInstance, TaskQueue, WorkerName};
     use vetinari_core::domain::devflow::outcome::GateAnswer;
     use vetinari_core::domain::devflow::run_view::{
@@ -464,6 +476,7 @@ mod tests {
     use vetinari_core::testing::FakeRunGateway;
 
     use super::*;
+    use crate::fakes::{RecordingGates, RecordingLaunches};
 
     struct Server {
         _dir: tempfile::TempDir,
@@ -472,58 +485,6 @@ mod tests {
         runs: Arc<FakeRunGateway>,
         gates: Arc<RecordingGates>,
         launches: Arc<RecordingLaunches>,
-    }
-
-    /// Starts each ticket once, as `run-<n>`, and records dismissals.
-    #[derive(Default)]
-    struct RecordingLaunches {
-        started: Mutex<Vec<String>>,
-        dismissed: Mutex<Vec<(String, bool)>>,
-    }
-
-    #[async_trait]
-    impl Launches for RecordingLaunches {
-        async fn start(
-            &self,
-            workflow: vetinari_core::domain::devflow::template::DevWorkflow,
-        ) -> Result<RunId, ApiError> {
-            let vetinari_core::domain::devflow::template::DevWorkflow::FeatureFromTicket(feature) =
-                workflow;
-            let mut started = self.started.lock().expect("lock");
-            let ticket = feature.ticket.key.to_string();
-            if started.contains(&ticket) {
-                return Err(ApiError::Conflict(format!("{ticket} already has a run")));
-            }
-            started.push(ticket);
-            Ok(RunId::parse(&format!("run-{}", started.len())).expect("run"))
-        }
-
-        async fn dismiss(&self, run: &RunId, remove_worktree: bool) -> Result<(), ApiError> {
-            self.dismissed
-                .lock()
-                .expect("lock")
-                .push((run.to_string(), remove_worktree));
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingGates(Mutex<Vec<(String, String, GateAnswer)>>);
-
-    #[async_trait]
-    impl Gates for RecordingGates {
-        async fn answer(
-            &self,
-            run: &RunId,
-            instance: &NodeInstance,
-            answer: GateAnswer,
-        ) -> Result<GateReply, ApiError> {
-            self.0
-                .lock()
-                .expect("lock")
-                .push((run.to_string(), instance.to_string(), answer));
-            Ok(GateReply::Sent)
-        }
     }
 
     async fn server() -> Server {

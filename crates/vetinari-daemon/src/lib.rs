@@ -6,6 +6,8 @@
 //! composition root.
 
 pub mod compose;
+#[cfg(test)]
+mod fakes;
 pub mod gates;
 pub mod hub;
 pub mod launches;
@@ -14,3 +16,5 @@ pub mod scripted;
 pub mod signin;
 pub mod socket;
 pub mod steps;
+pub mod view;
+pub mod web;
