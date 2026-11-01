@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/gameldar/vetinari"
+repository = "https://github.com/gameldar/vetinari-rs"
 description = "An orchestrator for coding agents, attention, and technical leadership"
 
 [workspace.dependencies]

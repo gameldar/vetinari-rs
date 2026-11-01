@@ -12,6 +12,12 @@ a panel of a larger layout, which already shows spaces and agents.
 It is named after the Patrician of Ankh-Morpork, who kept the city running by
 knowing what deserved his attention and what did not.
 
+> **Experimental: `vetinarid`, dev workflow runs and the web page.** These work
+> through an autognomus gateway, and autognomus is not publicly available yet,
+> so they cannot be run from this repository alone and may change without
+> notice. The `vetinari` interface runs without them: install it with
+> `make install-tui` and leave `[autognomus]` out of your configuration.
+
 ## What it does
 
 - **One attention queue.** GitHub, Jira, Slack, Google Calendar, and running
@@ -49,8 +55,8 @@ since a restart forgets every run.
 Needs Rust 1.88 or newer, `git`, and whichever agents and workspace backends
 you point it at (`claude`, `agy`, `tmux`, Herdr, an editor).
 
-Dev workflow runs need `vetinarid` running beside the interface, which never
-starts it. [`docs/systemd/`](docs/systemd/) has a user unit for it, and one for
+Dev workflow runs (experimental, see above) need `vetinarid` running beside the
+interface, which never starts it. [`docs/systemd/`](docs/systemd/) has a user unit for it, and one for
 the local autognomus dev stack to run it against:
 
 ```sh

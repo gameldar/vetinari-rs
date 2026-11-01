@@ -1,4 +1,5 @@
-# vetinarid as a systemd user service.
+# vetinarid as a systemd user service. Experimental: it needs an autognomus
+# gateway, which is not publicly available yet.
 #
 #   cargo install --path crates/vetinari-daemon
 #   cp docs/systemd/vetinarid.service ~/.config/systemd/user/
@@ -12,7 +13,7 @@
 
 [Unit]
 Description=vetinari dev workflow worker
-Documentation=https://github.com/gameldar/vetinari/blob/main/docs/specs/2026-10-25-dev-workflows-design.md
+Documentation=https://github.com/gameldar/vetinari-rs/blob/main/docs/specs/2026-10-25-dev-workflows-design.md
 # Signing in through the issuer stores the token in the Secret Service
 # keyring, which a desktop session provides.
 After=graphical-session.target

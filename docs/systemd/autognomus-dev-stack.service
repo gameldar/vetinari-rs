@@ -1,3 +1,5 @@
+# Experimental: autognomus is not publicly available yet.
+#
 # The autognomus dev stack as a systemd user service: engine, scheduler and
 # gateway in one process on 127.0.0.1:8080, signed by its own local issuer.
 # vetinarid reaches it through token_file (see docs/config.example.toml).

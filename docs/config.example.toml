@@ -148,7 +148,8 @@ calendar_id = "primary"
 lookahead_hours = 12
 
 
-# --- Dev workflows gateway --------------------------------------------------
+# --- Dev workflows gateway (experimental) -----------------------------------
+# Autognomus is not publicly available yet; leave this table out without it.
 # Only vetinarid reads this. It signs in at the OIDC issuer by device code
 # (`vetinarid login`) and keeps the credential in the keyring.
 
